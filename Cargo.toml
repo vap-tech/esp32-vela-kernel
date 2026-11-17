@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["boot/esp32p4", "kernel"]
+default-members = ["boot/esp32p4"]
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = 2

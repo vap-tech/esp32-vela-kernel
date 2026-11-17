@@ -1,0 +1,14 @@
+[package]
+name = "vela-boot-esp32p4"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+[dependencies]
+vela-kernel = { path = "../../kernel" }
+[[bin]]
+name = "vela-boot-esp32p4"
+path = "src/main.rs"
+test = false
+bench = false
+[features]
+trap-test = []
