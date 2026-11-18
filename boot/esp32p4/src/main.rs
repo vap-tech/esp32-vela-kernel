@@ -51,6 +51,7 @@ struct Runtime {
     calls: [Call; TASKS],
     idle_frame: arch::TrapFrame,
     in_idle: bool,
+    usb_rx_interrupts: u64,
     logged_block: bool,
     logged_wake: bool,
     logged_idle: bool,
@@ -190,6 +191,7 @@ extern "C" fn rust_main() -> ! {
         calls: [Call::EMPTY; TASKS],
         idle_frame: idle,
         in_idle: false,
+        usb_rx_interrupts: 0,
         logged_block: false,
         logged_wake: false,
         logged_idle: false,
@@ -936,10 +938,11 @@ impl Runtime {
             }
             syscall::TICKS => self.scheduler.snapshot().uptime_ticks as u32,
             syscall::STATS => {
-                if a1 as usize != syscall::STATS_BYTES {
+                let len = a1 as usize;
+                if !matches!(len, syscall::STATS_BYTES | syscall::STATS_IRQ_BYTES) {
                     return syscall::EINVAL;
                 }
-                if !self.writable(a0 as usize, syscall::STATS_BYTES) {
+                if !self.writable(a0 as usize, len) {
                     return syscall::EFAULT;
                 }
                 let s = self.scheduler.snapshot();
@@ -955,8 +958,10 @@ impl Runtime {
                     s.load_q16[0],
                     s.load_q16[1],
                     s.load_q16[2],
+                    self.usb_rx_interrupts as u32,
+                    (self.usb_rx_interrupts >> 32) as u32,
                 ];
-                for (i, word) in words.iter().enumerate() {
+                for (i, word) in words[..len / 4].iter().enumerate() {
                     for (j, byte) in word.to_le_bytes().iter().enumerate() {
                         // SAFETY: checked writable private user stack, byte-aligned ABI.
                         unsafe {
@@ -1167,6 +1172,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         runtime.scheduler.tick(uptime);
         switch = true;
     } else if interrupt && cause == soc::console::RX_LINE {
+        runtime.usb_rx_interrupts += 1;
         runtime.console.mask_rx_irq();
         if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked && matches!(t.wait, Wait::Event { object: CONSOLE_RX })

@@ -10,7 +10,7 @@ Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
 
 Monitor Ctrl-R resets; Ctrl-C detaches. Shell: help, cat <path>, uptime, memtest.
 Try cat /proc/loadavg and cat /proc/uptime. /proc/interrupts reports the 64-bit
-count of delivered SYSTIMER interrupts on hart0. File lookup and formatting run in
+counts of delivered SYSTIMER and USB Serial/JTAG RX interrupts on hart0. File lookup and formatting run in
 userspace procfs, requested through IPC; no kernel VFS or hardcoded file output.
 
 IPC: endpoint_create/send/recv/endpoint_close, eight endpoints, four queued
@@ -43,7 +43,8 @@ acknowledges the packet source until the driver rearms it. The shared static
 service image has an aligned 8 KiB RX mapping. On Tab5 v1.3 the shell accepted
 help and both procfs reads with one serial write per command.
 
-Stats ABI remains an explicit 44-byte little-endian snapshot. Total counts live
+STATS accepts the original 44-byte little-endian snapshot and a 52-byte
+version with a trailing USB RX interrupt count. Total counts live
 tasks (including Blocked), runnable is Ready+Running; last ID includes exited
 tasks. Idle is not in the task pool. Delivered timer IRQs and hardware uptime
 ticks are separate. Q16 load averages sample runnable count every five seconds

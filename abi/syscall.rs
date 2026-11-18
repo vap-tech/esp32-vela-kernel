@@ -6,6 +6,7 @@ pub const EXIT: u32 = 3;
 pub const TICKS: u32 = 4; // low 32 bits of 100Hz uptime; wrap after ~497 days
 pub const STATS: u32 = 5; // a0=writable user buffer; explicit wire layout below
 pub const STATS_BYTES: usize = 44; // 4*u32, 2*u64, 3*u32, little endian
+pub const STATS_IRQ_BYTES: usize = STATS_BYTES + 8; // optional USB RX IRQ count at byte 44
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EINVAL: u32 = (-22i32) as u32;
 pub const ENOSYS: u32 = (-38i32) as u32;

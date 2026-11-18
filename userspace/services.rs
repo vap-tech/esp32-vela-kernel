@@ -26,6 +26,7 @@ text!(UPTIME_CMD, b"uptime");
 text!(CAT, b"cat ");
 text!(LOADAVG, b"/proc/loadavg");
 text!(INTERRUPTS, b"/proc/interrupts");
+text!(USB_IRQ, b"usb_serial_jtag_rx ");
 text!(TIMER_IRQ, b"systimer0 ");
 text!(UPTIME, b"/proc/uptime");
 text!(NOT_FOUND, b"procfs: no such file\n");
@@ -258,19 +259,17 @@ fn read_node(request: &Buffer, response: &mut Buffer) {
         return;
     }
     let mut snapshot = Buffer::new();
-    if call(
-        abi::STATS,
-        snapshot.mut_ptr() as u32,
-        abi::STATS_BYTES as u32,
-        0,
-        0,
-    ) != 0
-    {
+    let size = if interrupts {
+        abi::STATS_IRQ_BYTES
+    } else {
+        abi::STATS_BYTES
+    };
+    if call(abi::STATS, snapshot.mut_ptr() as u32, size as u32, 0, 0) != 0 {
         response.push(2);
         response.append(FAILED.as_ptr(), FAILED.len());
         return;
     }
-    snapshot.len = abi::STATS_BYTES;
+    snapshot.len = size;
     response.push(0);
     if load {
         for offset in [32, 36, 40] {
@@ -287,6 +286,9 @@ fn read_node(request: &Buffer, response: &mut Buffer) {
     } else if interrupts {
         response.append(TIMER_IRQ.as_ptr(), TIMER_IRQ.len());
         response.decimal64(snapshot.word(16), snapshot.word(20));
+        response.push(b'\n');
+        response.append(USB_IRQ.as_ptr(), USB_IRQ.len());
+        response.decimal64(snapshot.word(44), snapshot.word(48));
         response.push(b'\n');
     } else {
         let (low, high, remainder) = div64(snapshot.word(24), snapshot.word(28), 100);
