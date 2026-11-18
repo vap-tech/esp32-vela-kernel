@@ -1,5 +1,5 @@
 /// Half-open user mapping. No overflow or cross-region syscall buffers.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Region {
     pub base: usize,
     pub size: usize,

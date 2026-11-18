@@ -3,6 +3,7 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     ipc::{self, Ipc, Message},
+    memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
     task::{Region, State, Wait},
@@ -27,6 +28,8 @@ struct Runtime {
     scheduler: Scheduler<arch::TrapFrame>,
     processes: Processes,
     active_space: Option<(usize, u32)>,
+    pmp_images: [Option<(u32, pmp::Prepared)>; vela_kernel::process::PROCESSES],
+    allocator: RegionAllocator,
     console: soc::console::Console,
     ipc: Ipc,
     idle_frame: arch::TrapFrame,
@@ -47,6 +50,8 @@ unsafe extern "C" {
     static _user_stack1: u8;
     static _user_stack2: u8;
     static _stack_top: u8;
+    static _stack_bottom: u8;
+    static _bss_end: u8;
     fn vela_trap_entry();
 }
 #[unsafe(no_mangle)]
@@ -114,7 +119,8 @@ extern "C" fn rust_main() -> ! {
         frame
     });
     // SAFETY: isolated physical regions, no users executing.
-    assert!(unsafe { pmp::activate(code, stacks[0]) }, "PMP readback");
+    let initial_pmp = pmp::Prepared::new(&processes.slots[0].memory).unwrap();
+    assert!(unsafe { initial_pmp.activate() }, "PMP readback");
     let _ = writeln!(
         console,
         "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (bounded 100Hz polling)"
@@ -128,8 +134,22 @@ extern "C" fn rust_main() -> ! {
     let runtime = Runtime {
         scheduler: Scheduler::new(contexts, entries, stacks),
         console,
-        processes,
         active_space: Some((0, 2)),
+        pmp_images: core::array::from_fn(|i| {
+            if processes.slots[i].state == Lifecycle::Alive {
+                Some((
+                    processes.slots[i].memory.revision,
+                    pmp::Prepared::new(&processes.slots[i].memory).unwrap(),
+                ))
+            } else {
+                None
+            }
+        }),
+        processes,
+        allocator: RegionAllocator::new(
+            core::ptr::addr_of!(_bss_end) as usize,
+            core::ptr::addr_of!(_stack_bottom) as usize,
+        ),
         ipc,
         idle_frame: idle,
         in_idle: false,
@@ -227,6 +247,11 @@ impl Runtime {
         }
         self.processes.slots[process].state = Lifecycle::Dying;
         let closed = self.ipc.remove_task(process);
+        self.allocator
+            .release_owner(self.processes.slots[process].id);
+        self.processes.slots[process].state = Lifecycle::Free;
+        self.processes.slots[process].memory = AddressSpace::EMPTY;
+        self.pmp_images[process] = None;
         for (ep, is_closed) in closed.into_iter().enumerate() {
             if is_closed {
                 self.complete_receivers(ep, true);
@@ -259,6 +284,61 @@ impl Runtime {
             syscall::EXIT => {
                 self.terminate();
                 *switch = true;
+                0
+            }
+            syscall::MEM_ALLOC => {
+                let owner = self.processes.slots[current].id;
+                let region = match self.allocator.allocate(owner, a0 as usize) {
+                    Ok(r) => r,
+                    Err(e) => return (-(e as i32)) as u32,
+                };
+                if let Err(e) = self.processes.slots[current]
+                    .memory
+                    .insert(region, READ | WRITE)
+                {
+                    self.allocator.free(owner, region).unwrap();
+                    return (-(e as i32)) as u32;
+                }
+                // SAFETY: newly reserved physical SRAM, no aliases or user execution.
+                unsafe {
+                    core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
+                }
+                frame.registers[9] = region.size as u32;
+                region.base as u32
+            }
+            syscall::MEM_FREE => {
+                let region = Region {
+                    base: a0 as usize,
+                    size: a1 as usize,
+                };
+                let owner = self.processes.slots[current].id;
+                if !self.allocator.owns(owner, region) {
+                    return ipc::EPERM;
+                }
+                if self.scheduler.tasks.iter().any(|t| {
+                    t.process == current
+                        && t.state != State::Terminated
+                        && region.contains(t.stack.base, t.stack.size)
+                }) {
+                    return (-16i32) as u32;
+                }
+                self.processes.slots[current].memory.remove(region).unwrap();
+                self.allocator.free(owner, region).unwrap();
+                // Cancel pending receives before the physical region can be reused.
+                for i in 0..TASKS {
+                    if self.scheduler.tasks[i].process != current {
+                        continue;
+                    }
+                    if let Wait::Receive {
+                        pointer, capacity, ..
+                    } = self.scheduler.tasks[i].wait
+                    {
+                        if region.contains(pointer, capacity) {
+                            self.scheduler.tasks[i].context.registers[8] = syscall::EFAULT;
+                            self.scheduler.wake(i);
+                        }
+                    }
+                }
                 0
             }
             syscall::THREAD_CREATE => {
@@ -530,7 +610,15 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     let memory = runtime.processes.slots[process].memory;
     // SAFETY: activate only selected task's RX code / RW stack before mret.
     if runtime.active_space != Some((process, memory.revision)) {
-        if !unsafe { pmp::activate(memory.maps[0].region, memory.maps[1].region) } {
+        let image = match runtime.pmp_images[process] {
+            Some((revision, image)) if revision == memory.revision => image,
+            _ => {
+                let image = pmp::Prepared::new(&memory).unwrap();
+                runtime.pmp_images[process] = Some((memory.revision, image));
+                image
+            }
+        };
+        if !unsafe { image.activate() } {
             fatal(frame);
         }
         runtime.active_space = Some((process, memory.revision));

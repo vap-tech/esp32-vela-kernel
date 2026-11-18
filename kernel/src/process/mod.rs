@@ -39,6 +39,16 @@ impl AddressSpace {
         {
             return Err(22);
         }
+        if permissions == 0
+            || permissions & (WRITE | EXECUTE) == WRITE | EXECUTE
+            || self.maps.iter().any(|m| {
+                m.region.size != 0
+                    && region.base < m.region.base + m.region.size
+                    && m.region.base < region.base + region.size
+            })
+        {
+            return Err(22);
+        }
         let index = self
             .maps
             .iter()
@@ -48,6 +58,16 @@ impl AddressSpace {
             region,
             permissions,
         };
+        self.revision = self.revision.checked_add(1).ok_or(75u32)?;
+        Ok(())
+    }
+    pub fn remove(&mut self, region: Region) -> Result<(), u32> {
+        let index = self
+            .maps
+            .iter()
+            .position(|m| m.region == region && region.size != 0)
+            .ok_or(22u32)?;
+        self.maps[index] = Mapping::default();
         self.revision = self.revision.checked_add(1).ok_or(75u32)?;
         Ok(())
     }

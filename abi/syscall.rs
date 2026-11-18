@@ -22,3 +22,6 @@ pub const EAGAIN: u32 = (-11i32) as u32;
 
 pub const THREAD_CREATE: u32 = 12; // a0=entry,a1=stack base,a2=size,a3=arg,a4=priority,a5=affinity
 pub const PROCESS_EXIT: u32 = 13;
+
+pub const MEM_ALLOC: u32 = 14; // a0=requested bytes -> a0=base,a1=actual size
+pub const MEM_FREE: u32 = 15; // a0=base,a1=exact allocated size
