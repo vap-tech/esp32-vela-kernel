@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+mod journal;
 #[path = "../../soc/esp32p4-v13/lp_counter.rs"]
 mod lp_counter;
 #[path = "../../soc/esp32p4-v13/mailbox.rs"]
@@ -73,6 +74,8 @@ struct Transport {
     hz: u32,
     watch: watch::Watch,
     reported_missed: u32,
+    journal: journal::Journal,
+    diagnostic_pending: Option<journal::Record>,
 }
 struct Local(core::cell::UnsafeCell<Transport>);
 // SAFETY: only LP startup and non-nested LP IRQ handlers access this LP SRAM.
@@ -87,25 +90,51 @@ static LOCAL: Local = Local(core::cell::UnsafeCell::new(Transport {
     hz: 0,
     watch: watch::Watch::new(),
     reported_missed: 0,
+    journal: journal::Journal::new(0),
+    diagnostic_pending: None,
 }));
-unsafe fn publish(local: &mut Transport, event: u32, request: u32, result: u32) {
+fn observe(local: &mut Transport, now: u64) {
+    let missed = local.watch.missed;
+    local.watch.sample(now);
+    if local.watch.missed != missed {
+        // Journaling is best effort only at u32 sequence exhaustion; observation
+        // and heartbeat recovery remain operational even if no new ID is available.
+        local.journal.append(
+            now,
+            wire::LOG_TIMEOUT,
+            local.watch.beats,
+            local.watch.missed,
+        );
+    }
+}
+unsafe fn publish_words(local: &mut Transport, event: u32, request: u32, words: [u32; 5]) {
     unsafe {
         local.published = local.published.checked_add(1).unwrap();
         local.busy = true;
         mailbox::word(wire::ECHO).write_volatile(local.epoch);
         mailbox::word(wire::REPLY_SEQ).write_volatile(request);
-        mailbox::word(wire::RESULT).write_volatile(result);
-        let now = lp_counter::now();
-        local.watch.sample(now);
-        let age = local.watch.age(now);
-        mailbox::word(wire::MONITOR).write_volatile(local.watch.state | (local.watch.missed << 2));
-        mailbox::word(wire::AGE_LO).write_volatile(age as u32);
-        mailbox::word(wire::AGE_HI).write_volatile((age >> 32) as u32);
-        mailbox::word(wire::BEATS).write_volatile(local.watch.beats);
+        for (i, value) in words.into_iter().enumerate() {
+            mailbox::word(wire::RESULT + i).write_volatile(value);
+        }
         mailbox::word(wire::PUBLISH_SEQ).write_volatile(local.published);
-        asm!("fence iorw, iorw", options(nostack));
+        asm!("fence iorw,iorw", options(nostack));
         mailbox::word(wire::EVENT).write_volatile(event);
-        asm!("fence iorw, iorw", options(nostack));
+        asm!("fence iorw,iorw", options(nostack));
+    }
+}
+unsafe fn publish(local: &mut Transport, event: u32, request: u32, result: u32) {
+    unsafe {
+        let now = lp_counter::now();
+        observe(local, now);
+        let age = local.watch.age(now);
+        let words = [
+            result,
+            local.watch.state | (local.watch.missed << 2),
+            age as u32,
+            (age >> 32) as u32,
+            local.watch.beats,
+        ];
+        publish_words(local, event, request, words);
     }
 }
 #[unsafe(no_mangle)]
@@ -119,6 +148,11 @@ extern "C" fn sentinel_main() {
         local.epoch = mailbox::word(wire::EPOCH).read_volatile();
         local.hz = mailbox::word(wire::CLOCK_HZ).read_volatile();
         assert!((1000..=1_000_000).contains(&local.hz));
+        let now = lp_counter::now();
+        local.journal = journal::Journal::new(now);
+        local
+            .journal
+            .append(now, wire::LOG_BOOT, local.epoch, local.hz);
         publish(local, wire::READY, 0, wire::OK);
     }
 }
@@ -141,13 +175,18 @@ extern "C" fn receive_command() {
 }
 unsafe fn service(local: &mut Transport) {
     unsafe {
-        local.watch.sample(lp_counter::now());
+        observe(local, lp_counter::now());
         if !local.busy && local.pending {
             process_command(local);
         }
         if !local.busy && local.reported_missed < local.watch.missed {
             local.reported_missed += 1;
             publish(local, wire::HEARTBEAT_MISSED, 0, wire::OK);
+        }
+        if !local.busy {
+            if let Some(record) = local.diagnostic_pending.take() {
+                publish_words(local, wire::DIAGNOSTIC_EVENT, 0, record.words());
+            }
         }
         // Exact deadline, not a polling tick. Healthy heartbeat resets it; a
         // missed/unarmed observer masks target1 until a new heartbeat arrives.
@@ -166,15 +205,72 @@ unsafe fn process_command(local: &mut Transport) {
         local.last_request = sequence;
         let arg0 = mailbox::word(wire::ARG0).read_volatile();
         let arg1 = mailbox::word(wire::ARG1).read_volatile();
+        if command == wire::LOG_META && arg0 == 0 && arg1 == 0 {
+            let [oldest, newest, overwritten, capacity] = local.journal.metadata();
+            publish_words(
+                local,
+                wire::LOG_METADATA,
+                sequence,
+                [wire::OK, oldest, newest, overwritten, capacity],
+            );
+            return;
+        }
+        if command == wire::LOG_READ && arg0 != 0 && arg1 == 0 {
+            match local.journal.read(arg0) {
+                Ok(record) => publish_words(local, wire::LOG_ENTRY, sequence, record.words()),
+                Err(error) => publish(
+                    local,
+                    wire::ACK,
+                    sequence,
+                    match error {
+                        journal::ReadError::Overwritten => wire::LOG_GONE,
+                        journal::ReadError::Unknown => wire::LOG_UNKNOWN,
+                    },
+                ),
+            }
+            return;
+        }
         let (event, result) = match command {
             wire::HELLO if arg0 == 0 && arg1 == 0 => (wire::ACK, wire::OK),
             wire::GET_STATUS if arg0 == 0 && arg1 == 0 => (wire::STATUS, wire::OK),
             wire::HEARTBEAT if (100..=60_000).contains(&arg0) && arg1 == 0 => {
                 let timeout = (u64::from(local.hz) * u64::from(arg0) + 999) / 1000;
-                local.watch.heartbeat(lp_counter::now(), timeout);
+                let now = lp_counter::now();
+                observe(local, now);
+                let first = local.watch.beats == 0;
+                let recovered = local.watch.state == wire::MISSED;
+                local.watch.heartbeat(now, timeout);
+                if first {
+                    local
+                        .journal
+                        .append(now, wire::LOG_FIRST_HEARTBEAT, local.watch.beats, arg0);
+                } else if recovered {
+                    local.journal.append(
+                        now,
+                        wire::LOG_RECOVERED,
+                        local.watch.beats,
+                        local.watch.missed,
+                    );
+                }
                 (wire::ACK, wire::OK)
             }
-            wire::HELLO | wire::GET_STATUS | wire::HEARTBEAT => (wire::ACK, wire::BAD_ARGUMENT),
+            wire::DIAGNOSTIC => {
+                if local.diagnostic_pending.is_some() {
+                    (wire::ACK, wire::LOG_BUSY)
+                } else if let Some(record) =
+                    local
+                        .journal
+                        .append(lp_counter::now(), wire::LOG_HP_EVENT, arg0, arg1)
+                {
+                    local.diagnostic_pending = Some(record);
+                    (wire::ACK, wire::OK)
+                } else {
+                    (wire::ACK, wire::LOG_EXHAUSTED)
+                }
+            }
+            wire::HELLO | wire::GET_STATUS | wire::HEARTBEAT | wire::LOG_META | wire::LOG_READ => {
+                (wire::ACK, wire::BAD_ARGUMENT)
+            }
             _ => (wire::ACK, wire::BAD_COMMAND),
         };
         publish(local, event, sequence, result);

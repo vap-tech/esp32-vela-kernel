@@ -47,3 +47,25 @@ pub const MISSED: u32 = 2;
 pub const STATUS_BYTES: usize = 24; // state,age_ms(lo/hi),calibrated_hz,beats,missed transitions
 
 pub const HEARTBEAT_MISSED: u32 = 0x484d_0000 | VERSION;
+
+// Additive v2 extensions; journal payloads reuse words 8..12, tagged by EVENT.
+pub const DIAGNOSTIC: u32 = 0x4447_0000 | VERSION;
+pub const LOG_META: u32 = 0x4c4d_0000 | VERSION;
+pub const LOG_READ: u32 = 0x4c52_0000 | VERSION;
+pub const LOG_METADATA: u32 = 0x4d45_0000 | VERSION;
+pub const LOG_ENTRY: u32 = 0x454e_0000 | VERSION;
+pub const DIAGNOSTIC_EVENT: u32 = 0x4445_0000 | VERSION;
+pub const LOG_GONE: u32 = 3;
+pub const LOG_UNKNOWN: u32 = 4;
+pub const LOG_BUSY: u32 = 5;
+pub const LOG_EXHAUSTED: u32 = 6;
+pub const LOG_BYTES: usize = 24;
+pub const LOG_BOOT: u16 = 1;
+pub const LOG_FIRST_HEARTBEAT: u16 = 2;
+pub const LOG_TIMEOUT: u16 = 3;
+pub const LOG_RECOVERED: u16 = 4;
+pub const LOG_HP_EVENT: u16 = 5;
+// LOG_METADATA words8..12: OK,oldest,newest,overwritten,capacity.
+// LOG_ENTRY/DIAGNOSTIC_EVENT words8..12:
+// sequence,ticks_lo,(type<<16)|ticks_hi16,arg0,arg1. Timestamp is 48-bit
+// LP ticks since Sentinel startup. No address/pointer appears on the wire.
