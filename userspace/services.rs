@@ -14,7 +14,7 @@ macro_rules! text {
 text!(PROMPT, b"vela:/$ ");
 text!(
     HELP,
-    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume]\n"
+    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n"
 );
 text!(HELP_CMD, b"help");
 text!(RUN_DMA, b"run dma");
@@ -23,6 +23,25 @@ text!(RESUME_CMD, b"sentinel resume");
 text!(PAUSED, b"Sentinel heartbeat paused\n");
 text!(RESUMED, b"Sentinel heartbeat resumed\n");
 text!(NOTICES, b" notices=");
+text!(LOG_CMD, b"sentinel log");
+text!(MARK_CMD, b"sentinel mark");
+text!(LOG_HEADER, b"Sentinel log epoch=");
+text!(LOG_HZ, b" hz=");
+text!(LOG_OLDEST, b"oldest=");
+text!(LOG_NEWEST, b" newest=");
+text!(LOG_OVERWRITTEN, b" overwritten=");
+text!(LOG_CAPACITY, b" capacity=");
+text!(LOG_NOTICES, b" diagnostic_notices=");
+text!(LOG_GONE, b"record overwritten during read; retry log\n");
+text!(LOG_TIME, b" lp_ticks=");
+text!(LOG_ARG0, b" a0=");
+text!(LOG_ARG1, b" a1=");
+text!(EVENT_BOOT, b" boot");
+text!(EVENT_FIRST, b" first_heartbeat");
+text!(EVENT_TIMEOUT, b" timeout");
+text!(EVENT_RECOVERED, b" recovered");
+text!(EVENT_HP, b" hp_diagnostic");
+text!(EVENT_UNKNOWN, b" unknown");
 text!(STATUS_CMD, b"sentinel status");
 text!(STATUS_PREFIX, b"Sentinel state=");
 text!(UNARMED, b"unarmed");
@@ -127,7 +146,8 @@ impl Buffer {
         // SAFETY: index below initialized length.
         unsafe { self.ptr().add(index).read_volatile() }
     }
-    #[inline(always)]
+    #[unsafe(link_section = ".user.text")]
+    #[inline(never)]
     fn append(&mut self, pointer: *const u8, length: usize) {
         for i in 0..length {
             // SAFETY: callers provide static RX bytes or initialized Buffer data.
@@ -154,7 +174,8 @@ impl Buffer {
             | (u32::from(self.get(offset + 2)) << 16)
             | (u32::from(self.get(offset + 3)) << 24)
     }
-    #[inline(always)]
+    #[unsafe(link_section = ".user.text")]
+    #[inline(never)]
     fn decimal(&mut self, mut number: u32) {
         let mut digits = MaybeUninit::<[u8; 10]>::uninit();
         let ptr = digits.as_mut_ptr().cast::<u8>();
@@ -395,6 +416,99 @@ fn arena_probe() -> bool {
     ok && released && arena.allocate(layout).is_none()
 }
 #[inline(always)]
+fn sentinel_data(sequence: u32, data: &mut Buffer) -> (u32, u32) {
+    let mut result = (0, 0);
+    for _ in 0..8 {
+        result = call6(
+            abi::SENTINEL_LOG,
+            sequence,
+            data.mut_ptr() as u32,
+            24,
+            0,
+            0,
+            0,
+        );
+        if result.0 != (-16i32) as u32 {
+            break;
+        }
+        sleep(); // bounded retry if automatic heartbeat currently owns the request slot
+    }
+    if result.0 == 24 {
+        data.len = 24;
+    }
+    result
+}
+#[inline(always)]
+fn sentinel_log() {
+    let mut data = Buffer::new();
+    let (result, notices) = sentinel_data(0, &mut data);
+    if result != 24 {
+        write(FAILED.as_ptr(), FAILED.len());
+        return;
+    }
+    let oldest = data.word(4);
+    let newest = data.word(8);
+    let mut out = Buffer::new();
+    out.append(LOG_HEADER.as_ptr(), LOG_HEADER.len());
+    out.decimal(data.word(0));
+    out.append(LOG_HZ.as_ptr(), LOG_HZ.len());
+    out.decimal(data.word(20));
+    out.push(b'\n');
+    write(out.ptr(), out.len);
+    out.len = 0;
+    out.append(LOG_OLDEST.as_ptr(), LOG_OLDEST.len());
+    out.decimal(oldest);
+    out.append(LOG_NEWEST.as_ptr(), LOG_NEWEST.len());
+    out.decimal(newest);
+    out.append(LOG_OVERWRITTEN.as_ptr(), LOG_OVERWRITTEN.len());
+    out.decimal(data.word(12));
+    out.append(LOG_CAPACITY.as_ptr(), LOG_CAPACITY.len());
+    out.decimal(data.word(16));
+    out.push(b'\n');
+    write(out.ptr(), out.len);
+    out.len = 0;
+    out.append(LOG_NOTICES.as_ptr(), LOG_NOTICES.len());
+    out.decimal(notices);
+    out.push(b'\n');
+    write(out.ptr(), out.len);
+    // Bounded snapshot tail; new arrivals never make this an infinite dump.
+    for offset in 0..16u32 {
+        let sequence = oldest.wrapping_add(offset);
+        if oldest == 0 || sequence == 0 || sequence > newest {
+            break;
+        }
+        let result = sentinel_data(sequence, &mut data).0;
+        if result != 24 {
+            if result == (-75i32) as u32 {
+                write(LOG_GONE.as_ptr(), LOG_GONE.len());
+            } else {
+                write(FAILED.as_ptr(), FAILED.len());
+            }
+            break;
+        }
+        out.len = 0;
+        out.push(b'#');
+        out.decimal(data.word(0));
+        out.append(LOG_TIME.as_ptr(), LOG_TIME.len());
+        out.decimal64(data.word(8), data.word(12));
+        let (name, length) = match data.word(4) {
+            1 => (EVENT_BOOT.as_ptr(), EVENT_BOOT.len()),
+            2 => (EVENT_FIRST.as_ptr(), EVENT_FIRST.len()),
+            3 => (EVENT_TIMEOUT.as_ptr(), EVENT_TIMEOUT.len()),
+            4 => (EVENT_RECOVERED.as_ptr(), EVENT_RECOVERED.len()),
+            5 => (EVENT_HP.as_ptr(), EVENT_HP.len()),
+            _ => (EVENT_UNKNOWN.as_ptr(), EVENT_UNKNOWN.len()),
+        };
+        out.append(name, length);
+        out.append(LOG_ARG0.as_ptr(), LOG_ARG0.len());
+        out.decimal(data.word(16));
+        out.append(LOG_ARG1.as_ptr(), LOG_ARG1.len());
+        out.decimal(data.word(20));
+        out.push(b'\n');
+        write(out.ptr(), out.len);
+    }
+}
+#[inline(always)]
 fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     if line.len == 0 {
         return;
@@ -411,6 +525,20 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
             u32::from(line.len == RUN_PIC.len())
         };
         if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
+            write(FAILED.as_ptr(), FAILED.len());
+        }
+    } else if line.matches(0, LOG_CMD.as_ptr(), LOG_CMD.len()) {
+        sentinel_log();
+    } else if line.matches(0, MARK_CMD.as_ptr(), MARK_CMD.len()) {
+        let ticks = call(abi::TICKS, 0, 0, 0, 0);
+        let seq = call(abi::SENTINEL_DIAG, 0x4d41524b, ticks, 0, 0);
+        if (seq as i32) > 0 {
+            let mut out = Buffer::new();
+            out.append(ACK_MSG.as_ptr(), ACK_MSG.len());
+            out.decimal(seq);
+            out.push(b'\n');
+            write(out.ptr(), out.len);
+        } else {
             write(FAILED.as_ptr(), FAILED.len());
         }
     } else if line.matches(0, PAUSE_CMD.as_ptr(), PAUSE_CMD.len())

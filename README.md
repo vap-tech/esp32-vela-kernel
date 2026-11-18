@@ -34,6 +34,8 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `sentinel hello` | Send HELLO via the hardware mailbox and print the acknowledged sequence. |
 | `sentinel status` | Read LP heartbeat state, age, counters and received missed notices. |
 | `sentinel pause`, `sentinel resume` | Stop/restart HP heartbeats without stopping HP or resetting LP. |
+| `sentinel log` | Read the bounded LP diagnostic journal without consuming records. |
+| `sentinel mark` | Send an HP diagnostic MARK event with the current HP uptime tick as its value. |
 
 ## Kernel and userspace
 
@@ -140,10 +142,39 @@ LP owns 1(echoed epoch), 2(event doorbell), 5(reply seq), 8(result),
 Payload precedes each doorbell. HP copies and clears IRQ before acknowledging
 the LP publication. LP never overwrites an unacknowledged response/event;
 commands take precedence over deferred missed notices. Epoch and sequence are
-checked before completion. Diagnostic journal and sleep supervision remain pending.
+checked before completion. Sleep supervision remains pending.
 
 Tab5 v1.3 smoke (2026-11-18): healthy, pause -> missed=1/notices=1,
 repeated GET_STATUS kept both at 1, resume -> healthy with growing beat count.
 HELLO, help, uptime and /proc/loadavg passed. Observed calibrated slow clock:
 130978 Hz; the value is measured anew at boot, not a platform constant.
 Log: target/sentinel-heartbeat-smoke.log. No power-cycle or stress campaign.
+
+### Diagnostic journal
+
+Sentinel keeps 16 LP-local records per LP boot: sequence, 48-bit timestamp in
+LP ticks since startup, 16-bit type and two u32 arguments. It records boot,
+first heartbeat, timeout, recovery and HP diagnostics. Args are (epoch,hz)
+for boot, (beat_count,timeout_ms) for first heartbeat, (beat_count,miss_count)
+for timeout/recovery, and (code,value) for HP diagnostics.
+
+The log header reports epoch, calibrated Hz, oldest/newest sequence, capacity,
+overwritten-record count and received diagnostic-notice count. Reading is
+nondestructive and limited to the captured tail. If a record is overwritten
+between metadata and entry reads, the reader reports that loss explicitly.
+Sequence IDs never wrap; exhaustion rejects new records without stopping
+heartbeat observation. A pending diagnostic notice applies backpressure to new
+HP diagnostics rather than replacing it. Replies and DIAGNOSTIC_EVENT use the
+same acknowledged publication slot; no unacknowledged payload is overwritten.
+The additive v2 entry payload packs timestamp_hi16 with type in one word;
+see abi/sentinel.rs. No HP/LP shared RAM queue or pointers are introduced.
+
+This is volatile LP SRAM, not persistent crash storage. Current HP startup
+resets LP, so an HP reboot also starts a new journal/epoch.
+
+Tab5 smoke: log -> mark -> log -> pause/timeout -> resume -> log showed
+boot, first_heartbeat, hp_diagnostic, timeout and recovered with stable earlier
+records; diagnostic_notices=1, missed=1/notices=1 and healthy after recovery.
+Help, uptime and /proc/loadavg passed. Ring overwrite, packed timestamp wrap and
+sequence exhaustion passed three host tests; overwrite was not stress-tested on
+hardware. Log: target/sentinel-journal-smoke.log.

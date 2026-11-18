@@ -44,3 +44,8 @@ pub const SENTINEL_HELLO: u32 = 27; // blocks for ACK; returns sequence or errno
 pub const SENTINEL_QUERY: u32 = 28; // a0=writable 24-byte buffer,a1=size; blocking live GET_STATUS
 
 pub const SENTINEL_CONTROL: u32 = 29; // shell only, a0=0 pause / 1 resume automatic HP heartbeat
+
+pub const SENTINEL_DIAG: u32 = 30; // shell only: a0=code,a1=value; blocking ACK
+pub const SENTINEL_LOG: u32 = 31; // a0=sequence (0 metadata),a1=writable 24B,a2=size
+// Metadata: epoch,oldest,newest,overwritten,capacity,clock_hz; a1=received diag notices.
+// Record: sequence,type,timestamp_lo,timestamp_hi16,arg0,arg1 (LP ticks since LP startup).
