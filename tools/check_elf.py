@@ -1,8 +1,10 @@
 """Check linked symbols/sections independently of the linker script."""
 import re
+import shutil
 import subprocess
 import sys
-out = subprocess.check_output(["llvm-readelf", "-S", "-s", sys.argv[1]], text=True)
+readelf = shutil.which("llvm-readelf") or "readelf"
+out = subprocess.check_output([readelf, "--wide", "-S", "-s", sys.argv[1]], text=True)
 symbols = {}
 for line in out.splitlines():
     fields = line.split()
