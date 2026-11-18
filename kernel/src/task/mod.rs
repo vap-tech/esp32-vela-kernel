@@ -34,19 +34,17 @@ pub enum Wait {
     },
 }
 #[derive(Clone, Copy)]
-pub struct Task<C: Copy> {
+pub struct Thread<C: Copy> {
     pub id: u32,
     pub wait: Wait,
     pub state: State,
     pub context: C,
     pub entry: usize,
-    pub code: Region,
+    pub process: usize,
+    pub priority: u8,
+    pub effective_priority: u8,
+    pub affinity: u8,
     pub stack: Region,
     pub runtime_ticks: u64,
     pub preemptions: u64,
-}
-impl<C: Copy> Task<C> {
-    pub fn readable(&self, pointer: usize, length: usize) -> bool {
-        self.code.contains(pointer, length) || self.stack.contains(pointer, length)
-    }
 }

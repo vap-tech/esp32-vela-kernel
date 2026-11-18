@@ -19,3 +19,6 @@ pub const SLEEP: u32 = 11; // a0=relative 100Hz ticks, 1..6000, blocks
 pub const IPC_BYTES: usize = 96;
 pub const NONBLOCK: u32 = 1;
 pub const EAGAIN: u32 = (-11i32) as u32;
+
+pub const THREAD_CREATE: u32 = 12; // a0=entry,a1=stack base,a2=size,a3=arg,a4=priority,a5=affinity
+pub const PROCESS_EXIT: u32 = 13;

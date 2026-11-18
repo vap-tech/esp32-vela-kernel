@@ -1,15 +1,16 @@
 use crate::{
     stats::{HZ, LoadAverage, Snapshot},
-    task::{Region, State, Task, Wait},
+    task::{Region, State, Thread, Wait},
 };
 
-pub const TASKS: usize = 3;
+pub const TASKS: usize = 8;
+pub const BOOT_THREADS: usize = 3;
 
 /// Static three-slot round robin. Only accessed by hart0 with machine interrupts
 /// disabled; all context switches happen at the outermost user trap boundary.
 /// C is architecture-owned saved CPU state; this crate has no SoC dependency.
 pub struct Scheduler<C: Copy> {
-    pub tasks: [Task<C>; TASKS],
+    pub tasks: [Thread<C>; TASKS],
     pub current: usize,
     ticks: u64,
     uptime: u64,
@@ -19,19 +20,27 @@ pub struct Scheduler<C: Copy> {
 }
 impl<C: Copy> Scheduler<C> {
     pub fn new(
-        contexts: [C; TASKS],
-        entries: [usize; TASKS],
-        code: Region,
-        stacks: [Region; TASKS],
+        contexts: [C; BOOT_THREADS],
+        entries: [usize; BOOT_THREADS],
+        stacks: [Region; BOOT_THREADS],
     ) -> Self {
-        let tasks = core::array::from_fn(|i| Task {
-            id: i as u32 + 1,
+        let tasks = core::array::from_fn(|i| Thread {
+            id: if i < BOOT_THREADS { i as u32 + 1 } else { 0 },
             wait: Wait::None,
-            state: if i == 0 { State::Running } else { State::Ready },
-            context: contexts[i],
-            entry: entries[i],
-            code,
-            stack: stacks[i],
+            state: if i >= BOOT_THREADS {
+                State::Terminated
+            } else if i == 0 {
+                State::Running
+            } else {
+                State::Ready
+            },
+            context: contexts[i.min(BOOT_THREADS - 1)],
+            entry: entries[i.min(BOOT_THREADS - 1)],
+            process: i,
+            priority: 1,
+            effective_priority: 1,
+            affinity: 1,
+            stack: stacks[i.min(BOOT_THREADS - 1)],
             runtime_ticks: 0,
             preemptions: 0,
         });
@@ -41,11 +50,46 @@ impl<C: Copy> Scheduler<C> {
             ticks: 0,
             uptime: 0,
             sampled_at: 0,
-            last_id: TASKS as u32,
+            last_id: BOOT_THREADS as u32,
             load: LoadAverage::default(),
         }
     }
-    pub fn current(&self) -> &Task<C> {
+    pub fn create_thread(
+        &mut self,
+        process: usize,
+        context: C,
+        stack: Region,
+        entry: usize,
+        priority: u8,
+        affinity: u8,
+    ) -> Result<u32, u32> {
+        if priority > 3 || affinity == 0 || affinity & !3 != 0 {
+            return Err(22);
+        }
+        let index = self
+            .tasks
+            .iter()
+            .position(|t| t.state == State::Terminated)
+            .ok_or(28u32)?;
+        let id = self.last_id.checked_add(1).ok_or(75u32)?;
+        self.tasks[index] = Thread {
+            id,
+            process,
+            context,
+            stack,
+            entry,
+            priority,
+            effective_priority: priority,
+            affinity,
+            wait: Wait::None,
+            state: State::Ready,
+            runtime_ticks: 0,
+            preemptions: 0,
+        };
+        self.last_id = id;
+        Ok(id)
+    }
+    pub fn current(&self) -> &Thread<C> {
         &self.tasks[self.current]
     }
     pub fn save(&mut self, context: C) {

@@ -3,6 +3,7 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     ipc::{self, Ipc, Message},
+    process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
     task::{Region, State, Wait},
 };
@@ -24,6 +25,8 @@ core::arch::global_asm!(include_str!("../entry.S"));
 
 struct Runtime {
     scheduler: Scheduler<arch::TrapFrame>,
+    processes: Processes,
+    active_space: Option<(usize, u32)>,
     console: soc::console::Console,
     ipc: Ipc,
     idle_frame: arch::TrapFrame,
@@ -96,6 +99,13 @@ extern "C" fn rust_main() -> ! {
         [reply, shell_request, input],
         [console_input, 0, 0],
     ];
+    let mut processes = Processes::new();
+    for stack in stacks {
+        let mut memory = AddressSpace::EMPTY;
+        memory.insert(code, READ | EXECUTE).unwrap();
+        memory.insert(stack, READ | WRITE).unwrap();
+        processes.create(memory).unwrap();
+    }
     let contexts = core::array::from_fn(|i| {
         let mut frame =
             arch::TrapFrame::user(entries[i], stacks[i].base + stacks[i].size, args[i][0]);
@@ -116,8 +126,10 @@ extern "C" fn rust_main() -> ! {
     );
     idle.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
     let runtime = Runtime {
-        scheduler: Scheduler::new(contexts, entries, code, stacks),
+        scheduler: Scheduler::new(contexts, entries, stacks),
         console,
+        processes,
+        active_space: Some((0, 2)),
         ipc,
         idle_frame: idle,
         in_idle: false,
@@ -144,6 +156,15 @@ unsafe fn deliver(pointer: usize, message: &Message) {
     }
 }
 impl Runtime {
+    fn memory(&self) -> &AddressSpace {
+        &self.processes.slots[self.scheduler.current().process].memory
+    }
+    fn readable(&self, pointer: usize, length: usize) -> bool {
+        self.memory().permits(pointer, length, READ)
+    }
+    fn writable(&self, pointer: usize, length: usize) -> bool {
+        self.memory().permits(pointer, length, WRITE)
+    }
     fn complete_receivers(&mut self, endpoint: usize, closed: bool) {
         for i in 0..TASKS {
             let task = self.scheduler.tasks[i];
@@ -167,7 +188,10 @@ impl Runtime {
                 let value = match result {
                     Ok(None) => continue,
                     Ok(Some(message)) => {
-                        if !task.stack.contains(pointer, capacity) {
+                        if !self.processes.slots[task.process]
+                            .memory
+                            .permits(pointer, capacity, WRITE)
+                        {
                             syscall::EFAULT
                         } else {
                             // SAFETY: full writable range revalidated against receiver's mapping.
@@ -191,9 +215,18 @@ impl Runtime {
         }
     }
     fn terminate(&mut self) {
-        let task = self.scheduler.current;
+        let process = self.scheduler.current().process;
         self.scheduler.terminate();
-        let closed = self.ipc.remove_task(task);
+        if self
+            .scheduler
+            .tasks
+            .iter()
+            .any(|t| t.process == process && t.state != State::Terminated)
+        {
+            return;
+        }
+        self.processes.slots[process].state = Lifecycle::Dying;
+        let closed = self.ipc.remove_task(process);
         for (ep, is_closed) in closed.into_iter().enumerate() {
             if is_closed {
                 self.complete_receivers(ep, true);
@@ -205,14 +238,14 @@ impl Runtime {
         let a1 = frame.registers[9];
         let a2 = frame.registers[10];
         let a3 = frame.registers[11];
-        let current = self.scheduler.current;
+        let current = self.scheduler.current().process;
         match frame.registers[15] {
             syscall::WRITE => {
                 let length = a1 as usize;
                 if length > 128 {
                     return syscall::EINVAL;
                 }
-                if !self.scheduler.current().readable(a0 as usize, length) {
+                if !self.readable(a0 as usize, length) {
                     return syscall::EFAULT;
                 }
                 // SAFETY: validated entire readable range, single hart, IRQs masked.
@@ -228,17 +261,63 @@ impl Runtime {
                 *switch = true;
                 0
             }
+            syscall::THREAD_CREATE => {
+                let entry = a0 as usize;
+                let stack = Region {
+                    base: a1 as usize,
+                    size: a2 as usize,
+                };
+                let priority = frame.registers[12];
+                let affinity = frame.registers[13];
+                if entry & 1 != 0
+                    || !self.memory().permits(entry, 2, EXECUTE)
+                    || stack.base & 15 != 0
+                    || stack.size < 256
+                    || stack.size & 15 != 0
+                    || !self.writable(stack.base, stack.size)
+                    || priority > 3
+                    || affinity != 1
+                {
+                    return syscall::EINVAL;
+                }
+                let end = stack.base + stack.size;
+                if self.scheduler.tasks.iter().any(|t| {
+                    t.process == current
+                        && t.state != State::Terminated
+                        && stack.base < t.stack.base + t.stack.size
+                        && t.stack.base < end
+                }) {
+                    return syscall::EINVAL;
+                }
+                let context = arch::TrapFrame::user(entry, end, a3);
+                self.scheduler
+                    .create_thread(
+                        current,
+                        context,
+                        stack,
+                        entry,
+                        priority as u8,
+                        affinity as u8,
+                    )
+                    .unwrap_or_else(|e| (-(e as i32)) as u32)
+            }
+            syscall::PROCESS_EXIT => {
+                for thread in &mut self.scheduler.tasks {
+                    if thread.process == current {
+                        thread.state = State::Terminated;
+                        thread.wait = Wait::None;
+                    }
+                }
+                self.terminate();
+                *switch = true;
+                0
+            }
             syscall::TICKS => self.scheduler.snapshot().uptime_ticks as u32,
             syscall::STATS => {
                 if a1 as usize != syscall::STATS_BYTES {
                     return syscall::EINVAL;
                 }
-                if !self
-                    .scheduler
-                    .current()
-                    .stack
-                    .contains(a0 as usize, syscall::STATS_BYTES)
-                {
+                if !self.writable(a0 as usize, syscall::STATS_BYTES) {
                     return syscall::EFAULT;
                 }
                 let s = self.scheduler.snapshot();
@@ -280,7 +359,7 @@ impl Runtime {
                 if length > ipc::MESSAGE_BYTES {
                     return ipc::EMSGSIZE;
                 }
-                if !self.scheduler.current().readable(a1 as usize, length) {
+                if !self.readable(a1 as usize, length) {
                     return syscall::EFAULT;
                 }
                 // Validate namespace/rights before touching sender's data.
@@ -306,12 +385,7 @@ impl Runtime {
                 if capacity == 0 || capacity > ipc::MESSAGE_BYTES || a3 & !syscall::NONBLOCK != 0 {
                     return syscall::EINVAL;
                 }
-                if !self
-                    .scheduler
-                    .current()
-                    .stack
-                    .contains(a1 as usize, capacity)
-                {
+                if !self.writable(a1 as usize, capacity) {
                     return syscall::EFAULT;
                 }
                 let ep = match self.ipc.resolve(current, a0, ipc::RECEIVE) {
@@ -355,12 +429,7 @@ impl Runtime {
                 if capacity == 0 || capacity > 32 {
                     return syscall::EINVAL;
                 }
-                if !self
-                    .scheduler
-                    .current()
-                    .stack
-                    .contains(a0 as usize, capacity)
-                {
+                if !self.writable(a0 as usize, capacity) {
                     return syscall::EFAULT;
                 }
                 let mut count = 0;
@@ -457,9 +526,14 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     runtime.in_idle = false;
     let task = &mut runtime.scheduler.tasks[runtime.scheduler.current];
     task.context.mcause = cause;
+    let process = task.process;
+    let memory = runtime.processes.slots[process].memory;
     // SAFETY: activate only selected task's RX code / RW stack before mret.
-    if !unsafe { pmp::activate(task.code, task.stack) } {
-        fatal(frame);
+    if runtime.active_space != Some((process, memory.revision)) {
+        if !unsafe { pmp::activate(memory.maps[0].region, memory.maps[1].region) } {
+            fatal(frame);
+        }
+        runtime.active_space = Some((process, memory.revision));
     }
     &task.context
 }
