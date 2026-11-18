@@ -46,6 +46,7 @@ pub unsafe fn start() -> Option<u32> {
         }
         write(BOOT_ADDR, LP_RAM as u32);
         write(BASE + 0x58, 0);
+        word(wire::EVENT_ACK).write_volatile(0);
         let epoch = word(wire::EPOCH).read_volatile().wrapping_add(1).max(1);
         word(wire::EPOCH).write_volatile(epoch);
         write(BASE + 0x5c, 0xffff);
@@ -62,25 +63,46 @@ pub unsafe fn start() -> Option<u32> {
     }
 }
 /// Consume the LP doorbell only after seeing the hardware status bit.
-pub unsafe fn acknowledge(epoch: Option<u32>) -> Option<(u32, u32)> {
+pub unsafe fn acknowledge(epoch: Option<u32>) -> Option<wire::Reply> {
     unsafe {
         let status = read(BASE + 0x54);
         fence();
-        let event = word(wire::EVENT).read_volatile();
+        if status & READY_BIT == 0 {
+            write(BASE + 0x5c, status);
+            return None;
+        }
         let echo = word(wire::ECHO).read_volatile();
-        let seq = word(wire::REPLY_SEQ).read_volatile();
+        let reply = wire::Reply {
+            event: word(wire::EVENT).read_volatile(),
+            request: word(wire::REPLY_SEQ).read_volatile(),
+            result: word(wire::RESULT).read_volatile(),
+            monitor: word(wire::MONITOR).read_volatile(),
+            age: (u64::from(word(wire::AGE_HI).read_volatile()) << 32)
+                | u64::from(word(wire::AGE_LO).read_volatile()),
+            beats: word(wire::BEATS).read_volatile(),
+            published: word(wire::PUBLISH_SEQ).read_volatile(),
+        };
+        // LP cannot overwrite payload until this acknowledgment. Clear before
+        // ACK so a fresh publication after ACK cannot be erased by our clear.
         write(BASE + 0x5c, status);
         fence();
-        (status & READY_BIT != 0 && Some(echo) == epoch).then_some((event, seq))
+        if Some(echo) != epoch {
+            return None;
+        }
+        word(wire::EVENT_ACK).write_volatile(reply.published);
+        fence();
+        Some(reply)
     }
 }
 
-/// Caller owns the only pending request under masked HP interrupts.
-pub unsafe fn hello(seq: u32) {
+/// Sole HP request owner, IRQs masked; arguments precede command doorbell.
+pub unsafe fn request(seq: u32, command: u32, arg0: u32, arg1: u32) {
     unsafe {
+        word(wire::ARG0).write_volatile(arg0);
+        word(wire::ARG1).write_volatile(arg1);
         word(wire::REQUEST_SEQ).write_volatile(seq);
         fence();
-        word(wire::COMMAND).write_volatile(wire::HELLO);
+        word(wire::COMMAND).write_volatile(command);
         fence();
     }
 }

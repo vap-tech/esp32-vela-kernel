@@ -1015,7 +1015,7 @@ impl Runtime {
                 let deadline = self.scheduler.snapshot().uptime_ticks.saturating_add(100);
                 self.scheduler.block(Wait::Sentinel { sequence, deadline });
                 unsafe {
-                    soc::sentinel::hello(sequence);
+                    soc::sentinel::request(sequence, sentinel_wire::HELLO, 0, 0);
                 }
                 *switch = true;
                 0
@@ -1313,21 +1313,22 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         runtime.scheduler.tick(uptime);
         switch = true;
     } else if interrupt && cause == soc::sentinel::LINE {
-        match unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) } {
-            Some((sentinel_wire::READY, _)) => runtime.sentinel_ready = true,
-            Some((sentinel_wire::ACK, seq))
-                if runtime.hello_pending && seq == runtime.sentinel_sequence =>
+        if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) } {
+            if reply.event == sentinel_wire::READY && reply.result == sentinel_wire::OK {
+                runtime.sentinel_ready = true;
+            } else if reply.event == sentinel_wire::ACK
+                && runtime.hello_pending
+                && reply.request == runtime.sentinel_sequence
             {
                 runtime.hello_pending = false;
                 if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
-                    t.state == State::Blocked
-                        && matches!(t.wait, Wait::Sentinel {sequence,..} if seq==sequence)
+                    t.state == State::Blocked && matches!(t.wait,Wait::Sentinel {sequence,..} if sequence == reply.request)
                 }) {
-                    runtime.scheduler.tasks[i].context.registers[8] = seq;
+                    runtime.scheduler.tasks[i].context.registers[8] =
+                        if reply.result == sentinel_wire::OK { reply.request } else { syscall::EINVAL };
                     runtime.scheduler.wake(i);
                 }
             }
-            _ => (),
         }
         switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::dma::LINE {
