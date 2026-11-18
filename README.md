@@ -3,6 +3,8 @@
 Space Flow bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
 Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
 100 Hz priority round robin, bounded process/thread pools, no global heap or async runtime.
+LP Sentinel independently observes HP heartbeats, keeps a diagnostic journal
+and delivers one-shot timer events through the hardware mailbox.
 
 ## Build and run
 
@@ -40,12 +42,50 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `sentinel arm <ms>`, `sentinel wait` | Arm without waiting for expiry; later consume the latched event. |
 | `sentinel cancel` | Cancel the current alarm before it fires; an already-fired event remains available to wait. |
 
+## Quick Sentinel session
+
+Run these commands at the shell prompt:
+
+```text
+sentinel
+sentinel status
+sentinel mark
+sentinel log
+sentinel wake 1000
+sentinel arm 10000
+sentinel cancel
+sentinel arm 10
+sentinel wait
+```
+
+`wake` blocks until the actual LP event. `arm` returns after the setup ACK;
+`wait` also accepts an event that has already arrived. Cancel before expiry;
+if it has already fired, collect it with `sentinel wait`. There is one alarm slot.
+Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
+Neither command enters PMU light/deep sleep.
+
+## Current scope
+
+| Available | Current limit |
+| --- | --- |
+| Process/thread pools, priority scheduling, PMP and capabilities | Hart0 only; no HP SMP or enabled userspace FPU/DSP/PIE state. |
+| ELF32 and static PIE loading | Bundled images selected by index; no general filesystem loader or dynamic linker. |
+| SRAM allocation and controlled DMA copy | PSRAM/XIP and general cached DMA are not enabled. |
+| USB RX event delivery | Boot-bound console event; no dynamic IRQ registration. |
+| Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
+| Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
+
+The shared service RX image is limited to 8 KiB and is close to that budget;
+linker assertions reject overflow. Existing files in docs describe earlier
+bring-up stages; this README records the current supported commands and limits.
+
 ## Kernel and userspace
 
 IPC: endpoint_create/send/recv/endpoint_close, eight endpoints, four queued
 messages each, max 96 bytes, sixteen generational capabilities per process. Creation
 gives owner send+receive rights. Boot assignments and explicit capability grants give SEND to
-peers; global endpoint IDs are not user handles. Endpoint owner alone receives.
+peers; global endpoint IDs are not user handles. Receiving requires an explicit
+process-local RECEIVE capability; handle values alone confer no authority.
 Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
 retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
 message queued. Closing an owner handle destroys endpoint/queue and invalidates
