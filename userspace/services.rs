@@ -12,8 +12,9 @@ macro_rules! text {
     };
 }
 text!(PROMPT, b"vela:/$ ");
-text!(HELP, b"help | cat <path> | uptime | memtest\n");
+text!(HELP, b"help | cat <path> | uptime | run hello | memtest\n");
 text!(HELP_CMD, b"help");
+text!(RUN_HELLO, b"run hello");
 text!(MEMTEST_CMD, b"memtest");
 text!(MEM_OK, b"arena: aligned allocations, bounds, release OK\n");
 text!(MEM_FAIL, b"arena: FAIL\n");
@@ -365,6 +366,10 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     }
     if line.matches(0, HELP_CMD.as_ptr(), HELP_CMD.len()) {
         write(HELP.as_ptr(), HELP.len());
+    } else if line.matches(0, RUN_HELLO.as_ptr(), RUN_HELLO.len()) {
+        if (call(abi::SPAWN_HELLO, 0, 0, 0, 0) as i32) < 0 {
+            write(FAILED.as_ptr(), FAILED.len());
+        }
     } else if line.matches(0, MEMTEST_CMD.as_ptr(), MEMTEST_CMD.len()) {
         if arena_probe() {
             write(MEM_OK.as_ptr(), MEM_OK.len());

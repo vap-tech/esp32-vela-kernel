@@ -435,6 +435,55 @@ impl Runtime {
             }
         }
     }
+    fn spawn_elf(&mut self, bytes: &[u8]) -> Result<u32, u32> {
+        let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| 8u32)?;
+        let process = self.processes.create(AddressSpace::EMPTY)?;
+        let owner = self.processes.slots[process].id;
+        let result = (|| {
+            let mut space = AddressSpace::EMPTY;
+            for (i, segment) in image.segments().iter().enumerate() {
+                let region =
+                    self.allocator
+                        .reserve(owner, segment.region.base, segment.region.size)?;
+                let mut rights = READ;
+                if segment.flags & 1 != 0 {
+                    rights |= EXECUTE;
+                }
+                if segment.flags & 2 != 0 {
+                    rights |= WRITE;
+                }
+                space.insert(region, rights)?;
+                let data = image.data(i).ok_or(8u32)?;
+                // Reserved private SRAM. Clear BSS and all PMP-visible padding.
+                unsafe {
+                    core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        region.base as *mut u8,
+                        data.len(),
+                    );
+                }
+            }
+            let stack = self.allocator.allocate(owner, 4096)?;
+            space.insert(stack, READ | WRITE)?;
+            let prepared = pmp::Prepared::new(&space)?;
+            unsafe {
+                core::ptr::write_bytes(stack.base as *mut u8, 0, stack.size);
+                core::arch::asm!("fence.i", options(nostack));
+            }
+            let frame = arch::TrapFrame::user(image.entry, stack.base + stack.size, 0);
+            self.scheduler
+                .create_thread(process, frame, stack, image.entry, 1, 1)?;
+            self.processes.slots[process].memory = space;
+            self.pmp_images[process] = Some((space.revision, prepared));
+            Ok(owner)
+        })();
+        if result.is_err() {
+            self.allocator.release_owner(owner);
+            self.processes.slots[process] = vela_kernel::process::Process::EMPTY;
+        }
+        result
+    }
     fn dispatch(&mut self, frame: &mut arch::TrapFrame, switch: &mut bool) -> u32 {
         let a0 = frame.registers[8];
         let a1 = frame.registers[9];
@@ -442,6 +491,13 @@ impl Runtime {
         let a3 = frame.registers[11];
         let current = self.scheduler.current().process;
         match frame.registers[15] {
+            syscall::SPAWN_HELLO => {
+                if self.processes.slots[current].id != 2 {
+                    return cap::EPERM;
+                }
+                self.spawn_elf(include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")))
+                    .unwrap_or_else(|e| (-(e as i32)) as u32)
+            }
             syscall::WRITE => {
                 let length = a1 as usize;
                 if length > 128 {
