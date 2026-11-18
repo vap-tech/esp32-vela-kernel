@@ -29,11 +29,12 @@ impl TrapFrame {
     }
 }
 unsafe extern "C" {
+    pub fn vela_idle_entry();
     fn vela_resume(frame: *const TrapFrame) -> !;
 }
 /// # Safety
 /// Hart0 M-mode, IRQs disabled, valid user mappings and kernel stack, complete
-/// integer frame with MPP=U, FS=off. Does not resume M-mode callers.
+/// integer frame with FS=off; MPP=U or the dedicated M-mode idle continuation.
 pub unsafe fn enter(frame: *const TrapFrame) -> ! {
     unsafe { vela_resume(frame) }
 }

@@ -1,13 +1,15 @@
 use crate::{
     stats::{HZ, LoadAverage, Snapshot},
-    task::{Region, State, Task},
+    task::{Region, State, Task, Wait},
 };
 
-/// Static two-slot round robin. Only accessed by hart0 with machine interrupts
+pub const TASKS: usize = 3;
+
+/// Static three-slot round robin. Only accessed by hart0 with machine interrupts
 /// disabled; all context switches happen at the outermost user trap boundary.
 /// C is architecture-owned saved CPU state; this crate has no SoC dependency.
 pub struct Scheduler<C: Copy> {
-    pub tasks: [Task<C>; 2],
+    pub tasks: [Task<C>; TASKS],
     pub current: usize,
     ticks: u64,
     uptime: u64,
@@ -16,12 +18,18 @@ pub struct Scheduler<C: Copy> {
     load: LoadAverage,
 }
 impl<C: Copy> Scheduler<C> {
-    pub fn new(contexts: [C; 2], entry: usize, code: Region, stacks: [Region; 2]) -> Self {
+    pub fn new(
+        contexts: [C; TASKS],
+        entries: [usize; TASKS],
+        code: Region,
+        stacks: [Region; TASKS],
+    ) -> Self {
         let tasks = core::array::from_fn(|i| Task {
             id: i as u32 + 1,
+            wait: Wait::None,
             state: if i == 0 { State::Running } else { State::Ready },
             context: contexts[i],
-            entry,
+            entry: entries[i],
             code,
             stack: stacks[i],
             runtime_ticks: 0,
@@ -33,7 +41,7 @@ impl<C: Copy> Scheduler<C> {
             ticks: 0,
             uptime: 0,
             sampled_at: 0,
-            last_id: 2,
+            last_id: TASKS as u32,
             load: LoadAverage::default(),
         }
     }
@@ -45,7 +53,17 @@ impl<C: Copy> Scheduler<C> {
     }
     pub fn tick(&mut self, uptime: u64) {
         self.ticks += 1;
-        self.tasks[self.current].runtime_ticks += uptime.saturating_sub(self.uptime);
+        if self.tasks[self.current].state == State::Running {
+            self.tasks[self.current].runtime_ticks += uptime.saturating_sub(self.uptime);
+        }
+        for task in &mut self.tasks {
+            if task.state == State::Blocked
+                && matches!(task.wait, Wait::Sleep { until } if until <= uptime)
+            {
+                task.wait = Wait::None;
+                task.state = State::Ready;
+            }
+        }
         self.uptime = uptime;
         while self.uptime.saturating_sub(self.sampled_at) >= 5 * HZ {
             self.load.sample(self.snapshot().runnable_tasks);
@@ -70,7 +88,18 @@ impl<C: Copy> Scheduler<C> {
         }
         None
     }
+    pub fn block(&mut self, wait: Wait) {
+        self.tasks[self.current].wait = wait;
+        self.tasks[self.current].state = State::Blocked;
+    }
+    pub fn wake(&mut self, task: usize) {
+        if self.tasks[task].state == State::Blocked {
+            self.tasks[task].wait = Wait::None;
+            self.tasks[task].state = State::Ready;
+        }
+    }
     pub fn terminate(&mut self) {
+        self.tasks[self.current].wait = Wait::None;
         self.tasks[self.current].state = State::Terminated;
     }
     pub fn snapshot(&self) -> Snapshot {

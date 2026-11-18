@@ -62,7 +62,8 @@ vela_resume:
     # a0 points to a kernel-owned task frame. Drop trap call stack completely.
     mv sp, a0
     lw t0, 124(sp)
-    # All resumable contexts belong to U-mode, outside any interrupt handler.
+    # User contexts and the dedicated kernel idle continuation both return
+    # outside any interrupt handler.
     # P4 CLIC carries MPIL in mcause[23:16]. Never carry a machine handler's
     # active level across a user context switch (not a nested IRQ return).
     li t1, 0x00ff0000
@@ -77,6 +78,12 @@ vela_resume:
     .option norelax
     la t0, _stack_top
     .option pop
+    lw t1, 136(sp)
+    srli t1, t1, 11
+    andi t1, t1, 3
+    beqz t1, .Luser_scratch
+    li t0, 0
+.Luser_scratch:
     csrw mscratch, t0
     lw ra, 0(sp)
     lw gp, 4(sp)
@@ -110,3 +117,9 @@ vela_resume:
     lw t6, 116(sp)
     lw sp, 120(sp)
     mret
+
+.balign 4
+.global vela_idle_entry
+vela_idle_entry:
+    wfi
+    j vela_idle_entry

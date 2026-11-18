@@ -1,52 +1,55 @@
-# Vela
+# Vela v0.3
 
-Space Flow bare-metal Rust microkernel on ESP32-P4 v1.3 / M5Stack Tab5.
-Current code: hart0 M-mode kernel, two U-mode task instances with private 4 KiB
-stacks, shared RX user code, PMP isolation, 100 Hz SYSTIMER/CLIC round robin.
-Tasks run computation without yield; only timer interrupts switch them by default.
-No allocator, async runtime, SMP, IPC, VFS or shell.
+Space Flow bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
+Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
+100 Hz preemptive round robin, static storage, no heap or async runtime.
 
-```sh
-./scripts/build.sh
-./scripts/flash.sh /dev/ttyACM0
-./scripts/monitor.sh /dev/ttyACM0
-```
+    ./scripts/build.sh
+    ./scripts/flash.sh /dev/ttyACM0
+    ./scripts/monitor.sh /dev/ttyACM0
 
-Rust toolchain is pinned; host needs rustup, Python 3 and espflash 4.7.0.
-Monitor: Ctrl-R resets, Ctrl-C detaches. Bring-up commands affect the currently
-running task: `a` enters a U-mode syscall probe (stats/bad pointer/yield/exit),
-`k` attempts a kernel SRAM read, `m` attempts USB MMIO, `s` attempts peer-stack read.
-Faulting tasks terminate; their peers continue. With no runnable tasks the kernel
-halts; an idle task and blocking/wakeup paths are not implemented.
+Monitor Ctrl-R resets; Ctrl-C detaches. Shell: help, cat <path>, uptime.
+Try cat /proc/loadavg and cat /proc/uptime. File lookup and formatting run in
+userspace procfs, requested through IPC; no kernel VFS or hardcoded file output.
 
-ABI is in abi/syscall.rs: write/yield/exit plus ticks and stats. STATS returns an
-explicit 44-byte little-endian snapshot, not an internal kernel struct or pointer.
-WRITE validates the whole buffer against current user mappings (128-byte limit),
-returns the actual submitted count, and never waits indefinitely for USB.
-User code is in userspace/first_tasks.rs; init/worker share the same fixed image
-with distinct role arguments, contexts and stacks. All user data is stack-local.
-FP is disabled; FP instructions fault rather than leaking unsaved FP state.
+IPC: endpoint_create/send/recv/endpoint_close, eight endpoints, four queued
+messages each, max 96 bytes, six generational local handles per task. Creation
+gives owner send+receive rights. Only explicit boot assignments grant SEND to
+peers; global endpoint IDs are not user handles. Endpoint owner alone receives.
+Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
+retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
+message queued. Closing an owner handle destroys endpoint/queue and invalidates
+all aliases; pending receives complete with EPIPE. Subsequent stale handles return
+EBADF. Closing a peer SEND alias only releases that alias, not the endpoint.
+Exit/fault cleans up owned endpoints and local aliases.
 
-Scheduler statistics are separate from scheduling policy in kernel/src/stats.rs.
-Runnable means Ready+Running, total means live tasks including Blocked, last ID
-includes terminated tasks. Scheduler ticks count delivered timer interrupts;
-uptime ticks come from the actual hardware counter in 10ms units since timer start.
-These can differ after pending/coalesced interrupts. Every 5 seconds, Q16 EWMA
-samples runnable tasks with exp(-5/tau), tau=60/300/900 seconds; initial value is zero.
-The `load_q16` diagnostic contains actual Q16 values, not decimal /proc output.
+Queue check and wait registration are serialized with masked IRQs on hart0.
+Send copies through kernel storage, completes the receiver's own saved return
+register and then wakes it. mepc advances once, before blocking. All buffers
+are validated against current mappings; writable buffers must be private stack.
+There is no user-to-user shared writable mapping.
 
-Hardware smoke passed on 2026-11-17: U-mode ecalls, both no-yield tasks preempted,
-PMP denial of kernel SRAM/MMIO/peer stack, fault termination with peer continuing,
-write/stats/bad-pointer/yield/exit ABI probe. Logs: target/multitasking-abi.log and
-target/multitasking-active-cause.log. No readback, power-cycle or stress test was done
-for this milestone. Boot entry.S is unchanged; old First Light docs describe history.
+Idle is a separate kernel WFI continuation, never a user task or loadavg input.
+Timer wakes sleeping tasks; recv wakes on send. Kernel references do not survive
+idle entry, and M-mode traps are resumable only from that assembly idle loop.
+CLIC return keeps the active trap's bookkeeping and target privilege.
 
-The return path is specific to P4's CLIC: saves all integer registers, mepc,
-mstatus, raw mcause, uses mscratch to enter a kernel stack, and restores the live
-trap's CLIC bookkeeping on task selection. Every user return resets previous
-machine interrupt level to zero; kernel interrupts are never nested. Kernel faults
-halt. Fatal faults during stack corruption/return are not a hardened recovery path.
-PMP CSR readback is checked on activation; this is memory isolation, not a security audit.
+Console RX is deliberately bounded polling in a U-mode service: <=32 bytes per
+sample, sleeps one 10ms tick between samples, with boot-assigned read authority.
+This is not interrupt-driven USB input. Shell blocks on input IPC and reply IPC.
+No USB polling or periodic console formatting occurs in the timer ISR.
 
-Next: kernel idle task and block/wakeup semantics, then user-facing syscall ABI
-library and a userspace procfs service; no fictitious file operations are provided.
+Stats ABI remains an explicit 44-byte little-endian snapshot. Total counts live
+tasks (including Blocked), runnable is Ready+Running; last ID includes exited
+tasks. Idle is not in the task pool. Delivered timer IRQs and hardware uptime
+ticks are separate. Q16 load averages sample runnable count every five seconds
+with exp(-5/tau), tau=60/300/900 seconds; reads never reset accumulated values.
+Load is sampled runnable demand, not CPU utilization: console wakeups can
+contribute even when the CPU spends most time in WFI.
+
+Hardware v0.3 smoke: blocked receive/wakeup, kernel WFI and timer wake,
+shell IPC reads of loadavg/uptime, help and unknown-file response.
+Logs are in ignored target/v03-smoke.log and target/v03-final.log.
+First Light documents are historical. Boot entry, packer and fixed Flash
+offsets are unchanged. Only SRAM task-stack reservations gained a third stack.
+No SMP, full capabilities, allocator, POSIX, kernel VFS or general driver framework.

@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "vela-boot-esp32p4"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "vela-kernel",
 ]
 
 [[package]]
 name = "vela-kernel"
-version = "0.1.0"
+version = "0.3.0"

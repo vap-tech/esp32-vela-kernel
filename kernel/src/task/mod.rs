@@ -21,9 +21,22 @@ pub enum State {
     Blocked,
     Terminated,
 }
+#[derive(Clone, Copy, Debug)]
+pub enum Wait {
+    None,
+    Receive {
+        endpoint: usize,
+        pointer: usize,
+        capacity: usize,
+    },
+    Sleep {
+        until: u64,
+    },
+}
 #[derive(Clone, Copy)]
 pub struct Task<C: Copy> {
     pub id: u32,
+    pub wait: Wait,
     pub state: State,
     pub context: C,
     pub entry: usize,

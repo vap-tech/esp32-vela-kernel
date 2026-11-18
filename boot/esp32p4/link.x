@@ -25,6 +25,7 @@ SECTIONS {
   _bss_start = .; *(.bss .bss.* .sbss .sbss.*); *(COMMON);
   . = ALIGN(4096); _user_stack0 = .; . += 4096;
   _user_stack1 = .; . += 4096;
+  _user_stack2 = .; . += 4096;
   . = ALIGN(16); _bss_end = .;
  } > UPPER
  _boot_stack_top = ORIGIN(BOOT_STACK) + LENGTH(BOOT_STACK);
