@@ -77,3 +77,6 @@ pub const WAKE_ALREADY: u32 = 7;
 pub const LOG_WAKE_ARMED: u16 = 6;
 pub const LOG_WAKE_FIRED: u16 = 7;
 pub const LOG_WAKE_CANCELLED: u16 = 8;
+
+// Retry doorbell carries the original 31-bit sequence in the same MMIO word.
+pub const RETRY_HEARTBEAT: u32 = 1 << 31;

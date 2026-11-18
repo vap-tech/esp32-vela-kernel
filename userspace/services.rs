@@ -75,6 +75,7 @@ text!(HELLO_CMD, b"sentinel hello");
 text!(ACK_MSG, b"Sentinel ACK seq ");
 text!(SENTINEL, b"sentinel");
 text!(READY, b"Sentinel READY v");
+text!(OFFLINE, b"Sentinel heartbeat timeout, epoch ");
 text!(PENDING, b"Sentinel pending, epoch ");
 text!(EPOCH, b", epoch ");
 text!(RUN_PIC, b"run pic");
@@ -205,7 +206,8 @@ impl Buffer {
         }
         (value != 0).then_some(value)
     }
-    #[inline(always)]
+    #[unsafe(link_section = ".user.text")]
+    #[inline(never)]
     fn matches(&self, offset: usize, pointer: *const u8, length: usize) -> bool {
         if self.len != offset + length {
             return false;
@@ -723,7 +725,9 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     } else if line.matches(0, SENTINEL.as_ptr(), SENTINEL.len()) {
         let (version, epoch) = call6(abi::SENTINEL_STATUS, 0, 0, 0, 0, 0, 0);
         let mut out = Buffer::new();
-        if version != 0 {
+        if version == (-110i32) as u32 {
+            out.append(OFFLINE.as_ptr(), OFFLINE.len());
+        } else if version != 0 {
             out.append(READY.as_ptr(), READY.len());
             out.decimal(version);
             out.append(EPOCH.as_ptr(), EPOCH.len());

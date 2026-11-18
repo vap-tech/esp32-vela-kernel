@@ -177,6 +177,11 @@ counts asynchronous missed notifications actually received by HP. A blocked
 status/HELLO request times out after one second; its transport slot stays
 reserved until the matching response, so a late reply cannot complete a new call.
 
+If an automatic heartbeat receives no reply for one second, `sentinel` reports
+a heartbeat timeout. HP retries the original sequence once per second. LP
+acknowledges duplicate delivery without counting a second beat, and HP resumes
+normal operation on the matching reply.
+
 Wire version 2 uses scalar mailbox words only:
 HP owns 0(epoch), 3(request seq), 4(command doorbell), 6/7(args),
 13(LP publication ACK) and 15(calibrated Hz).

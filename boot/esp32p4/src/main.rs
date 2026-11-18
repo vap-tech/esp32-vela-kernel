@@ -42,21 +42,7 @@ impl Call {
         server: None,
     };
 }
-#[derive(Clone, Copy)]
-enum WakePhase {
-    Requested,
-    Armed,
-    Fired(u32),
-}
-#[derive(Clone, Copy)]
-struct WakeTicket {
-    token: u32,
-    owner: u32,
-    started: u64,
-    expires: u64,
-    delay_ms: u32,
-    phase: WakePhase,
-}
+use vela_kernel::sentinel::{WakePhase, WakeTicket};
 struct Runtime {
     scheduler: Scheduler<arch::TrapFrame>,
     processes: Processes,
@@ -80,6 +66,7 @@ struct Runtime {
     sentinel_argument: u32,
     sentinel_diagnostics: u32,
     sentinel_hz: u32,
+    heartbeat_link: vela_kernel::sentinel::Heartbeat,
     sentinel_heartbeat: bool,
     sentinel_next_beat: u64,
     sentinel_notifications: u32,
@@ -237,6 +224,7 @@ extern "C" fn rust_main() -> ! {
         sentinel_argument: 0,
         sentinel_diagnostics: 0,
         sentinel_hz: 0,
+        heartbeat_link: Default::default(),
         sentinel_heartbeat: true,
         sentinel_next_beat: 0,
         sentinel_notifications: 0,
@@ -347,6 +335,9 @@ impl Runtime {
         if !self.sentinel_ready {
             return Err(syscall::EAGAIN);
         }
+        if self.heartbeat_link.offline {
+            return Err((-110i32) as u32);
+        }
         if self.sentinel_pending {
             return Err((-16i32) as u32);
         }
@@ -411,6 +402,9 @@ impl Runtime {
             return;
         }
         self.sentinel_pending = false;
+        if command == sentinel_wire::HEARTBEAT {
+            self.heartbeat_link.acknowledge(reply.request);
+        }
         let error_code = match reply.result {
             sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => (-75i32) as u32,
             sentinel_wire::LOG_UNKNOWN => (-2i32) as u32,
@@ -515,6 +509,13 @@ impl Runtime {
         self.scheduler.wake(i);
     }
     fn sentinel_tick(&mut self, uptime: u64) {
+        if self.heartbeat_link.retry_due(uptime) {
+            // Keep the slot and payload stable until the original heartbeat completes.
+            unsafe {
+                soc::sentinel::retry_heartbeat(self.sentinel_sequence);
+            }
+            return;
+        }
         if self.sentinel_ready
             && self.sentinel_heartbeat
             && !self.sentinel_pending
@@ -523,6 +524,7 @@ impl Runtime {
                 .sentinel_request(sentinel_wire::HEARTBEAT, 3000, 0)
                 .is_ok()
         {
+            self.heartbeat_link.sent(self.sentinel_sequence, uptime);
             self.sentinel_next_beat = uptime.saturating_add(100);
         }
     }
@@ -693,7 +695,14 @@ impl Runtime {
         {
             return;
         }
-        self.dma.release_process(self.processes.slots[process].id);
+        let owner = self.processes.slots[process].id;
+        if self
+            .sentinel_wake
+            .is_some_and(|ticket| ticket.release_on_exit(owner))
+        {
+            self.sentinel_wake = None;
+        }
+        self.dma.release_process(owner);
         self.processes.slots[process].state = Lifecycle::Dying;
         let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
         for i in 0..TASKS {
@@ -1408,7 +1417,9 @@ impl Runtime {
             }
             syscall::SENTINEL_STATUS => {
                 frame.registers[9] = self.sentinel_epoch.unwrap_or(0);
-                if self.sentinel_ready {
+                if self.heartbeat_link.offline {
+                    (-110i32) as u32
+                } else if self.sentinel_ready {
                     sentinel_wire::VERSION
                 } else {
                     0

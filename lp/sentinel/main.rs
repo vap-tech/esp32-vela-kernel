@@ -172,11 +172,29 @@ extern "C" fn receive_command() {
         asm!("fence iorw, iorw", options(nostack));
         ((mailbox::BASE + 0x4c) as *mut u32).write_volatile(status);
         let local = &mut *LOCAL.0.get();
-        if status & (1 << wire::COMMAND) != 0 {
-            local.pending = true;
-        }
         if local.busy && mailbox::word(wire::EVENT_ACK).read_volatile() == local.published {
             local.busy = false;
+        }
+        if status & (1 << wire::COMMAND) != 0 {
+            let command = mailbox::word(wire::COMMAND).read_volatile();
+            if command & wire::RETRY_HEARTBEAT == 0 {
+                local.pending = true;
+            } else {
+                let sequence = command & !wire::RETRY_HEARTBEAT;
+                if sequence > local.last_request {
+                    // First delivery; HP still owns this request and its arguments.
+                    local.pending = true;
+                } else if sequence == local.last_request {
+                    if local.busy {
+                        // Republish the unchanged slot until HP acknowledges it.
+                        let event = mailbox::word(wire::EVENT);
+                        event.write_volatile(event.read_volatile());
+                        asm!("fence iorw,iorw", options(nostack));
+                    } else {
+                        publish(local, wire::ACK, sequence, wire::OK);
+                    }
+                }
+            }
         }
         service(local);
     }
@@ -233,6 +251,11 @@ unsafe fn process_command(local: &mut Transport) {
         let epoch = mailbox::word(wire::EPOCH).read_volatile();
         let sequence = mailbox::word(wire::REQUEST_SEQ).read_volatile();
         let command = mailbox::word(wire::COMMAND).read_volatile();
+        let command = if command == wire::RETRY_HEARTBEAT | sequence {
+            wire::HEARTBEAT
+        } else {
+            command
+        };
         if epoch != local.epoch || sequence == 0 || sequence <= local.last_request {
             return;
         }

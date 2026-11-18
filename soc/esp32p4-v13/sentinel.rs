@@ -131,3 +131,11 @@ pub unsafe fn request(seq: u32, command: u32, arg0: u32, arg1: u32) {
         fence();
     }
 }
+
+/// Reassert only the doorbell while the original request still owns the slot.
+pub unsafe fn retry_heartbeat(sequence: u32) {
+    unsafe {
+        word(wire::COMMAND).write_volatile(wire::RETRY_HEARTBEAT | sequence);
+        fence();
+    }
+}
