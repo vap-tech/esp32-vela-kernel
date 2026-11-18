@@ -29,6 +29,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
 | `cat /proc/interrupts` | Read 64-bit SYSTIMER and USB Serial/JTAG RX interrupt counts on hart0. |
+| `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
 | `memtest` | Check aligned userspace allocation, bounds and release. |
 | `run hello`, `run pic` | Launch the bundled fixed-address ELF and static PIE, respectively. |
 | `run dma` | Copy and verify 2048 bytes of SRAM using GDMA-AHB. |
@@ -42,6 +43,13 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `sentinel prepare <ms>` | Agree a heartbeat pause with LP for 1–60000 ms while HP stays active. Use `sentinel cancel` or `sentinel wait` with the returned alarm. |
 | `sentinel arm <ms>`, `sentinel wait` | Arm without waiting for expiry; later consume the latched event. |
 | `sentinel cancel` | Cancel the current alarm before it fires; an already-fired event remains available to wait. |
+
+The bars come from the DSI host pattern generator and require no framebuffer.
+The command reports completion after PHY lock and command FIFO drain. Inspect
+the glass to confirm scanout. Display errors 1 and 2 indicate expander and
+touch I²C failures, 3 a PHY startup timeout, 4 a packet FIFO timeout and 5
+loss of PHY lock. Values 256–511 encode an unsupported touch firmware byte
+as 256 plus the version.
 
 ## Quick Sentinel session
 

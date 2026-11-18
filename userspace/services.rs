@@ -16,6 +16,9 @@ text!(
     HELP,
     b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n"
 );
+text!(DISPLAY, b"display test");
+text!(BARS, b"ST7121 DSI bars enabled\n");
+text!(DISPLAY_ERROR, b"display error ");
 text!(HELP_CMD, b"help");
 text!(RUN_DMA, b"run dma");
 text!(PAUSE_CMD, b"sentinel pause");
@@ -32,7 +35,7 @@ text!(WAIT_CMD, b"sentinel wait");
 text!(CANCEL_CMD, b"sentinel cancel");
 text!(
     WAKE_HELP,
-    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel\n"
+    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test\n"
 );
 text!(WAKE_ARMED, b"Sentinel wake armed token=");
 text!(WAKE_FIRED, b"Sentinel WAKE_EVENT token=");
@@ -126,7 +129,8 @@ fn exit() -> ! {
         core::hint::spin_loop();
     }
 }
-#[inline(always)]
+#[unsafe(link_section = ".user.text")]
+#[inline(never)]
 fn write(pointer: *const u8, length: usize) {
     call(abi::WRITE, pointer as u32, length as u32, 0, 0);
 }
@@ -152,7 +156,8 @@ impl Buffer {
     fn mut_ptr(&mut self) -> *mut u8 {
         self.bytes.as_mut_ptr().cast::<u8>()
     }
-    #[inline(always)]
+    #[unsafe(link_section = ".user.text")]
+    #[inline(never)]
     fn push(&mut self, byte: u8) {
         if self.len < abi::IPC_BYTES {
             // SAFETY: bounded destination, len tracks initialized bytes only.
@@ -655,6 +660,21 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     if line.matches(0, HELP_CMD.as_ptr(), HELP_CMD.len()) {
         write(HELP.as_ptr(), HELP.len());
         write(WAKE_HELP.as_ptr(), WAKE_HELP.len());
+    } else if line.matches(0, DISPLAY.as_ptr(), DISPLAY.len()) {
+        let mut rc = call(abi::DISPLAY_TEST, 1, 0, 0, 0);
+        while (rc as i32) > 0 {
+            call(abi::SLEEP, rc, 0, 0, 0);
+            rc = call(abi::DISPLAY_TEST, 0, 0, 0, 0);
+        }
+        if rc == 0 {
+            write(BARS.as_ptr(), BARS.len());
+        } else {
+            let mut out = Buffer::new();
+            out.append(DISPLAY_ERROR.as_ptr(), DISPLAY_ERROR.len());
+            out.decimal(0u32.wrapping_sub(rc));
+            out.push(b'\n');
+            write(out.ptr(), out.len);
+        }
     } else if line.matches(0, RUN_HELLO.as_ptr(), RUN_HELLO.len())
         || line.matches(0, RUN_PIC.as_ptr(), RUN_PIC.len())
         || line.matches(0, RUN_DMA.as_ptr(), RUN_DMA.len())
