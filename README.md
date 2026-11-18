@@ -4,14 +4,35 @@ Space Flow bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
 Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
 100 Hz priority round robin, bounded process/thread pools, no global heap or async runtime.
 
-    ./scripts/build.sh
-    ./scripts/flash.sh /dev/ttyACM0
-    ./scripts/monitor.sh /dev/ttyACM0
+## Build and run
 
-Monitor Ctrl-R resets; Ctrl-C detaches. Shell: help, cat <path>, uptime, memtest.
-Try cat /proc/loadavg and cat /proc/uptime. /proc/interrupts reports the 64-bit
-counts of delivered SYSTIMER and USB Serial/JTAG RX interrupts on hart0. File lookup and formatting run in
-userspace procfs, requested through IPC; no kernel VFS or hardcoded file output.
+The build requires Rustup, Clang with RISC-V support, `ld.lld`, `espflash`
+and Python 3. The pinned toolchain in `rust-toolchain.toml` includes the HP
+and LP targets. The build produces `target/firmware.bin` with the bundled
+userspace programs and the separate LP Sentinel image.
+
+```sh
+./scripts/build.sh
+./scripts/flash.sh /dev/ttyACM0
+./scripts/monitor.sh /dev/ttyACM0
+```
+
+The flash script rebuilds the image and checks the configured Tab5 before
+writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
+
+| Shell command | Result |
+| --- | --- |
+| `help` | List shell commands. |
+| `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
+| `cat /proc/loadavg` | Read sampled runnable demand. |
+| `cat /proc/interrupts` | Read 64-bit SYSTIMER and USB Serial/JTAG RX interrupt counts on hart0. |
+| `memtest` | Check aligned userspace allocation, bounds and release. |
+| `run hello`, `run pic` | Launch the bundled fixed-address ELF and static PIE, respectively. |
+| `run dma` | Copy and verify 2048 bytes of SRAM using GDMA-AHB. |
+| `sentinel` | Show the LP protocol version and boot epoch acknowledged by HP. |
+| `sentinel hello` | Send HELLO via the hardware mailbox and print the acknowledged sequence. |
+
+## Kernel and userspace
 
 IPC: endpoint_create/send/recv/endpoint_close, eight endpoints, four queued
 messages each, max 96 bytes, sixteen generational capabilities per process. Creation
@@ -52,11 +73,6 @@ with exp(-5/tau), tau=60/300/900 seconds; reads never reset accumulated values.
 Load is sampled runnable demand, not CPU utilization: console wakeups can
 contribute even when the CPU spends most time in WFI.
 
-Hardware v0.3 smoke: blocked receive/wakeup, kernel WFI and timer wake,
-shell IPC reads of loadavg/uptime, help and unknown-file response.
-Logs are in ignored target/v03-smoke.log and target/v03-final.log.
-First Light documents are historical. Boot entry, packer and fixed Flash
-offsets are unchanged. Only SRAM task-stack reservations gained a third stack.
 Processes own address spaces, cached PMP images and capability tables; threads
 own saved contexts, stacks and priority/affinity. MEM_ALLOC reserves zeroed,
 NAPOT-compatible owned SRAM; MEM_FREE revokes aliases before reuse. Endpoint
@@ -71,9 +87,9 @@ alignment, writable allocations, exhaustion and release in U-mode.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
 No SMP, POSIX, kernel VFS or dynamic IRQ registration.
 
-The shell launches a fixed-address ET_EXEC with `run hello` and a static PIE
-with `run pic`. Building both programs requires clang with the RISC-V target
-and ld.lld. The loader checks RV32 bounds, segment permissions and entry before
+## ELF and DMA
+
+The ELF loader checks RV32 bounds, segment permissions and entry before
 starting the process with a private stack and empty capability table. Exit and
 fault release its SRAM. Each PIE receives one aligned backing allocation and
 separate PMP mappings for its segments. The supported relocation is symbol-free
@@ -91,21 +107,23 @@ the caller. Exit defers page reuse until completion. Failure or a one-second
 timeout quarantines the page until reboot. The buffer supports internal SRAM
 on this channel; PSRAM and cached user mappings require separate cache handling.
 
-On Tab5 v1.3, `sentinel` shows the LP firmware version and startup epoch
-acknowledged by HP. The build compiles a separate no_std RV32IMAC binary with
-the target listed in rust-toolchain.toml. HP stalls LP, loads the binary at
-0x50108000, sets the LP reset vector, clears stale mailbox interrupts and
-starts LP. Only HP writes mailbox word 0 (epoch). LP writes word 1 (echo),
-issues an I/O fence, then writes word 2 (versioned READY) to signal HP CLIC
-line 20. HP checks the latched bit, event and epoch and acknowledges the IRQ.
-The firmware then waits in WFI with mailbox interrupt 26 enabled. Hardware smoke returned `Sentinel READY v1,
-epoch 1` and the shell continued to serve uptime and loadavg. Heartbeat,
-diagnostics and sleep supervision remain future protocol commands.
+## LP Sentinel
 
-The boot shell sends a request with `sentinel hello`. HP writes its sequence
-to word 3 and HELLO to word 4. The LP interrupt handler clears the command
-latch, echoes the epoch and writes the sequence to word 5 before ringing the
-HP event doorbell with ACK. HP wakes the caller on a matching epoch and
-sequence. One request may be outstanding. A one-second timeout releases the
-caller; the mailbox slot stays busy until the matching ACK or the next boot.
-Tab5 v1.3 smoke: READY epoch 2, ACK sequences 1 and 2, uptime and loadavg.
+Sentinel is a separate `no_std` RV32IMAC image. HP stalls and resets LP,
+loads the image into LP SRAM at `0x50108000`, sets the boot address and
+clears stale mailbox interrupts before starting LP. Sentinel initializes its
+own stack and BSS. It then replies with READY and waits in WFI with LP
+mailbox interrupt 26 enabled. Heartbeat, diagnostics and sleep supervision
+are pending.
+
+HP owns mailbox words 0 (boot epoch), 3 (request sequence) and 4 (command).
+LP owns words 1 (echoed epoch), 5 (reply sequence) and 2 (event). Each sender
+writes the payload before the word that triggers the receiver's interrupt.
+HP acknowledges READY and ACK on CLIC line 20. A HELLO caller resumes after
+an ACK matches both epoch and sequence. One request can be outstanding. A
+one-second timeout releases the caller and keeps the slot reserved until
+the matching ACK or the next boot.
+
+The Tab5 v1.3 smoke test after reflashing returned `Sentinel READY v1, epoch 2`,
+then `Sentinel ACK seq 1` and `Sentinel ACK seq 2`. Both `uptime` and
+`cat /proc/loadavg` still worked.
