@@ -2,6 +2,7 @@
 #![no_main]
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
+    capability::{self as cap, Capability, Object},
     ipc::{self, Ipc, Message},
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
@@ -86,14 +87,21 @@ extern "C" fn rust_main() -> ! {
             size: 4096,
         },
     ];
+    let mut processes = Processes::new();
+    for stack in stacks {
+        let mut memory = AddressSpace::EMPTY;
+        memory.insert(code, READ | EXECUTE).unwrap();
+        memory.insert(stack, READ | WRITE).unwrap();
+        processes.create(memory).unwrap();
+    }
     // Explicit boot policy. Kernel IPC module has no service names/protocols.
     let mut ipc = Ipc::new();
-    let request = ipc.create(0).unwrap();
-    let reply = ipc.create(1).unwrap();
-    let input = ipc.create(1).unwrap();
-    let shell_request = ipc.grant_send(0, request, 1).unwrap();
-    let proc_reply = ipc.grant_send(1, reply, 0).unwrap();
-    let console_input = ipc.grant_send(1, input, 2).unwrap();
+    let request = create_endpoint(&mut ipc, &mut processes, 0).unwrap();
+    let reply = create_endpoint(&mut ipc, &mut processes, 1).unwrap();
+    let input = create_endpoint(&mut ipc, &mut processes, 1).unwrap();
+    let shell_request = grant(&mut processes, 0, request, 1, cap::SEND).unwrap();
+    let proc_reply = grant(&mut processes, 1, reply, 0, cap::SEND).unwrap();
+    let console_input = grant(&mut processes, 1, input, 2, cap::SEND).unwrap();
     let entries = [
         users::procfs_main as *const () as usize,
         users::shell_main as *const () as usize,
@@ -104,13 +112,6 @@ extern "C" fn rust_main() -> ! {
         [reply, shell_request, input],
         [console_input, 0, 0],
     ];
-    let mut processes = Processes::new();
-    for stack in stacks {
-        let mut memory = AddressSpace::EMPTY;
-        memory.insert(code, READ | EXECUTE).unwrap();
-        memory.insert(stack, READ | WRITE).unwrap();
-        processes.create(memory).unwrap();
-    }
     let contexts = core::array::from_fn(|i| {
         let mut frame =
             arch::TrapFrame::user(entries[i], stacks[i].base + stacks[i].size, args[i][0]);
@@ -175,7 +176,77 @@ unsafe fn deliver(pointer: usize, message: &Message) {
         }
     }
 }
+fn create_endpoint(ipc: &mut Ipc, processes: &mut Processes, owner: usize) -> Result<u32, u32> {
+    let object = ipc.create(owner)?;
+    match processes.slots[owner].capabilities.install(Capability {
+        object,
+        rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL,
+    }) {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            let ep = ipc.resolve(object)?;
+            ipc.close(ep);
+            Err(e)
+        }
+    }
+}
+fn grant(
+    processes: &mut Processes,
+    owner: usize,
+    handle: u32,
+    peer: usize,
+    rights: u16,
+) -> Result<u32, u32> {
+    let source = processes.slots[owner]
+        .capabilities
+        .get(handle, cap::GRANT)?;
+    if rights == 0 || rights & !source.rights != 0 || rights & (cap::CONTROL | cap::GRANT) != 0 {
+        return Err(cap::EPERM);
+    }
+    processes.slots[peer].capabilities.install(Capability {
+        object: source.object,
+        rights,
+    })
+}
 impl Runtime {
+    fn endpoint(&self, process: usize, handle: u32, rights: u16) -> Result<usize, u32> {
+        let capability = self.processes.slots[process]
+            .capabilities
+            .get(handle, rights)?;
+        self.ipc.resolve(capability.object)
+    }
+    fn invalidate_object(&mut self, object: Object, keep_owner: Option<usize>) {
+        for process in 0..self.processes.slots.len() {
+            if Some(process) == keep_owner {
+                continue;
+            }
+            self.processes.slots[process].capabilities.revoke(object);
+            if let Object::Memory { region, .. } = object {
+                if self.processes.slots[process]
+                    .memory
+                    .maps
+                    .iter()
+                    .any(|m| m.region == region)
+                {
+                    self.processes.slots[process].memory.remove(region).unwrap();
+                    for thread in 0..TASKS {
+                        if self.scheduler.tasks[thread].process == process {
+                            if let Wait::Receive {
+                                pointer, capacity, ..
+                            } = self.scheduler.tasks[thread].wait
+                            {
+                                if region.contains(pointer, capacity) {
+                                    self.scheduler.tasks[thread].context.registers[8] =
+                                        syscall::EFAULT;
+                                    self.scheduler.wake(thread);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     fn memory(&self) -> &AddressSpace {
         &self.processes.slots[self.scheduler.current().process].memory
     }
@@ -193,6 +264,7 @@ impl Runtime {
             }
             if let Wait::Receive {
                 endpoint: waiting,
+                handle,
                 pointer,
                 capacity,
             } = task.wait
@@ -200,7 +272,8 @@ impl Runtime {
                 if waiting != endpoint {
                     continue;
                 }
-                let result = if closed {
+                let result = if closed || self.endpoint(task.process, handle, ipc::RECEIVE).is_err()
+                {
                     Err(ipc::EPIPE)
                 } else {
                     self.ipc.receive(endpoint, capacity)
@@ -246,7 +319,26 @@ impl Runtime {
             return;
         }
         self.processes.slots[process].state = Lifecycle::Dying;
+        let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
         let closed = self.ipc.remove_task(process);
+        for (i, is_closed) in closed.iter().enumerate() {
+            if *is_closed {
+                self.invalidate_object(objects[i], None);
+            }
+        }
+        for capability in self.processes.slots[process]
+            .capabilities
+            .objects()
+            .into_iter()
+            .flatten()
+        {
+            if let Object::Memory { owner, .. } = capability.object {
+                if owner == self.processes.slots[process].id {
+                    self.invalidate_object(capability.object, Some(process));
+                }
+            }
+        }
+        self.processes.slots[process].capabilities.clear();
         self.allocator
             .release_owner(self.processes.slots[process].id);
         self.processes.slots[process].state = Lifecycle::Free;
@@ -286,6 +378,87 @@ impl Runtime {
                 *switch = true;
                 0
             }
+            syscall::CAP_GRANT | syscall::MEM_GRANT => {
+                let peer = match self
+                    .processes
+                    .slots
+                    .iter()
+                    .position(|p| p.state == Lifecycle::Alive && p.id == a1)
+                {
+                    Some(p) if p != current => p,
+                    _ => return syscall::EINVAL,
+                };
+                if a2 > u16::MAX as u32 {
+                    return syscall::EINVAL;
+                }
+                let rights = a2 as u16;
+                let source = match self.processes.slots[current]
+                    .capabilities
+                    .get(a0, cap::GRANT)
+                {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                if let Object::Memory { region, .. } = source.object {
+                    if rights & !(cap::READ | cap::WRITE) != 0 || rights & cap::READ == 0 {
+                        return syscall::EINVAL;
+                    }
+                    let handle = match grant(&mut self.processes, current, a0, peer, rights) {
+                        Ok(h) => h,
+                        Err(e) => return e,
+                    };
+                    if let Err(e) = self.processes.slots[peer]
+                        .memory
+                        .insert(region, rights as u8)
+                    {
+                        self.processes.slots[peer]
+                            .capabilities
+                            .close(handle)
+                            .unwrap();
+                        return (-(e as i32)) as u32;
+                    }
+                    handle
+                } else if frame.registers[15] == syscall::MEM_GRANT {
+                    syscall::EINVAL
+                } else {
+                    grant(&mut self.processes, current, a0, peer, rights).unwrap_or_else(|e| e)
+                }
+            }
+            syscall::CAP_REVOKE => {
+                let c = match self.processes.slots[current]
+                    .capabilities
+                    .get(a0, cap::CONTROL)
+                {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                self.invalidate_object(c.object, Some(current));
+                if let Object::Endpoint { index, .. } = c.object {
+                    self.complete_receivers(index, false);
+                }
+                0
+            }
+            syscall::MEM_CAP => {
+                let region = self
+                    .memory()
+                    .maps
+                    .iter()
+                    .find(|m| m.region.base == a0 as usize)
+                    .map(|m| m.region);
+                match region {
+                    Some(region) => self.processes.slots[current]
+                        .capabilities
+                        .find(
+                            Object::Memory {
+                                owner: self.processes.slots[current].id,
+                                region,
+                            },
+                            cap::CONTROL,
+                        )
+                        .unwrap_or(cap::EBADF),
+                    None => cap::EBADF,
+                }
+            }
             syscall::MEM_ALLOC => {
                 let owner = self.processes.slots[current].id;
                 let region = match self.allocator.allocate(owner, a0 as usize) {
@@ -298,6 +471,17 @@ impl Runtime {
                 {
                     self.allocator.free(owner, region).unwrap();
                     return (-(e as i32)) as u32;
+                }
+                if let Err(e) = self.processes.slots[current]
+                    .capabilities
+                    .install(Capability {
+                        object: Object::Memory { owner, region },
+                        rights: cap::READ | cap::WRITE | cap::GRANT | cap::CONTROL,
+                    })
+                {
+                    self.processes.slots[current].memory.remove(region).unwrap();
+                    self.allocator.free(owner, region).unwrap();
+                    return e;
                 }
                 // SAFETY: newly reserved physical SRAM, no aliases or user execution.
                 unsafe {
@@ -322,7 +506,7 @@ impl Runtime {
                 }) {
                     return (-16i32) as u32;
                 }
-                self.processes.slots[current].memory.remove(region).unwrap();
+                self.invalidate_object(Object::Memory { owner, region }, None);
                 self.allocator.free(owner, region).unwrap();
                 // Cancel pending receives before the physical region can be reused.
                 for i in 0..TASKS {
@@ -357,6 +541,7 @@ impl Runtime {
                     || !self.writable(stack.base, stack.size)
                     || priority > 3
                     || affinity != 1
+                    || !self.allocator.owns(self.processes.slots[current].id, stack)
                 {
                     return syscall::EINVAL;
                 }
@@ -424,16 +609,31 @@ impl Runtime {
                 }
                 0
             }
-            syscall::ENDPOINT_CREATE => self.ipc.create(current).unwrap_or_else(|e| e),
-            syscall::ENDPOINT_CLOSE => match self.ipc.close(current, a0) {
-                Ok(endpoint) => {
-                    if let Some(ep) = endpoint {
-                        self.complete_receivers(ep, true);
-                    }
-                    0
+            syscall::ENDPOINT_CREATE => {
+                create_endpoint(&mut self.ipc, &mut self.processes, current).unwrap_or_else(|e| e)
+            }
+            syscall::ENDPOINT_CLOSE => {
+                let capability = match self.processes.slots[current].capabilities.get(a0, 0) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let ep = match self.ipc.resolve(capability.object) {
+                    Ok(ep) => ep,
+                    Err(e) => return e,
+                };
+                if capability.rights & cap::CONTROL != 0 {
+                    self.ipc.close(ep);
+                    self.invalidate_object(capability.object, None);
+                    self.complete_receivers(ep, true);
+                } else {
+                    self.processes.slots[current]
+                        .capabilities
+                        .close(a0)
+                        .unwrap();
+                    self.complete_receivers(ep, false);
                 }
-                Err(e) => e,
-            },
+                0
+            }
             syscall::SEND => {
                 let length = a2 as usize;
                 if length > ipc::MESSAGE_BYTES {
@@ -443,7 +643,7 @@ impl Runtime {
                     return syscall::EFAULT;
                 }
                 // Validate namespace/rights before touching sender's data.
-                if let Err(e) = self.ipc.resolve(current, a0, ipc::SEND) {
+                if let Err(e) = self.endpoint(current, a0, ipc::SEND) {
                     return e;
                 }
                 let mut message = Message::EMPTY;
@@ -452,7 +652,10 @@ impl Runtime {
                     // SAFETY: checked sender mapping, copy into a kernel-owned message.
                     message.data[i] = unsafe { (a1 as *const u8).add(i).read() };
                 }
-                match self.ipc.send(current, a0, message) {
+                match self
+                    .ipc
+                    .send(self.endpoint(current, a0, ipc::SEND).unwrap(), message)
+                {
                     Ok(ep) => {
                         self.complete_receivers(ep, false);
                         0
@@ -468,7 +671,7 @@ impl Runtime {
                 if !self.writable(a1 as usize, capacity) {
                     return syscall::EFAULT;
                 }
-                let ep = match self.ipc.resolve(current, a0, ipc::RECEIVE) {
+                let ep = match self.endpoint(current, a0, ipc::RECEIVE) {
                     Ok(ep) => ep,
                     Err(e) => return e,
                 };
@@ -487,6 +690,7 @@ impl Runtime {
                         // transaction, so send cannot race and lose the wakeup.
                         self.scheduler.block(Wait::Receive {
                             endpoint: ep,
+                            handle: a0,
                             pointer: a1 as usize,
                             capacity,
                         });

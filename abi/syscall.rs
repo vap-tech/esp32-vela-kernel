@@ -25,3 +25,8 @@ pub const PROCESS_EXIT: u32 = 13;
 
 pub const MEM_ALLOC: u32 = 14; // a0=requested bytes -> a0=base,a1=actual size
 pub const MEM_FREE: u32 = 15; // a0=base,a1=exact allocated size
+
+pub const CAP_GRANT: u32 = 16; // a0=source handle,a1=target PID,a2=subset rights -> peer-local handle
+pub const CAP_REVOKE: u32 = 17; // owner control handle revokes all peer grants
+pub const MEM_CAP: u32 = 18; // a0=owned region base -> memory capability
+pub const MEM_GRANT: u32 = 19; // memory grant + PMP mapping; one-level R/RW grants

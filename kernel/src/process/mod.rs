@@ -1,5 +1,5 @@
 //! Process-owned address spaces. Slot indices never cross the user ABI.
-use crate::task::Region;
+use crate::{capability::Table, task::Region};
 pub const PROCESSES: usize = 8;
 pub const REGIONS: usize = 6;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,12 +84,14 @@ pub struct Process {
     pub id: u32,
     pub state: Lifecycle,
     pub memory: AddressSpace,
+    pub capabilities: Table,
 }
 impl Process {
     pub const EMPTY: Self = Self {
         id: 0,
         state: Lifecycle::Free,
         memory: AddressSpace::EMPTY,
+        capabilities: Table::new(),
     };
 }
 pub struct Processes {
@@ -120,6 +122,7 @@ impl Processes {
             id,
             state: Lifecycle::Alive,
             memory,
+            capabilities: Table::new(),
         };
         Ok(index)
     }

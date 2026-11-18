@@ -26,6 +26,7 @@ pub enum Wait {
     None,
     Receive {
         endpoint: usize,
+        handle: u32,
         pointer: usize,
         capacity: usize,
     },
