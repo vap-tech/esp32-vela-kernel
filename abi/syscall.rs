@@ -53,3 +53,5 @@ pub const SENTINEL_LOG: u32 = 31; // a0=sequence (0 metadata),a1=writable 24B,a2
 pub const SENTINEL_ARM_WAKE: u32 = 32; // a0=1..60000ms; returns LP-acknowledged wake token
 pub const SENTINEL_WAIT_WAKE: u32 = 33; // a0=token (0=current own alarm); returns token,a1=elapsed HP 10ms ticks
 pub const SENTINEL_CANCEL_WAKE: u32 = 34; // a0=token (0=current own alarm); returns cancel ACK or EALREADY
+
+pub const SENTINEL_PREPARE_SLEEP: u32 = 35; // a0=ms, returns wake token; WAIT/CANCEL use the same ticket

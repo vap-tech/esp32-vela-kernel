@@ -110,6 +110,7 @@ fn observe(local: &mut Transport, now: u64) {
         );
     }
     if let Some(event) = local.wakeup.sample(now) {
+        local.watch.end_sleep(now);
         local
             .journal
             .append(event.at, wire::LOG_WAKE_FIRED, event.token, event.delay_ms);
@@ -290,6 +291,7 @@ unsafe fn process_command(local: &mut Transport) {
         let (event, result) = match command {
             wire::HELLO if arg0 == 0 && arg1 == 0 => (wire::ACK, wire::OK),
             wire::GET_STATUS if arg0 == 0 && arg1 == 0 => (wire::STATUS, wire::OK),
+            wire::HEARTBEAT if local.watch.state == wire::PREPARED => (wire::ACK, wire::LOG_BUSY),
             wire::HEARTBEAT if (100..=60_000).contains(&arg0) && arg1 == 0 => {
                 let timeout = (u64::from(local.hz) * u64::from(arg0) + 999) / 1000;
                 let now = lp_counter::now();
@@ -311,10 +313,16 @@ unsafe fn process_command(local: &mut Transport) {
                 }
                 (wire::ACK, wire::OK)
             }
-            wire::SET_WAKEUP if (1..=60_000).contains(&arg0) && arg1 == 0 => {
+            wire::SET_WAKEUP | wire::PREPARE_SLEEP if (1..=60_000).contains(&arg0) && arg1 == 0 => {
                 let now = lp_counter::now();
                 let ticks = (u64::from(local.hz) * u64::from(arg0) + 999) / 1000;
-                if local.wakeup.arm(sequence, now, ticks, arg0) {
+                observe(local, now);
+                if command == wire::PREPARE_SLEEP && local.watch.state != wire::HEALTHY {
+                    (wire::ACK, wire::LOG_BUSY)
+                } else if local.wakeup.arm(sequence, now, ticks, arg0) {
+                    if command == wire::PREPARE_SLEEP {
+                        local.watch.prepare();
+                    }
                     local
                         .journal
                         .append(now, wire::LOG_WAKE_ARMED, sequence, arg0);
@@ -323,11 +331,12 @@ unsafe fn process_command(local: &mut Transport) {
                     (wire::ACK, wire::LOG_BUSY)
                 }
             }
-            wire::CANCEL_WAKEUP if arg0 != 0 && arg1 == 0 => {
+            wire::CANCEL_WAKEUP | wire::CANCEL_SLEEP if arg0 != 0 && arg1 == 0 => {
                 let now = lp_counter::now();
                 observe(local, now);
                 match local.wakeup.cancel(arg0, now) {
                     wakeup::Cancel::Cancelled(delay_ms) => {
+                        local.watch.end_sleep(now);
                         local
                             .journal
                             .append(now, wire::LOG_WAKE_CANCELLED, arg0, delay_ms);
@@ -356,6 +365,8 @@ unsafe fn process_command(local: &mut Transport) {
             | wire::HEARTBEAT
             | wire::LOG_META
             | wire::LOG_READ
+            | wire::PREPARE_SLEEP
+            | wire::CANCEL_SLEEP
             | wire::SET_WAKEUP
             | wire::CANCEL_WAKEUP => (wire::ACK, wire::BAD_ARGUMENT),
             _ => (wire::ACK, wire::BAD_COMMAND),

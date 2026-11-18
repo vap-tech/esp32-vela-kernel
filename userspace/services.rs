@@ -24,12 +24,15 @@ text!(PAUSED, b"Sentinel heartbeat paused\n");
 text!(RESUMED, b"Sentinel heartbeat resumed\n");
 text!(NOTICES, b" notices=");
 text!(WAKE_PREFIX, b"sentinel wake ");
+text!(PREPARE_PREFIX, b"sentinel prepare ");
+text!(PREPARED, b"prepared");
+text!(PREPARED_MSG, b"Sentinel sleep prepared token=");
 text!(ARM_PREFIX, b"sentinel arm ");
 text!(WAIT_CMD, b"sentinel wait");
 text!(CANCEL_CMD, b"sentinel cancel");
 text!(
     WAKE_HELP,
-    b"sentinel wake/arm <ms> | sentinel wait/cancel\n"
+    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel\n"
 );
 text!(WAKE_ARMED, b"Sentinel wake armed token=");
 text!(WAKE_FIRED, b"Sentinel WAKE_EVENT token=");
@@ -570,7 +573,8 @@ fn sentinel_log() {
 fn wake_command(line: &Buffer) -> bool {
     let wait = line.matches(0, WAIT_CMD.as_ptr(), WAIT_CMD.len());
     let cancel = line.matches(0, CANCEL_CMD.as_ptr(), CANCEL_CMD.len());
-    let arm = line.starts(ARM_PREFIX.as_ptr(), ARM_PREFIX.len());
+    let prepare = line.starts(PREPARE_PREFIX.as_ptr(), PREPARE_PREFIX.len());
+    let arm = prepare || line.starts(ARM_PREFIX.as_ptr(), ARM_PREFIX.len());
     let wake = line.starts(WAKE_PREFIX.as_ptr(), WAKE_PREFIX.len());
     if !wait && !cancel && !arm && !wake {
         return false;
@@ -579,11 +583,15 @@ fn wake_command(line: &Buffer) -> bool {
         abi::SENTINEL_CANCEL_WAKE
     } else if wait {
         abi::SENTINEL_WAIT_WAKE
+    } else if prepare {
+        abi::SENTINEL_PREPARE_SLEEP
     } else {
         abi::SENTINEL_ARM_WAKE
     };
     let argument = if arm || wake {
-        let Some(ms) = line.delay_ms(if arm {
+        let Some(ms) = line.delay_ms(if prepare {
+            PREPARE_PREFIX.len()
+        } else if arm {
             ARM_PREFIX.len()
         } else {
             WAKE_PREFIX.len()
@@ -619,7 +627,9 @@ fn wake_command(line: &Buffer) -> bool {
         write(WAKE_CANCELLED.as_ptr(), WAKE_CANCELLED.len());
     } else {
         let mut out = Buffer::new();
-        if arm {
+        if prepare {
+            out.append(PREPARED_MSG.as_ptr(), PREPARED_MSG.len());
+        } else if arm {
             out.append(WAKE_ARMED.as_ptr(), WAKE_ARMED.len());
         } else {
             out.append(WAKE_FIRED.as_ptr(), WAKE_FIRED.len());
@@ -694,6 +704,7 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
             match data.word(0) {
                 0 => out.append(UNARMED.as_ptr(), UNARMED.len()),
                 1 => out.append(HEALTHY.as_ptr(), HEALTHY.len()),
+                3 => out.append(PREPARED.as_ptr(), PREPARED.len()),
                 _ => out.append(MISSED.as_ptr(), MISSED.len()),
             }
             out.append(AGE_MS.as_ptr(), AGE_MS.len());

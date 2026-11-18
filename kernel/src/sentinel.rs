@@ -61,6 +61,7 @@ pub struct WakeTicket {
     pub started: u64,
     pub expires: u64,
     pub delay_ms: u32,
+    pub sleep: bool,
     pub phase: WakePhase,
 }
 impl WakeTicket {
@@ -77,6 +78,7 @@ fn exit_retains_only_unfinished_owned_alarm() {
         started: 0,
         expires: 5,
         delay_ms: 10,
+        sleep: false,
         phase: WakePhase::Requested,
     };
     assert!(!ticket.release_on_exit(2));

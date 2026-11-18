@@ -412,7 +412,10 @@ impl Runtime {
             sentinel_wire::WAKE_ALREADY => (-114i32) as u32,
             _ => syscall::EINVAL,
         };
-        if command == sentinel_wire::SET_WAKEUP {
+        if matches!(
+            command,
+            sentinel_wire::SET_WAKEUP | sentinel_wire::PREPARE_SLEEP
+        ) {
             if let Some(mut ticket) = self.sentinel_wake {
                 if ticket.token == reply.request {
                     if error {
@@ -424,7 +427,11 @@ impl Runtime {
                     }
                 }
             }
-        } else if command == sentinel_wire::CANCEL_WAKEUP && !error {
+        } else if matches!(
+            command,
+            sentinel_wire::CANCEL_WAKEUP | sentinel_wire::CANCEL_SLEEP
+        ) && !error
+        {
             if let Some(ticket) = self.sentinel_wake {
                 if ticket.token == self.sentinel_argument {
                     self.finish_wake_waiter(ticket, (-125i32) as u32, 0);
@@ -518,6 +525,9 @@ impl Runtime {
         }
         if self.sentinel_ready
             && self.sentinel_heartbeat
+            && !self
+                .sentinel_wake
+                .is_some_and(|t| t.sleep && !matches!(t.phase, WakePhase::Fired(_)))
             && !self.sentinel_pending
             && uptime >= self.sentinel_next_beat
             && self
@@ -1279,7 +1289,8 @@ impl Runtime {
                 }
                 0
             }
-            syscall::SENTINEL_ARM_WAKE => {
+            syscall::SENTINEL_ARM_WAKE | syscall::SENTINEL_PREPARE_SLEEP => {
+                let sleep = frame.registers[15] == syscall::SENTINEL_PREPARE_SLEEP;
                 let owner = self.processes.slots[current].id;
                 if owner != 2 {
                     return cap::EPERM;
@@ -1292,7 +1303,15 @@ impl Runtime {
                 }
                 // SAFETY: sole hart snapshot owner under masked IRQs.
                 let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER arm snapshot");
-                let sequence = match self.sentinel_request(sentinel_wire::SET_WAKEUP, a0, 0) {
+                let sequence = match self.sentinel_request(
+                    if sleep {
+                        sentinel_wire::PREPARE_SLEEP
+                    } else {
+                        sentinel_wire::SET_WAKEUP
+                    },
+                    a0,
+                    0,
+                ) {
                     Ok(seq) => seq,
                     Err(e) => return e,
                 };
@@ -1302,6 +1321,7 @@ impl Runtime {
                     started: now,
                     expires: now + (u64::from(a0) + 9) / 10 + 100,
                     delay_ms: a0,
+                    sleep,
                     phase: WakePhase::Requested,
                 });
                 self.scheduler.block(Wait::Sentinel {
@@ -1358,11 +1378,18 @@ impl Runtime {
                 if matches!(ticket.phase, WakePhase::Fired(_)) {
                     return (-114i32) as u32;
                 }
-                let sequence =
-                    match self.sentinel_request(sentinel_wire::CANCEL_WAKEUP, ticket.token, 0) {
-                        Ok(seq) => seq,
-                        Err(e) => return e,
-                    };
+                let sequence = match self.sentinel_request(
+                    if ticket.sleep {
+                        sentinel_wire::CANCEL_SLEEP
+                    } else {
+                        sentinel_wire::CANCEL_WAKEUP
+                    },
+                    ticket.token,
+                    0,
+                ) {
+                    Ok(seq) => seq,
+                    Err(e) => return e,
+                };
                 self.scheduler.block(Wait::Sentinel {
                     sequence,
                     deadline: self.scheduler.snapshot().uptime_ticks + 100,

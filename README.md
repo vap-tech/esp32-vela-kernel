@@ -39,6 +39,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `sentinel log` | Read the bounded LP diagnostic journal without consuming records. |
 | `sentinel mark` | Send an HP diagnostic MARK event with the current HP uptime tick as its value. |
 | `sentinel wake <ms>` | Arm an LP timer and block until its WAKE_EVENT. Range: 1–60000 ms. |
+| `sentinel prepare <ms>` | Agree a heartbeat pause with LP for 1–60000 ms while HP stays active. Use `sentinel cancel` or `sentinel wait` with the returned alarm. |
 | `sentinel arm <ms>`, `sentinel wait` | Arm without waiting for expiry; later consume the latched event. |
 | `sentinel cancel` | Cancel the current alarm before it fires; an already-fired event remains available to wait. |
 
@@ -190,7 +191,7 @@ LP owns 1(echoed epoch), 2(event doorbell), 5(reply seq), 8(result),
 Payload precedes each doorbell. HP copies and clears IRQ before acknowledging
 the LP publication. LP never overwrites an unacknowledged response/event;
 commands take precedence over deferred missed notices. Epoch and sequence are
-checked before completion. Sleep supervision remains pending.
+checked before completion. PMU sleep entry and resume remain pending.
 
 Tab5 v1.3 smoke (2026-11-18): healthy, pause -> missed=1/notices=1,
 repeated GET_STATUS kept both at 1, resume -> healthy with growing beat count.
@@ -258,3 +259,16 @@ pending event and no wake_fired record for that token. Heartbeat remained health
 with missed=0; log, status, help, uptime and /proc/loadavg passed. Four host tests
 cover one-shot/backpressure, cancellation, 48-bit wrap and deadline arbitration.
 Log: target/sentinel-wakeup-smoke.log.
+
+### Preparing a sleep interval
+
+A healthy observer accepts PREPARE_SLEEP after reserving the one-shot timer.
+Its ACK carries the wake token. HP suppresses automatic heartbeats for that
+ticket, and STATUS reports `prepared` with the age of the last real heartbeat.
+Cancellation before the deadline disarms the timer. At or after the deadline
+expiry wins, and WAIT consumes one WAKE_EVENT. Either outcome opens a fresh
+heartbeat timeout window. HP remains active throughout this protocol check.
+
+On Tab5 a cancelled 800 ms interval left no pending wake after its original
+deadline. A 4500 ms interval produced one event at 450 HP ticks. STATUS
+changed from prepared to healthy, with zero missed transitions and notices.

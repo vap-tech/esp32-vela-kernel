@@ -3,6 +3,7 @@ const MASK: u64 = (1u64 << 48) - 1;
 pub struct Watch {
     last: Option<u64>,
     timeout: u64,
+    window_start: u64,
     pub state: u32,
     pub beats: u32,
     pub missed: u32,
@@ -12,6 +13,7 @@ impl Watch {
         Self {
             last: None,
             timeout: 0,
+            window_start: 0,
             state: 0,
             beats: 0,
             missed: 0,
@@ -21,17 +23,28 @@ impl Watch {
         self.last.map_or(0, |last| now.wrapping_sub(last) & MASK)
     }
     pub fn sample(&mut self, now: u64) {
-        if self.state == 1 && self.age(now) >= self.timeout {
+        if self.state == 1 && (now.wrapping_sub(self.window_start) & MASK) >= self.timeout {
             self.state = 2;
             self.missed = self.missed.saturating_add(1).min(0x3fff_ffff);
         }
     }
     pub fn deadline(&self) -> Option<u64> {
-        (self.state == 1).then(|| (self.last.unwrap() + self.timeout) & MASK)
+        (self.state == 1).then(|| (self.window_start + self.timeout) & MASK)
+    }
+    pub fn prepare(&mut self) {
+        debug_assert_eq!(self.state, 1);
+        self.state = 3;
+    }
+    pub fn end_sleep(&mut self, now: u64) {
+        if self.state == 3 {
+            self.state = 1;
+            self.window_start = now;
+        }
     }
     pub fn heartbeat(&mut self, now: u64, timeout: u64) {
         self.sample(now);
         self.last = Some(now);
+        self.window_start = now;
         self.timeout = timeout;
         self.state = 1;
         self.beats = self.beats.saturating_add(1);
@@ -73,4 +86,23 @@ mod tests {
         w.heartbeat(11, 10);
         assert_eq!((w.state, w.beats, w.missed), (1, 2, 1));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_window_preserves_heartbeat_age_and_rearms_on_return() {
+    let mut watch = Watch::new();
+    watch.heartbeat(MASK - 4, 10);
+    watch.prepare();
+    watch.sample(100);
+    assert_eq!((watch.deadline(), watch.missed), (None, 0));
+    watch.end_sleep(100);
+    assert_eq!(
+        (watch.age(101), watch.beats, watch.deadline()),
+        (106, 1, Some(110))
+    );
+    watch.sample(109);
+    assert_eq!(watch.missed, 0);
+    watch.sample(110);
+    assert_eq!(watch.missed, 1);
 }
