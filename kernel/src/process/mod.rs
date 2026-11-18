@@ -85,6 +85,7 @@ pub struct Process {
     pub state: Lifecycle,
     pub memory: AddressSpace,
     pub capabilities: Table,
+    pub priority_ceiling: u8,
 }
 impl Process {
     pub const EMPTY: Self = Self {
@@ -92,6 +93,7 @@ impl Process {
         state: Lifecycle::Free,
         memory: AddressSpace::EMPTY,
         capabilities: Table::new(),
+        priority_ceiling: 1,
     };
 }
 pub struct Processes {
@@ -123,6 +125,7 @@ impl Processes {
             state: Lifecycle::Alive,
             memory,
             capabilities: Table::new(),
+            priority_ceiling: 1,
         };
         Ok(index)
     }

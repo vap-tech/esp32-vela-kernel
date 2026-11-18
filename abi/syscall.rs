@@ -30,3 +30,7 @@ pub const CAP_GRANT: u32 = 16; // a0=source handle,a1=target PID,a2=subset right
 pub const CAP_REVOKE: u32 = 17; // owner control handle revokes all peer grants
 pub const MEM_CAP: u32 = 18; // a0=owned region base -> memory capability
 pub const MEM_GRANT: u32 = 19; // memory grant + PMP mapping; one-level R/RW grants
+
+pub const IPC_CALL: u32 = 20; // a0=send handle,a1=req,a2=len,a3=reply buffer,a4=capacity,a5=timeout ticks (0 infinite)
+pub const IPC_REPLY: u32 = 21; // a0=single-use reply token,a1=buffer,a2=len
+pub const THREAD_PRIORITY: u32 = 22; // a0=own TID,a1=priority 0..3

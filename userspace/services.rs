@@ -25,15 +25,18 @@ text!(ERASE, b"\x08 \x08");
 text!(NEWLINE, b"\n");
 
 #[inline(always)]
-fn call(number: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
-    let result;
-    // SAFETY: ecall ABI preserves every register except return a0. No nomem:
-    // receive/stats/read can initialize the supplied private user buffer.
+fn call6(number: u32, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) -> (u32, u32) {
+    let (result, second);
+    // SAFETY: syscall boundary; all integer state preserved except a0/a1 results.
     unsafe {
-        core::arch::asm!("ecall", in("a7") number, inlateout("a0") a0 => result,
-            in("a1") a1, in("a2") a2, in("a3") a3);
+        core::arch::asm!("ecall",in("a7")number,inlateout("a0")a0=>result,
+        inlateout("a1")a1=>second,in("a2")a2,in("a3")a3,in("a4")a4,in("a5")a5);
     }
-    result
+    (result, second)
+}
+#[inline(always)]
+fn call(number: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
+    call6(number, a0, a1, a2, a3, 0, 0).0
 }
 #[inline(always)]
 fn sleep() {
@@ -53,6 +56,7 @@ fn write(pointer: *const u8, length: usize) {
 struct Buffer {
     bytes: MaybeUninit<[u8; abi::IPC_BYTES]>,
     len: usize,
+    reply: u32,
 }
 impl Buffer {
     #[inline(always)]
@@ -60,6 +64,7 @@ impl Buffer {
         Self {
             bytes: MaybeUninit::uninit(),
             len: 0,
+            reply: 0,
         }
     }
     #[inline(always)]
@@ -166,13 +171,16 @@ impl Buffer {
     }
     #[inline(always)]
     fn receive(&mut self, handle: u32) -> bool {
-        let result = call(
+        let (result, reply) = call6(
             abi::RECV,
             handle,
             self.mut_ptr() as u32,
             abi::IPC_BYTES as u32,
             0,
+            0,
+            0,
         );
+        self.reply = reply;
         if result > abi::IPC_BYTES as u32 {
             return false;
         }
@@ -281,26 +289,41 @@ pub extern "C" fn procfs_main(request_handle: u32, reply_handle: u32) -> ! {
         }
         let mut response = Buffer::new();
         read_node(&request, &mut response);
-        if !response.send(reply_handle) {
+        if request.reply != 0 {
+            // A timed-out client invalidates its one-shot reply token. Keep serving.
+            let _ = call(
+                abi::IPC_REPLY,
+                request.reply,
+                response.ptr() as u32,
+                response.len as u32,
+                0,
+            );
+        } else if !response.send(reply_handle) {
             exit();
         }
     }
 }
 #[inline(always)]
-fn read_file(path: *const u8, length: usize, request_handle: u32, reply_handle: u32) {
+fn read_file(path: *const u8, length: usize, request_handle: u32, _reply_handle: u32) {
     let mut request = Buffer::new();
     request.push(1);
     request.append(path, length);
-    if !request.send(request_handle) {
-        write(FAILED.as_ptr(), FAILED.len());
-        return;
-    }
     let mut response = Buffer::new();
-    // RECV blocks this client until procfs supplies an actual IPC reply.
-    if !response.receive(reply_handle) || response.len < 1 {
+    let result = call6(
+        abi::IPC_CALL,
+        request_handle,
+        request.ptr() as u32,
+        request.len as u32,
+        response.mut_ptr() as u32,
+        abi::IPC_BYTES as u32,
+        100,
+    )
+    .0;
+    if result == 0 || result > abi::IPC_BYTES as u32 {
         write(FAILED.as_ptr(), FAILED.len());
         return;
     }
+    response.len = result as usize;
     // Error replies carry userspace diagnostics, never fabricated file data.
     unsafe {
         write(response.ptr().add(1), response.len - 1);

@@ -30,6 +30,13 @@ pub enum Wait {
         pointer: usize,
         capacity: usize,
     },
+    Reply {
+        token: u32,
+        pointer: usize,
+        capacity: usize,
+        server: usize,
+        until: u64,
+    },
     Sleep {
         until: u64,
     },

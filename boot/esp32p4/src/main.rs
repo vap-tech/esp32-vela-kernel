@@ -25,6 +25,21 @@ mod syscall;
 mod users;
 core::arch::global_asm!(include_str!("../entry.S"));
 
+#[derive(Clone, Copy)]
+struct Call {
+    generation: u32,
+    active: bool,
+    endpoint: usize,
+    server: Option<usize>,
+}
+impl Call {
+    const EMPTY: Self = Self {
+        generation: 0,
+        active: false,
+        endpoint: 0,
+        server: None,
+    };
+}
 struct Runtime {
     scheduler: Scheduler<arch::TrapFrame>,
     processes: Processes,
@@ -33,6 +48,7 @@ struct Runtime {
     allocator: RegionAllocator,
     console: soc::console::Console,
     ipc: Ipc,
+    calls: [Call; TASKS],
     idle_frame: arch::TrapFrame,
     in_idle: bool,
     logged_block: bool,
@@ -132,8 +148,14 @@ extern "C" fn rust_main() -> ! {
         0,
     );
     idle.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
+    let mut scheduler = Scheduler::new(contexts, entries, stacks);
+    scheduler.tasks[0].priority = 0;
+    scheduler.tasks[0].effective_priority = 0;
+    scheduler.tasks[2].priority = 2;
+    scheduler.tasks[2].effective_priority = 2;
+    processes.slots[2].priority_ceiling = 2;
     let runtime = Runtime {
-        scheduler: Scheduler::new(contexts, entries, stacks),
+        scheduler,
         console,
         active_space: Some((0, 2)),
         pmp_images: core::array::from_fn(|i| {
@@ -152,6 +174,7 @@ extern "C" fn rust_main() -> ! {
             core::ptr::addr_of!(_stack_bottom) as usize,
         ),
         ipc,
+        calls: [Call::EMPTY; TASKS],
         idle_frame: idle,
         in_idle: false,
         logged_block: false,
@@ -209,6 +232,51 @@ fn grant(
     })
 }
 impl Runtime {
+    fn bind_reply(&mut self, token: u32, server: usize) {
+        if token == 0 {
+            return;
+        }
+        let client = (token & 255).wrapping_sub(1) as usize;
+        if let Some(call) = self.calls.get_mut(client) {
+            if call.active && call.generation == token >> 8 {
+                call.server = Some(server);
+                if let Wait::Reply {
+                    token,
+                    pointer,
+                    capacity,
+                    until,
+                    ..
+                } = self.scheduler.tasks[client].wait
+                {
+                    self.scheduler.tasks[client].wait = Wait::Reply {
+                        token,
+                        pointer,
+                        capacity,
+                        until,
+                        server,
+                    };
+                }
+            }
+        }
+    }
+    fn fail_call(&mut self, client: usize, error: u32) {
+        self.calls[client].active = false;
+        if matches!(self.scheduler.tasks[client].wait, Wait::Reply { .. }) {
+            self.scheduler.tasks[client].context.registers[8] = error;
+            self.scheduler.wake(client);
+        }
+    }
+    fn expire_calls(&mut self, uptime: u64) {
+        for i in 0..TASKS {
+            if self.calls[i].active {
+                if let Wait::Reply { until, .. } = self.scheduler.tasks[i].wait {
+                    if until != 0 && until <= uptime {
+                        self.fail_call(i, (-110i32) as u32);
+                    }
+                }
+            }
+        }
+    }
     fn endpoint(&self, process: usize, handle: u32, rights: u16) -> Result<usize, u32> {
         let capability = self.processes.slots[process]
             .capabilities
@@ -281,6 +349,8 @@ impl Runtime {
                 let value = match result {
                     Ok(None) => continue,
                     Ok(Some(message)) => {
+                        self.bind_reply(message.reply_token, i);
+                        self.scheduler.tasks[i].context.registers[9] = message.reply_token;
                         if !self.processes.slots[task.process]
                             .memory
                             .permits(pointer, capacity, WRITE)
@@ -300,6 +370,9 @@ impl Runtime {
                 // own return register before making the task runnable.
                 self.scheduler.tasks[i].context.registers[8] = value;
                 self.scheduler.wake(i);
+                if let Wait::Receive { .. } = task.wait {
+                    self.scheduler.prefer(i);
+                }
                 if !self.logged_wake {
                     self.logged_wake = true;
                     let _ = writeln!(self.console, "[ipc] receiver woke task={}", task.id);
@@ -309,6 +382,13 @@ impl Runtime {
     }
     fn terminate(&mut self) {
         let process = self.scheduler.current().process;
+        let exiting = self.scheduler.current;
+        self.calls[exiting].active = false;
+        for i in 0..TASKS {
+            if self.calls[i].active && self.calls[i].server == Some(exiting) {
+                self.fail_call(i, ipc::EPIPE);
+            }
+        }
         self.scheduler.terminate();
         if self
             .scheduler
@@ -320,6 +400,11 @@ impl Runtime {
         }
         self.processes.slots[process].state = Lifecycle::Dying;
         let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
+        for i in 0..TASKS {
+            if self.calls[i].active && self.ipc.owner(self.calls[i].endpoint) == Some(process) {
+                self.fail_call(i, ipc::EPIPE);
+            }
+        }
         let closed = self.ipc.remove_task(process);
         for (i, is_closed) in closed.iter().enumerate() {
             if *is_closed {
@@ -378,6 +463,155 @@ impl Runtime {
                 *switch = true;
                 0
             }
+            syscall::THREAD_PRIORITY => {
+                if a1 > u32::from(self.processes.slots[current].priority_ceiling) {
+                    return syscall::EINVAL;
+                }
+                let Some(index) = self.scheduler.tasks.iter().position(|t| {
+                    t.id == a0 && t.process == current && t.state != State::Terminated
+                }) else {
+                    return ipc::EPERM;
+                };
+                self.scheduler.tasks[index].priority = a1 as u8;
+                self.scheduler.inherit();
+                *switch = self.scheduler.should_preempt();
+                0
+            }
+            syscall::IPC_CALL => {
+                let length = a2 as usize;
+                let capacity = frame.registers[12] as usize;
+                let timeout = frame.registers[13];
+                let thread = self.scheduler.current;
+                if length > ipc::MESSAGE_BYTES
+                    || capacity == 0
+                    || capacity > ipc::MESSAGE_BYTES
+                    || timeout > 6000
+                {
+                    return syscall::EINVAL;
+                }
+                if !self.readable(a1 as usize, length) || !self.writable(a3 as usize, capacity) {
+                    return syscall::EFAULT;
+                }
+                let ep = match self.endpoint(current, a0, cap::SEND) {
+                    Ok(e) => e,
+                    Err(e) => return e,
+                };
+                let server_process = self.ipc.owner(ep).unwrap();
+                // No self-process RPC: avoid an unbounded dependency on caller-owned locks.
+                if server_process == current {
+                    return (-35i32) as u32;
+                }
+                let Some(server) = self
+                    .scheduler
+                    .tasks
+                    .iter()
+                    .position(|t| t.process == server_process && t.state != State::Terminated)
+                else {
+                    return ipc::EPIPE;
+                };
+                let mut dependency = server;
+                for _ in 0..TASKS {
+                    if dependency == thread {
+                        return (-35i32) as u32;
+                    }
+                    if let Wait::Reply { server, .. } = self.scheduler.tasks[dependency].wait {
+                        dependency = server;
+                    } else {
+                        break;
+                    }
+                }
+                if self.calls[thread].generation == 0x7f_ffff {
+                    return ipc::ENOSPC;
+                }
+                let generation = self.calls[thread].generation + 1;
+                let token = (generation << 8) | (thread as u32 + 1);
+                let mut message = Message::EMPTY;
+                message.length = length;
+                message.reply_token = token;
+                for i in 0..length {
+                    // SAFETY: validated source; copy message before blocking caller.
+                    message.data[i] = unsafe { (a1 as *const u8).add(i).read() };
+                }
+                if let Err(e) = self.ipc.send(ep, message) {
+                    return e;
+                }
+                self.calls[thread] = Call {
+                    generation,
+                    active: true,
+                    endpoint: ep,
+                    server: None,
+                };
+                let until = if timeout == 0 {
+                    0
+                } else {
+                    self.scheduler.snapshot().uptime_ticks + u64::from(timeout)
+                };
+                self.scheduler.block(Wait::Reply {
+                    token,
+                    pointer: a3 as usize,
+                    capacity,
+                    server,
+                    until,
+                });
+                self.complete_receivers(ep, false);
+                self.scheduler.inherit();
+                *switch = true;
+                0
+            }
+            syscall::IPC_REPLY => {
+                let client = (a0 & 255).wrapping_sub(1) as usize;
+                let Some(call) = self.calls.get(client).copied() else {
+                    return ipc::EBADF;
+                };
+                if !call.active || call.generation != a0 >> 8 {
+                    return ipc::EPIPE;
+                }
+                let Some(server) = call.server else {
+                    return ipc::EPERM;
+                };
+                if self.scheduler.tasks[server].process != current {
+                    return ipc::EPERM;
+                }
+                let Wait::Reply {
+                    token,
+                    pointer,
+                    capacity,
+                    ..
+                } = self.scheduler.tasks[client].wait
+                else {
+                    return ipc::EPIPE;
+                };
+                if token != a0 {
+                    return ipc::EPIPE;
+                }
+                if a2 as usize > capacity || a2 as usize > ipc::MESSAGE_BYTES {
+                    return ipc::EMSGSIZE;
+                }
+                let target = self.scheduler.tasks[client].process;
+                if !self.readable(a1 as usize, a2 as usize)
+                    || !self.processes.slots[target]
+                        .memory
+                        .permits(pointer, capacity, WRITE)
+                {
+                    return syscall::EFAULT;
+                }
+                let mut message = Message::EMPTY;
+                message.length = a2 as usize;
+                for i in 0..message.length {
+                    // SAFETY: validated server source and caller destination, sole hart.
+                    message.data[i] = unsafe { (a1 as *const u8).add(i).read() };
+                }
+                unsafe {
+                    deliver(pointer, &message);
+                }
+                self.scheduler.tasks[client].context.registers[8] = a2;
+                self.calls[client].active = false;
+                self.scheduler.wake(client);
+                self.scheduler.inherit();
+                self.scheduler.prefer(client);
+                *switch = self.scheduler.should_preempt();
+                0
+            }
             syscall::CAP_GRANT | syscall::MEM_GRANT => {
                 let peer = match self
                     .processes
@@ -434,6 +668,14 @@ impl Runtime {
                 };
                 self.invalidate_object(c.object, Some(current));
                 if let Object::Endpoint { index, .. } = c.object {
+                    for i in 0..TASKS {
+                        if self.calls[i].active
+                            && self.calls[i].endpoint == index
+                            && self.scheduler.tasks[i].process != current
+                        {
+                            self.fail_call(i, ipc::EPIPE);
+                        }
+                    }
                     self.complete_receivers(index, false);
                 }
                 0
@@ -539,7 +781,7 @@ impl Runtime {
                     || stack.size < 256
                     || stack.size & 15 != 0
                     || !self.writable(stack.base, stack.size)
-                    || priority > 3
+                    || priority > u32::from(self.processes.slots[current].priority_ceiling)
                     || affinity != 1
                     || !self.allocator.owns(self.processes.slots[current].id, stack)
                 {
@@ -622,6 +864,11 @@ impl Runtime {
                     Err(e) => return e,
                 };
                 if capability.rights & cap::CONTROL != 0 {
+                    for i in 0..TASKS {
+                        if self.calls[i].active && self.calls[i].endpoint == ep {
+                            self.fail_call(i, ipc::EPIPE);
+                        }
+                    }
                     self.ipc.close(ep);
                     self.invalidate_object(capability.object, None);
                     self.complete_receivers(ep, true);
@@ -658,6 +905,8 @@ impl Runtime {
                 {
                     Ok(ep) => {
                         self.complete_receivers(ep, false);
+                        self.scheduler.inherit();
+                        *switch = self.scheduler.should_preempt();
                         0
                     }
                     Err(e) => e,
@@ -677,6 +926,8 @@ impl Runtime {
                 };
                 match self.ipc.receive(ep, capacity) {
                     Ok(Some(message)) => {
+                        self.bind_reply(message.reply_token, self.scheduler.current);
+                        frame.registers[9] = message.reply_token;
                         // SAFETY: checked writable receive buffer. No shared-memory pointers.
                         unsafe {
                             deliver(a1 as usize, &message);
@@ -769,6 +1020,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             soc::timer::acknowledge();
         }
         let uptime = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER snapshot timeout");
+        runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
     } else if !interrupt && cause == 8 && !from_idle {

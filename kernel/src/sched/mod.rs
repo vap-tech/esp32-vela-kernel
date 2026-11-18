@@ -17,6 +17,7 @@ pub struct Scheduler<C: Copy> {
     sampled_at: u64,
     last_id: u32,
     load: LoadAverage,
+    preferred: Option<usize>,
 }
 impl<C: Copy> Scheduler<C> {
     pub fn new(
@@ -52,6 +53,7 @@ impl<C: Copy> Scheduler<C> {
             sampled_at: 0,
             last_id: BOOT_THREADS as u32,
             load: LoadAverage::default(),
+            preferred: None,
         }
     }
     pub fn create_thread(
@@ -119,9 +121,28 @@ impl<C: Copy> Scheduler<C> {
         if was_running {
             self.tasks[self.current].state = State::Ready;
         }
+        self.inherit();
+        let best = self
+            .tasks
+            .iter()
+            .filter(|t| t.state == State::Ready && t.affinity & 1 != 0)
+            .map(|t| t.effective_priority)
+            .max();
+        if let Some(preferred) = self.preferred.take() {
+            let t = &self.tasks[preferred];
+            if t.state == State::Ready && t.affinity & 1 != 0 && Some(t.effective_priority) == best
+            {
+                self.tasks[preferred].state = State::Running;
+                self.current = preferred;
+                return Some(preferred);
+            }
+        }
         for offset in 1..=self.tasks.len() {
             let next = (self.current + offset) % self.tasks.len();
-            if self.tasks[next].state == State::Ready {
+            if self.tasks[next].state == State::Ready
+                && self.tasks[next].affinity & 1 != 0
+                && Some(self.tasks[next].effective_priority) == best
+            {
                 if preemptive && was_running && next != self.current {
                     self.tasks[self.current].preemptions += 1;
                 }
@@ -131,6 +152,43 @@ impl<C: Copy> Scheduler<C> {
             }
         }
         None
+    }
+    pub fn prefer(&mut self, thread: usize) {
+        self.preferred = Some(thread);
+    }
+    pub fn should_preempt(&self) -> bool {
+        self.tasks.iter().any(|t| {
+            t.state == State::Ready
+                && t.affinity & 1 != 0
+                && t.effective_priority > self.current().effective_priority
+        })
+    }
+    pub fn inherit(&mut self) {
+        for t in &mut self.tasks {
+            t.effective_priority = t.priority;
+        }
+        // At most TASKS dependency edges. Bounded transitive donation; no heap.
+        for _ in 0..TASKS {
+            let mut changed = false;
+            for i in 0..TASKS {
+                if self.tasks[i].state != State::Blocked {
+                    continue;
+                }
+                if let Wait::Reply { server, .. } = self.tasks[i].wait {
+                    let priority = self.tasks[i].effective_priority;
+                    if server < TASKS
+                        && self.tasks[server].state != State::Terminated
+                        && self.tasks[server].effective_priority < priority
+                    {
+                        self.tasks[server].effective_priority = priority;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
     pub fn block(&mut self, wait: Wait) {
         self.tasks[self.current].wait = wait;

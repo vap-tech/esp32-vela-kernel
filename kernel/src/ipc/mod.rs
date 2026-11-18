@@ -17,11 +17,13 @@ pub const EMSGSIZE: u32 = (-90i32) as u32;
 pub struct Message {
     pub data: [u8; MESSAGE_BYTES],
     pub length: usize,
+    pub reply_token: u32,
 }
 impl Message {
     pub const EMPTY: Self = Self {
         data: [0; MESSAGE_BYTES],
         length: 0,
+        reply_token: 0,
     };
 }
 #[derive(Clone, Copy)]
@@ -83,6 +85,9 @@ impl Ipc {
             index,
             generation: self.generation,
         })
+    }
+    pub fn owner(&self, index: usize) -> Option<usize> {
+        self.endpoints.get(index)?.owner
     }
     pub fn object(&self, index: usize) -> Object {
         Object::Endpoint {
