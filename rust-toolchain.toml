@@ -1,5 +1,5 @@
 [toolchain]
 channel = "1.99.1"
-targets = ["riscv32imafc-unknown-none-elf"]
+targets = ["riscv32imafc-unknown-none-elf", "riscv32imac-unknown-none-elf"]
 components = ["rustfmt"]
 profile = "minimal"
