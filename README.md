@@ -66,3 +66,10 @@ alignment, writable allocations, exhaustion and release in U-mode.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
 The polling console can lose burst input; paced monitor input was used.
 No SMP, ELF process launch, DMA, Sentinel, POSIX, kernel VFS or IRQ driver framework.
+
+ELF validation: bounded little-endian ELF32 RISC-V ET_EXEC parser, at most eight
+load segments; checks file/RV32 bounds, alignment, overlap, permissions and a
+file-backed executable entry. Rejects W+X, dynamic/interpreter/TLS headers and
+unsupported ISA ABI flags. Exposes segment bytes and BSS sizes without writing
+memory. Address reservation, copying/BSS initialization and dynamic process
+launch are the next step; this is not yet a runnable ELF loader.
