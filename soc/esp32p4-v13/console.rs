@@ -79,3 +79,40 @@ impl fmt::Write for Console {
         }
     }
 }
+
+// P4 v1.3 TRM chapters 12 and 49. Source 22 routes to HP0 CLIC line 18.
+// SERIAL_OUT_RECV_PKT is latched per packet. DATA_AVAIL persists per byte.
+pub const RX_LINE: u32 = 18;
+const RX_PACKET: u32 = 1 << 2;
+impl Console {
+    pub fn route_rx_irq(&mut self) {
+        unsafe {
+            crate::pac::write(FIFO + 0x10, 0);
+            crate::pac::write(FIFO + 0x14, RX_PACKET);
+            crate::pac::write(0x500d_6058, RX_LINE);
+            crate::pac::write(0x2080_1048, 0x3fc00100);
+            core::arch::asm!("fence iorw, iorw", options(nostack));
+        }
+    }
+    pub fn mask_rx_irq(&mut self) {
+        unsafe {
+            crate::pac::write(FIFO + 0x10, 0);
+            crate::pac::write(FIFO + 0x14, RX_PACKET);
+            core::arch::asm!("fence iorw, iorw", options(nostack));
+        }
+    }
+    /// Called under masked hart interrupts. Clear old notifications, enable the
+    /// source, then sample FIFO state to cover arrivals before/during rearm.
+    pub fn arm_rx_irq(&mut self) -> bool {
+        unsafe {
+            crate::pac::write(FIFO + 0x14, RX_PACKET);
+            crate::pac::write(FIFO + 0x10, RX_PACKET);
+            core::arch::asm!("fence iorw, iorw", options(nostack));
+            if crate::pac::read(CONFIG) & 4 != 0 {
+                self.mask_rx_irq();
+                return false;
+            }
+        }
+        true
+    }
+}

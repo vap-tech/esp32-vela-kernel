@@ -459,7 +459,7 @@ pub extern "C" fn shell_main(reply_handle: u32, request_handle: u32, input_handl
 }
 #[unsafe(link_section = ".user.text")]
 #[unsafe(no_mangle)]
-pub extern "C" fn console_main(input_handle: u32) -> ! {
+pub extern "C" fn console_main(input_handle: u32, rx_event: u32) -> ! {
     loop {
         let mut input = Buffer::new();
         let length = call(abi::CONSOLE_READ, input.mut_ptr() as u32, 32, 0, 0);
@@ -472,8 +472,8 @@ pub extern "C" fn console_main(input_handle: u32) -> ! {
                 exit();
             }
         }
-        // Isolated bounded polling service, NOT interrupt-driven USB input:
-        // at most 32 bytes per 10ms, sleeps via scheduler between samples.
-        sleep();
+        if length == 0 && call(abi::EVENT_WAIT, rx_event, 0, 0, 0) != 0 {
+            exit();
+        }
     }
 }

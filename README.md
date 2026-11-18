@@ -35,10 +35,13 @@ Timer wakes sleeping tasks; recv wakes on send. Kernel references do not survive
 idle entry, and M-mode traps are resumable only from that assembly idle loop.
 CLIC return keeps the active trap's bookkeeping and target privilege.
 
-Console RX is deliberately bounded polling in a U-mode service: <=32 bytes per
-sample, sleeps one 10ms tick between samples, with boot-assigned read authority.
-This is not interrupt-driven USB input. Shell blocks on input IPC and reply IPC.
-No USB polling or periodic console formatting occurs in the timer ISR.
+The console service drains USB Serial/JTAG RX in batches of up to 32 bytes.
+Boot binds the RX event capability to the console process. EVENT_WAIT rearms
+the packet interrupt and checks FIFO availability under masked hart interrupts
+before blocking. CLIC line 18 wakes the driver on hart0. The handler masks and
+acknowledges the packet source until the driver rearms it. The shared static
+service image has an aligned 8 KiB RX mapping. On Tab5 v1.3 the shell accepted
+help and both procfs reads with one serial write per command.
 
 Stats ABI remains an explicit 44-byte little-endian snapshot. Total counts live
 tasks (including Blocked), runnable is Ready+Running; last ID includes exited
@@ -65,8 +68,7 @@ whole-region release. Raw pointers expire at release; sharing requires userspace
 synchronization. No global allocator or individual free. `memtest` exercises
 alignment, writable allocations, exhaustion and release in U-mode.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
-The polling console can lose burst input; paced monitor input was used.
-No SMP, DMA, Sentinel, POSIX, kernel VFS or IRQ driver framework.
+No SMP, DMA, Sentinel, POSIX, kernel VFS or dynamic IRQ registration.
 
 The shell launches a fixed-address ET_EXEC with `run hello` and a static PIE
 with `run pic`. Building both programs requires clang with the RISC-V target

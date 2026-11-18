@@ -55,6 +55,10 @@ struct Runtime {
     logged_wake: bool,
     logged_idle: bool,
 }
+const CONSOLE_RX: Object = Object::Event {
+    index: 0,
+    generation: 1,
+};
 struct BootCell(UnsafeCell<MaybeUninit<Runtime>>);
 // SAFETY: hart0 only, HP1 reset, MIE=0 in every Rust kernel path. The M-mode
 // WFI loop has no Rust references and never accesses this cell. Initialization
@@ -63,6 +67,7 @@ unsafe impl Sync for BootCell {}
 static RUNTIME: BootCell = BootCell(UnsafeCell::new(MaybeUninit::uninit()));
 unsafe extern "C" {
     static _user_code_start: u8;
+    static _user_code_end: u8;
     static _user_stack0: u8;
     static _user_stack1: u8;
     static _user_stack2: u8;
@@ -87,7 +92,8 @@ extern "C" fn rust_main() -> ! {
     );
     let code = Region {
         base: core::ptr::addr_of!(_user_code_start) as usize,
-        size: 4096,
+        size: core::ptr::addr_of!(_user_code_end) as usize
+            - core::ptr::addr_of!(_user_code_start) as usize,
     };
     let stacks = [
         Region {
@@ -118,6 +124,13 @@ extern "C" fn rust_main() -> ! {
     let shell_request = grant(&mut processes, 0, request, 1, cap::SEND).unwrap();
     let proc_reply = grant(&mut processes, 1, reply, 0, cap::SEND).unwrap();
     let console_input = grant(&mut processes, 1, input, 2, cap::SEND).unwrap();
+    let rx_event = processes.slots[2]
+        .capabilities
+        .install(Capability {
+            object: CONSOLE_RX,
+            rights: cap::READ | cap::WAIT | cap::ACK,
+        })
+        .unwrap();
     let entries = [
         users::procfs_main as *const () as usize,
         users::shell_main as *const () as usize,
@@ -126,7 +139,7 @@ extern "C" fn rust_main() -> ! {
     let args = [
         [request, proc_reply, 0],
         [reply, shell_request, input],
-        [console_input, 0, 0],
+        [console_input, rx_event, 0],
     ];
     let contexts = core::array::from_fn(|i| {
         let mut frame =
@@ -140,7 +153,7 @@ extern "C" fn rust_main() -> ! {
     assert!(unsafe { initial_pmp.activate() }, "PMP readback");
     let _ = writeln!(
         console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (bounded 100Hz polling)"
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)"
     );
     let mut idle = arch::TrapFrame::user(
         arch::vela_idle_entry as *const () as usize,
@@ -186,6 +199,7 @@ extern "C" fn rust_main() -> ! {
         let runtime = (*RUNTIME.0.get()).write(runtime);
         let _ = writeln!(runtime.console, "[sched] preemptive scheduler online");
         soc::timer::start(vela_trap_entry as *const () as usize);
+        runtime.console.route_rx_irq();
         arch::enter(&runtime.scheduler.current().context);
     }
 }
@@ -1056,9 +1070,34 @@ impl Runtime {
                     }
                 }
             }
+            syscall::EVENT_WAIT => {
+                let caps = &self.processes.slots[current].capabilities;
+                match caps.get(a0, cap::WAIT | cap::ACK) {
+                    Ok(c) if c.object == CONSOLE_RX => (),
+                    Ok(_) => return cap::EBADF,
+                    Err(e) => return e,
+                }
+                if self
+                    .scheduler
+                    .tasks
+                    .iter()
+                    .any(|t| matches!(t.wait, Wait::Event { object: CONSOLE_RX }))
+                {
+                    return (-16i32) as u32;
+                }
+                if self.console.arm_rx_irq() {
+                    self.scheduler.block(Wait::Event { object: CONSOLE_RX });
+                    *switch = true;
+                }
+                0
+            }
             syscall::CONSOLE_READ => {
                 // Boot-assigned input authority: only console task owns RX.
-                if current != 2 {
+                if self.processes.slots[current]
+                    .capabilities
+                    .find(CONSOLE_RX, cap::READ)
+                    .is_none()
+                {
                     return ipc::EPERM;
                 }
                 let capacity = a1 as usize;
@@ -1103,7 +1142,10 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     // Reject all M-mode entries except the known assembly idle IRQ first.
     if from_idle {
         let idle_pc = arch::vela_idle_entry as *const () as u32;
-        if !interrupt || cause != 17 || frame.mepc.wrapping_sub(idle_pc) >= 8 {
+        if !interrupt
+            || !matches!(cause, 17 | soc::console::RX_LINE)
+            || frame.mepc.wrapping_sub(idle_pc) >= 8
+        {
             fatal(frame);
         }
     }
@@ -1124,6 +1166,16 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
+    } else if interrupt && cause == soc::console::RX_LINE {
+        runtime.console.mask_rx_irq();
+        if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
+            t.state == State::Blocked && matches!(t.wait, Wait::Event { object: CONSOLE_RX })
+        }) {
+            runtime.scheduler.wake(i);
+            switch = from_idle || runtime.scheduler.should_preempt();
+        } else {
+            switch = from_idle;
+        }
     } else if !interrupt && cause == 8 && !from_idle {
         frame.mepc = frame.mepc.wrapping_add(4);
         frame.registers[8] = runtime.dispatch(frame, &mut switch);

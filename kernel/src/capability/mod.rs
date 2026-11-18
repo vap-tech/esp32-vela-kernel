@@ -12,7 +12,7 @@ pub const ACK: u16 = 128;
 pub const CONTROL: u16 = 256;
 pub const EBADF: u32 = (-9i32) as u32;
 pub const EPERM: u32 = (-1i32) as u32;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     Endpoint { index: usize, generation: u32 },
     Memory { owner: u32, region: Region },

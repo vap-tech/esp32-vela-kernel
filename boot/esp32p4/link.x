@@ -15,10 +15,10 @@ SECTIONS {
   *(.rodata .rodata.* .srodata .srodata.*);
   . = ALIGN(4);
   *(.data .data.* .sdata .sdata.* .got .got.*);
-  . = ALIGN(4096); _user_code_start = .;
+  . = ALIGN(8192); _user_code_start = .;
   KEEP(*(.user.text)); KEEP(*(.user.rodata));
   _user_code_used_end = .;
-  . = _user_code_start + 4096; _user_code_end = .;
+  . = _user_code_start + 8192; _user_code_end = .;
   . = ALIGN(4); _upper_load_end = .;
  } > UPPER
  .bss (NOLOAD) : ALIGN(16) {
@@ -31,7 +31,7 @@ SECTIONS {
  _boot_stack_top = ORIGIN(BOOT_STACK) + LENGTH(BOOT_STACK);
  _stack_bottom = ORIGIN(STACK);
  _stack_top = ORIGIN(STACK) + LENGTH(STACK);
- ASSERT(_user_code_used_end <= _user_code_end, "User code exceeds 4 KiB")
+ ASSERT(_user_code_used_end <= _user_code_end, "User code exceeds 8 KiB")
  ASSERT(SIZEOF(.entry) <= 8192, "SPM entry exceeds 8KiB")
  ASSERT(_upper_start == 0x4ff40000, "ROM reservation violated")
  ASSERT(_bss_end <= _stack_bottom, "Runtime overlaps stack")

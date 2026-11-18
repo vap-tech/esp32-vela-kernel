@@ -35,3 +35,4 @@ pub const IPC_CALL: u32 = 20; // a0=send handle,a1=req,a2=len,a3=reply buffer,a4
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token,a1=buffer,a2=len
 pub const THREAD_PRIORITY: u32 = 22; // a0=own TID,a1=priority 0..3
 pub const SPAWN_HELLO: u32 = 23; // boot shell launches bundled ELF (a0: 0=hello, 1=pic), returns PID
+pub const EVENT_WAIT: u32 = 24; // a0=boot-bound USB RX event; acknowledge, rearm and wait

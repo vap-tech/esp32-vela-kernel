@@ -23,6 +23,9 @@ pub enum State {
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Wait {
+    Event {
+        object: crate::capability::Object,
+    },
     None,
     Receive {
         endpoint: usize,
