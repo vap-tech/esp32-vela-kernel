@@ -2,19 +2,19 @@
 
 Space Flow bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
 Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
-100 Hz preemptive round robin, static storage, no heap or async runtime.
+100 Hz priority round robin, bounded process/thread pools, no global heap or async runtime.
 
     ./scripts/build.sh
     ./scripts/flash.sh /dev/ttyACM0
     ./scripts/monitor.sh /dev/ttyACM0
 
-Monitor Ctrl-R resets; Ctrl-C detaches. Shell: help, cat <path>, uptime.
+Monitor Ctrl-R resets; Ctrl-C detaches. Shell: help, cat <path>, uptime, memtest.
 Try cat /proc/loadavg and cat /proc/uptime. File lookup and formatting run in
 userspace procfs, requested through IPC; no kernel VFS or hardcoded file output.
 
 IPC: endpoint_create/send/recv/endpoint_close, eight endpoints, four queued
-messages each, max 96 bytes, six generational local handles per task. Creation
-gives owner send+receive rights. Only explicit boot assignments grant SEND to
+messages each, max 96 bytes, sixteen generational capabilities per process. Creation
+gives owner send+receive rights. Boot assignments and explicit capability grants give SEND to
 peers; global endpoint IDs are not user handles. Endpoint owner alone receives.
 Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
 retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
@@ -26,8 +26,8 @@ Exit/fault cleans up owned endpoints and local aliases.
 Queue check and wait registration are serialized with masked IRQs on hart0.
 Send copies through kernel storage, completes the receiver's own saved return
 register and then wakes it. mepc advances once, before blocking. All buffers
-are validated against current mappings; writable buffers must be private stack.
-There is no user-to-user shared writable mapping.
+are validated against current mappings; writable buffers require a writable process mapping.
+Explicit one-level memory grants support shared R/RW mappings and owner revocation.
 
 Idle is a separate kernel WFI continuation, never a user task or loadavg input.
 Timer wakes sleeping tasks; recv wakes on send. Kernel references do not survive
@@ -52,4 +52,17 @@ shell IPC reads of loadavg/uptime, help and unknown-file response.
 Logs are in ignored target/v03-smoke.log and target/v03-final.log.
 First Light documents are historical. Boot entry, packer and fixed Flash
 offsets are unchanged. Only SRAM task-stack reservations gained a third stack.
-No SMP, full capabilities, allocator, POSIX, kernel VFS or general driver framework.
+Processes own address spaces, cached PMP images and capability tables; threads
+own saved contexts, stacks and priority/affinity. MEM_ALLOC reserves zeroed,
+NAPOT-compatible owned SRAM; MEM_FREE revokes aliases before reuse. Endpoint
+and memory grants cannot forward authority. IPC call/reply uses single-use reply
+tokens, bounded priority donation, direct handoff and optional deadlines.
+
+Userspace Arena explicitly suballocates aligned blocks inside one MEM_ALLOC
+region; metadata stays on the service stack, with checked arithmetic and explicit
+whole-region release. Raw pointers expire at release; sharing requires userspace
+synchronization. No global allocator or individual free. `memtest` exercises
+alignment, writable allocations, exhaustion and release in U-mode.
+Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
+The polling console can lose burst input; paced monitor input was used.
+No SMP, ELF process launch, DMA, Sentinel, POSIX, kernel VFS or IRQ driver framework.

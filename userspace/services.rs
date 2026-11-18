@@ -2,6 +2,8 @@
 //! is inlined or placed in .user.text; literals live only in .user.rodata.
 //! No allocation, kernel references, shared writable memory, or core formatting.
 use crate::syscall as abi;
+#[path = "arena.rs"]
+mod arena;
 use core::mem::MaybeUninit;
 macro_rules! text {
     ($name:ident, $bytes:literal) => {
@@ -10,8 +12,11 @@ macro_rules! text {
     };
 }
 text!(PROMPT, b"vela:/$ ");
-text!(HELP, b"help | cat <path> | uptime\n");
+text!(HELP, b"help | cat <path> | uptime | memtest\n");
 text!(HELP_CMD, b"help");
+text!(MEMTEST_CMD, b"memtest");
+text!(MEM_OK, b"arena: aligned allocations, bounds, release OK\n");
+text!(MEM_FAIL, b"arena: FAIL\n");
 text!(UPTIME_CMD, b"uptime");
 text!(CAT, b"cat ");
 text!(LOADAVG, b"/proc/loadavg");
@@ -330,12 +335,42 @@ fn read_file(path: *const u8, length: usize, request_handle: u32, _reply_handle:
     }
 }
 #[inline(always)]
+fn arena_probe() -> bool {
+    let Ok(mut arena) = arena::Arena::new(4096) else {
+        return false;
+    };
+    let layout = core::alloc::Layout::from_size_align(31, 64).unwrap();
+    let first = arena.allocate(layout);
+    let second = arena.allocate(layout);
+    let mut ok = false;
+    if let (Some(a), Some(b)) = (first, second) {
+        // SAFETY: distinct live allocations, both at least 31 writable bytes.
+        unsafe {
+            a.as_ptr().write_volatile(0x5a);
+            b.as_ptr().write_volatile(0xa5);
+            ok = a.as_ptr().read_volatile() == 0x5a && b.as_ptr().read_volatile() == 0xa5;
+        }
+        ok &= a.as_ptr() as usize % 64 == 0 && b.as_ptr() as usize % 64 == 0;
+    }
+    ok &= arena
+        .allocate(core::alloc::Layout::from_size_align(4096, 1).unwrap())
+        .is_none();
+    let released = arena.release().is_ok();
+    ok && released && arena.allocate(layout).is_none()
+}
+#[inline(always)]
 fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     if line.len == 0 {
         return;
     }
     if line.matches(0, HELP_CMD.as_ptr(), HELP_CMD.len()) {
         write(HELP.as_ptr(), HELP.len());
+    } else if line.matches(0, MEMTEST_CMD.as_ptr(), MEMTEST_CMD.len()) {
+        if arena_probe() {
+            write(MEM_OK.as_ptr(), MEM_OK.len());
+        } else {
+            write(MEM_FAIL.as_ptr(), MEM_FAIL.len());
+        }
     } else if line.matches(0, UPTIME_CMD.as_ptr(), UPTIME_CMD.len()) {
         read_file(UPTIME.as_ptr(), UPTIME.len(), request_handle, reply_handle);
     } else if line.len > CAT.len()
