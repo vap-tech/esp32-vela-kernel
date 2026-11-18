@@ -47,6 +47,50 @@ impl Lease {
 #[cfg(test)]
 mod tests {
     use super::Lease;
+    use crate::{
+        process::{AddressSpace, Lifecycle, Processes, READ, WRITE},
+        task::Region,
+    };
+
+    #[test]
+    fn late_completion_after_slot_reuse_has_no_recipient() {
+        let page = Region {
+            base: 0x10000,
+            size: 4096,
+        };
+        for success in [true, false] {
+            let mut pool = Processes::new();
+            let mut lease = Lease::Free;
+            let slot = pool.create(AddressSpace::EMPTY).unwrap();
+            let owner = &mut pool.slots[slot];
+            let old_pid = owner.id;
+            assert!(lease.acquire(old_pid));
+            owner.memory.insert(page, READ | WRITE).unwrap();
+            owner.memory.dma_access(page, false).unwrap();
+            assert!(lease.submit(old_pid));
+
+            lease.release_process(old_pid);
+            owner.memory = AddressSpace::EMPTY;
+            owner.state = Lifecycle::Free;
+
+            let replacement = pool.create(AddressSpace::EMPTY).unwrap();
+            assert_eq!(replacement, slot);
+            let new_pid = pool.slots[replacement].id;
+            assert_ne!(new_pid, old_pid);
+            assert!(!lease.acquire(new_pid));
+
+            // This is the completion decision consumed by the IRQ/timeout path.
+            // None prevents both restoring a mapping and waking a thread.
+            assert_eq!(lease.finish(success), None);
+            assert!(
+                !pool.slots[replacement]
+                    .memory
+                    .permits(page.base, page.size, READ)
+            );
+            assert_eq!(lease.acquire(new_pid), success);
+        }
+    }
+
     #[test]
     fn exit_waits_for_completion_before_reuse() {
         let mut lease = Lease::Free;
