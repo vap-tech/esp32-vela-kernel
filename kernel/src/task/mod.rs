@@ -23,6 +23,10 @@ pub enum State {
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Wait {
+    Sentinel {
+        sequence: u32,
+        deadline: u64,
+    },
     Dma,
     Event {
         object: crate::capability::Object,

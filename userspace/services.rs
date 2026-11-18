@@ -14,10 +14,12 @@ macro_rules! text {
 text!(PROMPT, b"vela:/$ ");
 text!(
     HELP,
-    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel\n"
+    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel | sentinel hello\n"
 );
 text!(HELP_CMD, b"help");
 text!(RUN_DMA, b"run dma");
+text!(HELLO_CMD, b"sentinel hello");
+text!(ACK_MSG, b"Sentinel ACK seq ");
 text!(SENTINEL, b"sentinel");
 text!(READY, b"Sentinel READY v");
 text!(PENDING, b"Sentinel pending, epoch ");
@@ -395,6 +397,17 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
             u32::from(line.len == RUN_PIC.len())
         };
         if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
+            write(FAILED.as_ptr(), FAILED.len());
+        }
+    } else if line.matches(0, HELLO_CMD.as_ptr(), HELLO_CMD.len()) {
+        let seq = call(abi::SENTINEL_HELLO, 0, 0, 0, 0);
+        if (seq as i32) > 0 {
+            let mut out = Buffer::new();
+            out.append(ACK_MSG.as_ptr(), ACK_MSG.len());
+            out.decimal(seq);
+            out.push(b'\n');
+            write(out.ptr(), out.len);
+        } else {
             write(FAILED.as_ptr(), FAILED.len());
         }
     } else if line.matches(0, SENTINEL.as_ptr(), SENTINEL.len()) {

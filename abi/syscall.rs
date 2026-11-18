@@ -39,3 +39,4 @@ pub const SPAWN_HELLO: u32 = 23; // boot shell launches bundled ELF (a0: 0=hello
 pub const EVENT_WAIT: u32 = 24; // a0=boot-bound USB RX event; acknowledge, rearm and wait
 pub const DMA_COPY: u32 = 25; // bundled DMA driver: copy a0 bytes between private page halves, block until IRQ
 pub const SENTINEL_STATUS: u32 = 26; // a0=acknowledged version (0 until READY), a1=startup epoch
+pub const SENTINEL_HELLO: u32 = 27; // blocks for ACK; returns sequence or errno

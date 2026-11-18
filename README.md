@@ -98,6 +98,14 @@ the target listed in rust-toolchain.toml. HP stalls LP, loads the binary at
 starts LP. Only HP writes mailbox word 0 (epoch). LP writes word 1 (echo),
 issues an I/O fence, then writes word 2 (versioned READY) to signal HP CLIC
 line 20. HP checks the latched bit, event and epoch and acknowledges the IRQ.
-The firmware then waits in WFI. Hardware smoke returned `Sentinel READY v1,
+The firmware then waits in WFI with mailbox interrupt 26 enabled. Hardware smoke returned `Sentinel READY v1,
 epoch 1` and the shell continued to serve uptime and loadavg. Heartbeat,
 diagnostics and sleep supervision remain future protocol commands.
+
+The boot shell sends a request with `sentinel hello`. HP writes its sequence
+to word 3 and HELLO to word 4. The LP interrupt handler clears the command
+latch, echoes the epoch and writes the sequence to word 5 before ringing the
+HP event doorbell with ACK. HP wakes the caller on a matching epoch and
+sequence. One request may be outstanding. A one-second timeout releases the
+caller; the mailbox slot stays busy until the matching ACK or the next boot.
+Tab5 v1.3 smoke: READY epoch 2, ACK sequences 1 and 2, uptime and loadavg.

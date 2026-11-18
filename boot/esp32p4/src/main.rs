@@ -58,6 +58,8 @@ struct Runtime {
     dma_deadline: u64,
     sentinel_epoch: Option<u32>,
     sentinel_ready: bool,
+    sentinel_sequence: u32,
+    hello_pending: bool,
     usb_rx_interrupts: u64,
     logged_block: bool,
     logged_wake: bool,
@@ -204,6 +206,8 @@ extern "C" fn rust_main() -> ! {
         dma_deadline: 0,
         sentinel_epoch: None,
         sentinel_ready: false,
+        sentinel_sequence: 0,
+        hello_pending: false,
         usb_rx_interrupts: 0,
         logged_block: false,
         logged_wake: false,
@@ -992,6 +996,30 @@ impl Runtime {
                 *switch = true;
                 0
             }
+            syscall::SENTINEL_HELLO => {
+                if self.processes.slots[current].id != 2 {
+                    return cap::EPERM;
+                }
+                if !self.sentinel_ready {
+                    return syscall::EAGAIN;
+                }
+                if self.hello_pending {
+                    return (-16i32) as u32;
+                }
+                if self.sentinel_sequence == i32::MAX as u32 {
+                    return (-75i32) as u32;
+                }
+                self.sentinel_sequence += 1;
+                self.hello_pending = true;
+                let sequence = self.sentinel_sequence;
+                let deadline = self.scheduler.snapshot().uptime_ticks.saturating_add(100);
+                self.scheduler.block(Wait::Sentinel { sequence, deadline });
+                unsafe {
+                    soc::sentinel::hello(sequence);
+                }
+                *switch = true;
+                0
+            }
             syscall::SENTINEL_STATUS => {
                 frame.registers[9] = self.sentinel_epoch.unwrap_or(0);
                 if self.sentinel_ready {
@@ -1272,12 +1300,36 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             }
             runtime.complete_dma(false);
         }
+        if runtime.hello_pending {
+            for i in 0..TASKS {
+                if matches!(runtime.scheduler.tasks[i].wait, Wait::Sentinel {deadline,..} if uptime>=deadline)
+                {
+                    runtime.scheduler.tasks[i].context.registers[8] = (-110i32) as u32;
+                    runtime.scheduler.wake(i);
+                }
+            }
+        }
         runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
     } else if interrupt && cause == soc::sentinel::LINE {
-        runtime.sentinel_ready |= unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) };
-        switch = from_idle;
+        match unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) } {
+            Some((sentinel_wire::READY, _)) => runtime.sentinel_ready = true,
+            Some((sentinel_wire::ACK, seq))
+                if runtime.hello_pending && seq == runtime.sentinel_sequence =>
+            {
+                runtime.hello_pending = false;
+                if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
+                    t.state == State::Blocked
+                        && matches!(t.wait, Wait::Sentinel {sequence,..} if seq==sequence)
+                }) {
+                    runtime.scheduler.tasks[i].context.registers[8] = seq;
+                    runtime.scheduler.wake(i);
+                }
+            }
+            _ => (),
+        }
+        switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::dma::LINE {
         let ok = unsafe { soc::dma::finish(runtime.dma_length) };
         runtime.complete_dma(ok);

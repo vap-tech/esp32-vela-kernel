@@ -29,6 +29,10 @@ pub unsafe fn start() -> Option<u32> {
     unsafe {
         write(LP_CLOCK, read(LP_CLOCK) | 1 << 31);
         write(POWER, read(POWER) | FORCE_STALL | 1 << 29 | 1 << 30);
+        // A retained LP can already be in WFI with its local IRQs masked.
+        // Reset its pipeline while force-stall is asserted before awaiting STALL_RDY.
+        write(LP_RESET, 1 << 31);
+        fence();
         write(WAKE_SOURCE, HP_WAKE);
         write(WAKE, 1 << 31);
         fence();
@@ -58,14 +62,25 @@ pub unsafe fn start() -> Option<u32> {
     }
 }
 /// Consume the LP doorbell only after seeing the hardware status bit.
-pub unsafe fn acknowledge(epoch: Option<u32>) -> bool {
+pub unsafe fn acknowledge(epoch: Option<u32>) -> Option<(u32, u32)> {
     unsafe {
         let status = read(BASE + 0x54);
         fence();
         let event = word(wire::EVENT).read_volatile();
         let echo = word(wire::ECHO).read_volatile();
+        let seq = word(wire::REPLY_SEQ).read_volatile();
         write(BASE + 0x5c, status);
         fence();
-        status & READY_BIT != 0 && event == wire::READY && Some(echo) == epoch
+        (status & READY_BIT != 0 && Some(echo) == epoch).then_some((event, seq))
+    }
+}
+
+/// Caller owns the only pending request under masked HP interrupts.
+pub unsafe fn hello(seq: u32) {
+    unsafe {
+        word(wire::REQUEST_SEQ).write_volatile(seq);
+        fence();
+        word(wire::COMMAND).write_volatile(wire::HELLO);
+        fence();
     }
 }
