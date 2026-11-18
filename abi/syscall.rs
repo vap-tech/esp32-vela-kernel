@@ -38,3 +38,4 @@ pub const THREAD_PRIORITY: u32 = 22; // a0=own TID,a1=priority 0..3
 pub const SPAWN_HELLO: u32 = 23; // boot shell launches bundled ELF (a0: 0=hello, 1=pic, 2=dma), returns PID
 pub const EVENT_WAIT: u32 = 24; // a0=boot-bound USB RX event; acknowledge, rearm and wait
 pub const DMA_COPY: u32 = 25; // bundled DMA driver: copy a0 bytes between private page halves, block until IRQ
+pub const SENTINEL_STATUS: u32 = 26; // a0=acknowledged version (0 until READY), a1=startup epoch

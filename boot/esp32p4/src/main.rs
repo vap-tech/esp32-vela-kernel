@@ -17,6 +17,8 @@ mod board;
 mod pac;
 #[path = "../../../arch/riscv32/pmp.rs"]
 mod pmp;
+#[path = "../../../abi/sentinel.rs"]
+mod sentinel_wire;
 #[path = "../../../soc/esp32p4-v13/mod.rs"]
 mod soc;
 #[path = "../../../abi/syscall.rs"]
@@ -54,6 +56,8 @@ struct Runtime {
     dma: vela_kernel::dma::Lease,
     dma_length: usize,
     dma_deadline: u64,
+    sentinel_epoch: Option<u32>,
+    sentinel_ready: bool,
     usb_rx_interrupts: u64,
     logged_block: bool,
     logged_wake: bool,
@@ -198,6 +202,8 @@ extern "C" fn rust_main() -> ! {
         dma: vela_kernel::dma::Lease::Free,
         dma_length: 0,
         dma_deadline: 0,
+        sentinel_epoch: None,
+        sentinel_ready: false,
         usb_rx_interrupts: 0,
         logged_block: false,
         logged_wake: false,
@@ -209,6 +215,7 @@ extern "C" fn rust_main() -> ! {
         let _ = writeln!(runtime.console, "[sched] preemptive scheduler online");
         soc::timer::start(vela_trap_entry as *const () as usize);
         runtime.console.route_rx_irq();
+        runtime.sentinel_epoch = soc::sentinel::start();
         arch::enter(&runtime.scheduler.current().context);
     }
 }
@@ -985,6 +992,14 @@ impl Runtime {
                 *switch = true;
                 0
             }
+            syscall::SENTINEL_STATUS => {
+                frame.registers[9] = self.sentinel_epoch.unwrap_or(0);
+                if self.sentinel_ready {
+                    sentinel_wire::VERSION
+                } else {
+                    0
+                }
+            }
             syscall::TICKS => self.scheduler.snapshot().uptime_ticks as u32,
             syscall::STATS => {
                 let len = a1 as usize;
@@ -1224,7 +1239,10 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     if from_idle {
         let idle_pc = arch::vela_idle_entry as *const () as u32;
         if !interrupt
-            || !matches!(cause, 17 | soc::console::RX_LINE | soc::dma::LINE)
+            || !matches!(
+                cause,
+                17 | soc::console::RX_LINE | soc::dma::LINE | soc::sentinel::LINE
+            )
             || frame.mepc.wrapping_sub(idle_pc) >= 8
         {
             fatal(frame);
@@ -1257,6 +1275,9 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
+    } else if interrupt && cause == soc::sentinel::LINE {
+        runtime.sentinel_ready |= unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) };
+        switch = from_idle;
     } else if interrupt && cause == soc::dma::LINE {
         let ok = unsafe { soc::dma::finish(runtime.dma_length) };
         runtime.complete_dma(ok);

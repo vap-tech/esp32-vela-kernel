@@ -14,10 +14,14 @@ macro_rules! text {
 text!(PROMPT, b"vela:/$ ");
 text!(
     HELP,
-    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest\n"
+    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel\n"
 );
 text!(HELP_CMD, b"help");
 text!(RUN_DMA, b"run dma");
+text!(SENTINEL, b"sentinel");
+text!(READY, b"Sentinel READY v");
+text!(PENDING, b"Sentinel pending, epoch ");
+text!(EPOCH, b", epoch ");
 text!(RUN_PIC, b"run pic");
 text!(RUN_HELLO, b"run hello");
 text!(MEMTEST_CMD, b"memtest");
@@ -393,6 +397,19 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
         if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
             write(FAILED.as_ptr(), FAILED.len());
         }
+    } else if line.matches(0, SENTINEL.as_ptr(), SENTINEL.len()) {
+        let (version, epoch) = call6(abi::SENTINEL_STATUS, 0, 0, 0, 0, 0, 0);
+        let mut out = Buffer::new();
+        if version != 0 {
+            out.append(READY.as_ptr(), READY.len());
+            out.decimal(version);
+            out.append(EPOCH.as_ptr(), EPOCH.len());
+        } else {
+            out.append(PENDING.as_ptr(), PENDING.len());
+        }
+        out.decimal(epoch);
+        out.push(b'\n');
+        write(out.ptr(), out.len);
     } else if line.matches(0, MEMTEST_CMD.as_ptr(), MEMTEST_CMD.len()) {
         if arena_probe() {
             write(MEM_OK.as_ptr(), MEM_OK.len());

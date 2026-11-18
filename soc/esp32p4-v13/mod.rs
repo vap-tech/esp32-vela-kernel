@@ -12,4 +12,6 @@ pub unsafe fn memory_ready() -> bool {
 }
 
 pub mod dma;
+mod mailbox;
+pub mod sentinel;
 pub mod timer;

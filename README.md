@@ -69,7 +69,7 @@ whole-region release. Raw pointers expire at release; sharing requires userspace
 synchronization. No global allocator or individual free. `memtest` exercises
 alignment, writable allocations, exhaustion and release in U-mode.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
-No SMP, Sentinel, POSIX, kernel VFS or dynamic IRQ registration.
+No SMP, POSIX, kernel VFS or dynamic IRQ registration.
 
 The shell launches a fixed-address ET_EXEC with `run hello` and a static PIE
 with `run pic`. Building both programs requires clang with the RISC-V target
@@ -90,3 +90,14 @@ checks descriptor ownership and length before restoring access and waking
 the caller. Exit defers page reuse until completion. Failure or a one-second
 timeout quarantines the page until reboot. The buffer supports internal SRAM
 on this channel; PSRAM and cached user mappings require separate cache handling.
+
+On Tab5 v1.3, `sentinel` shows the LP firmware version and startup epoch
+acknowledged by HP. The build compiles a separate no_std RV32IMAC binary with
+the target listed in rust-toolchain.toml. HP stalls LP, loads the binary at
+0x50108000, sets the LP reset vector, clears stale mailbox interrupts and
+starts LP. Only HP writes mailbox word 0 (epoch). LP writes word 1 (echo),
+issues an I/O fence, then writes word 2 (versioned READY) to signal HP CLIC
+line 20. HP checks the latched bit, event and epoch and acknowledges the IRQ.
+The firmware then waits in WFI. Hardware smoke returned `Sentinel READY v1,
+epoch 1` and the shell continued to serve uptime and loadavg. Heartbeat,
+diagnostics and sleep supervision remain future protocol commands.
