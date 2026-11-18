@@ -1,5 +1,6 @@
 #![no_std]
 pub mod capability;
+pub mod dma;
 pub mod elf;
 pub mod ipc;
 pub mod memory;
