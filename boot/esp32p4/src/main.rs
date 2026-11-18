@@ -441,10 +441,36 @@ impl Runtime {
         let owner = self.processes.slots[process].id;
         let result = (|| {
             let mut space = AddressSpace::EMPTY;
+            let bias = if image.pic {
+                let end = image
+                    .segments()
+                    .iter()
+                    .map(|s| s.region.base + s.region.size)
+                    .max()
+                    .ok_or(8u32)?;
+                self.allocator.allocate(owner, end)?.base
+            } else {
+                0
+            };
             for (i, segment) in image.segments().iter().enumerate() {
-                let region =
+                let region = if image.pic {
+                    let size = segment
+                        .region
+                        .size
+                        .max(128)
+                        .checked_next_power_of_two()
+                        .ok_or(8u32)?;
+                    if segment.region.base % size != 0 {
+                        return Err(8);
+                    }
+                    Region {
+                        base: bias + segment.region.base,
+                        size,
+                    }
+                } else {
                     self.allocator
-                        .reserve(owner, segment.region.base, segment.region.size)?;
+                        .reserve(owner, segment.region.base, segment.region.size)?
+                };
                 let mut rights = READ;
                 if segment.flags & 1 != 0 {
                     rights |= EXECUTE;
@@ -464,6 +490,15 @@ impl Runtime {
                     );
                 }
             }
+            image
+                .visit_relocations(|target, addend| {
+                    // Parser validated the destination RW word and image-relative addend.
+                    unsafe {
+                        ((bias + target) as *mut u32).write((bias + addend) as u32);
+                    }
+                })
+                .map_err(|_| 8u32)?;
+            let entry = bias + image.entry;
             let stack = self.allocator.allocate(owner, 4096)?;
             space.insert(stack, READ | WRITE)?;
             let prepared = pmp::Prepared::new(&space)?;
@@ -471,9 +506,9 @@ impl Runtime {
                 core::ptr::write_bytes(stack.base as *mut u8, 0, stack.size);
                 core::arch::asm!("fence.i", options(nostack));
             }
-            let frame = arch::TrapFrame::user(image.entry, stack.base + stack.size, 0);
+            let frame = arch::TrapFrame::user(entry, stack.base + stack.size, 0);
             self.scheduler
-                .create_thread(process, frame, stack, image.entry, 1, 1)?;
+                .create_thread(process, frame, stack, entry, 1, 1)?;
             self.processes.slots[process].memory = space;
             self.pmp_images[process] = Some((space.revision, prepared));
             Ok(owner)
@@ -495,7 +530,12 @@ impl Runtime {
                 if self.processes.slots[current].id != 2 {
                     return cap::EPERM;
                 }
-                self.spawn_elf(include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")))
+                let bytes: &[u8] = match a0 {
+                    0 => include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
+                    1 => include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
+                    _ => return syscall::EINVAL,
+                };
+                self.spawn_elf(bytes)
                     .unwrap_or_else(|e| (-(e as i32)) as u32)
             }
             syscall::WRITE => {
@@ -794,7 +834,12 @@ impl Runtime {
                     size: a1 as usize,
                 };
                 let owner = self.processes.slots[current].id;
-                if !self.allocator.owns(owner, region) {
+                if !self.allocator.owns(owner, region)
+                    || self.processes.slots[current]
+                        .capabilities
+                        .find(Object::Memory { owner, region }, cap::CONTROL)
+                        .is_none()
+                {
                     return ipc::EPERM;
                 }
                 if self.scheduler.tasks.iter().any(|t| {

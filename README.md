@@ -67,12 +67,11 @@ Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
 The polling console can lose burst input; paced monitor input was used.
 No SMP, DMA, Sentinel, POSIX, kernel VFS or IRQ driver framework.
 
-ELF validation: bounded little-endian ELF32 RISC-V ET_EXEC parser, at most eight
-load segments; checks file/RV32 bounds, alignment, overlap, permissions and a
-file-backed executable entry. Rejects W+X, dynamic/interpreter/TLS headers and
-unsupported ISA ABI flags. The boot shell can launch the bundled fixed-address ELF with `run hello`.
-The build uses clang with the RISC-V target and ld.lld to link the separate
-userspace program. Its RX and RW segments must fit naturally aligned SRAM
-allocations. Each launch creates a process with an empty capability table and
-a private stack. Exit/fault releases its SRAM. A concurrent launch at occupied
-addresses fails. The current ABI selects only the bundled executable.
+The shell launches a fixed-address ET_EXEC with `run hello` and a static PIE
+with `run pic`. Building both programs requires clang with the RISC-V target
+and ld.lld. The loader checks RV32 bounds, segment permissions and entry before
+starting the process with a private stack and empty capability table. Exit and
+fault release its SRAM. Each PIE receives one aligned backing allocation and
+separate PMP mappings for its segments. The supported relocation is symbol-free
+R_RISCV_RELATIVE with an aligned RW destination and an in-image addend.
+The spawn ABI selects a bundled executable by index.

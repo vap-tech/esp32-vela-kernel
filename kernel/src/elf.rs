@@ -1,4 +1,4 @@
-//! Bounded ELF32 little-endian RISC-V ET_EXEC validation. No memory is changed
+//! Bounded ELF32 little-endian RISC-V ET_EXEC and static PIE validation. No memory is changed
 //! until the whole image has passed validation. Dynamic linking is unsupported.
 use crate::task::Region;
 
@@ -23,6 +23,8 @@ pub struct Segment {
 pub struct Image<'a> {
     bytes: &'a [u8],
     pub entry: usize,
+    pub pic: bool,
+    dynamic: Option<(usize, usize, usize)>,
     segments: [Segment; MAX_SEGMENTS],
     count: usize,
 }
@@ -43,7 +45,8 @@ impl<'a> Image<'a> {
         if bytes.len() < 52 || bytes.get(..7) != Some(b"\x7fELF\x01\x01\x01") {
             return Err(Error::Header);
         }
-        if half(bytes, 16)? != 2
+        let kind = half(bytes, 16)?;
+        if !matches!(kind, 2 | 3)
             || half(bytes, 18)? != 243
             || word(bytes, 20)? != 1
             || half(bytes, 40)? != 52
@@ -66,6 +69,8 @@ impl<'a> Image<'a> {
         }
         let mut image = Self {
             bytes,
+            pic: kind == 3,
+            dynamic: None,
             entry: word(bytes, 24)? as usize,
             segments: [Segment::default(); MAX_SEGMENTS],
             count: 0,
@@ -73,6 +78,17 @@ impl<'a> Image<'a> {
         for i in 0..count {
             let p = offset + i * 32;
             let kind = word(bytes, p)?;
+            if kind == 2 && image.pic {
+                let header = (
+                    word(bytes, p + 4)? as usize,
+                    word(bytes, p + 8)? as usize,
+                    word(bytes, p + 16)? as usize,
+                );
+                if image.dynamic.replace(header).is_some() {
+                    return Err(Error::Unsupported);
+                }
+                continue;
+            }
             if kind == 2 || kind == 3 || kind == 7 {
                 return Err(Error::Unsupported);
             }
@@ -93,7 +109,8 @@ impl<'a> Image<'a> {
                 continue;
             }
             if image.count == MAX_SEGMENTS
-                || base == 0
+                || (!image.pic && base == 0)
+                || (image.pic && align > 4096)
                 || physical != base
                 || file_size > size
                 || flags & !7 != 0
@@ -134,7 +151,72 @@ impl<'a> Image<'a> {
         {
             return Err(Error::Entry);
         }
+        image.visit_relocations(|_, _| {})?;
         Ok(image)
+    }
+    fn file_range(&self, addr: usize, len: usize) -> Result<usize, Error> {
+        for s in self.segments() {
+            if let Some(delta) = addr.checked_sub(s.region.base) {
+                if delta <= s.file_size && len <= s.file_size - delta {
+                    return Ok(s.file_offset + delta);
+                }
+            }
+        }
+        Err(Error::Bounds)
+    }
+    /// Apply only symbol-free RV32 RELATIVE relocations to aligned RW words.
+    /// Offsets and addends refer to original virtual addresses, before rebasing.
+    pub fn visit_relocations(&self, mut apply: impl FnMut(usize, usize)) -> Result<(), Error> {
+        let Some((offset, addr, size)) = self.dynamic else {
+            return Ok(());
+        };
+        if size == 0 || size % 8 != 0 || size > 512 || self.file_range(addr, size)? != offset {
+            return Err(Error::Bounds);
+        }
+        let mut rela = None;
+        let mut length = None;
+        let mut stride = None;
+        let mut terminated = false;
+        for p in (offset..offset + size).step_by(8) {
+            let value = word(self.bytes, p + 4)? as usize;
+            match word(self.bytes, p)? {
+                0 => {
+                    terminated = true;
+                    break;
+                }
+                7 if rela.replace(value).is_none() => (),
+                8 if length.replace(value).is_none() => (),
+                9 if stride.replace(value).is_none() => (),
+                0x6ffffffb if value == 0x08000000 => (),
+                4 | 5 | 6 | 10 | 11 | 21 | 0x6ffffff9 | 0x6ffffef5 => (),
+                _ => return Err(Error::Unsupported),
+            }
+        }
+        if !terminated {
+            return Err(Error::Header);
+        }
+        let (address, size) = match (rela, length, stride) {
+            (None, None, None) => return Ok(()),
+            (Some(a), Some(n), Some(12)) if n % 12 == 0 && n <= 12 * 256 => (a, n),
+            _ => return Err(Error::Unsupported),
+        };
+        let start = self.file_range(address, size)?;
+        for p in (start..start + size).step_by(12) {
+            let target = word(self.bytes, p)? as usize;
+            let addend = word(self.bytes, p + 8)? as usize;
+            if word(self.bytes, p + 4)? != 3
+                || target % 4 != 0
+                || !self
+                    .segments()
+                    .iter()
+                    .any(|s| s.flags & 2 != 0 && s.region.contains(target, 4))
+                || !self.segments().iter().any(|s| s.region.contains(addend, 1))
+            {
+                return Err(Error::Unsupported);
+            }
+            apply(target, addend);
+        }
+        Ok(())
     }
     pub fn segments(&self) -> &[Segment] {
         &self.segments[..self.count]
@@ -173,6 +255,64 @@ mod tests {
             b[o..o + 2].copy_from_slice(&v.to_le_bytes());
         }
         b
+    }
+    #[test]
+    fn relative_relocation_requires_private_writable_word_and_local_addend() {
+        let mut bytes = [0u8; 64];
+        // A read-only RELA record followed by a writable segment containing DT_*.
+        for (offset, value) in [
+            (0, 0x1000u32),
+            (4, 3),
+            (8, 4),
+            (16, 7),
+            (20, 0),
+            (24, 8),
+            (28, 12),
+            (32, 9),
+            (36, 12),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (field, value, valid) in [
+            (0, 0x1000u32, true),
+            (0, 0, false),
+            (0, 0x1001, false),
+            (4, 0x103, false),
+            (8, 0xffff, false),
+        ] {
+            let mut input = bytes;
+            input[field..field + 4].copy_from_slice(&value.to_le_bytes());
+            let mut segments = [Segment::default(); MAX_SEGMENTS];
+            segments[0] = Segment {
+                region: Region { base: 0, size: 16 },
+                file_size: 16,
+                file_offset: 0,
+                flags: 5,
+            };
+            segments[1] = Segment {
+                region: Region {
+                    base: 0x1000,
+                    size: 48,
+                },
+                file_size: 48,
+                file_offset: 16,
+                flags: 6,
+            };
+            let image = Image {
+                bytes: &input,
+                entry: 0,
+                pic: true,
+                dynamic: Some((16, 0x1000, 32)),
+                segments,
+                count: 2,
+            };
+            let mut patch = None;
+            assert_eq!(
+                image.visit_relocations(|a, b| patch = Some((a, b))).is_ok(),
+                valid
+            );
+            assert_eq!(patch, valid.then_some((0x1000, 4)));
+        }
     }
     #[test]
     fn accepts_code_with_bss() {

@@ -34,4 +34,4 @@ pub const MEM_GRANT: u32 = 19; // memory grant + PMP mapping; one-level R/RW gra
 pub const IPC_CALL: u32 = 20; // a0=send handle,a1=req,a2=len,a3=reply buffer,a4=capacity,a5=timeout ticks (0 infinite)
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token,a1=buffer,a2=len
 pub const THREAD_PRIORITY: u32 = 22; // a0=own TID,a1=priority 0..3
-pub const SPAWN_HELLO: u32 = 23; // boot shell launches the bundled ELF, returns PID
+pub const SPAWN_HELLO: u32 = 23; // boot shell launches bundled ELF (a0: 0=hello, 1=pic), returns PID
