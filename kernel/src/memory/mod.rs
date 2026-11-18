@@ -69,6 +69,31 @@ impl RegionAllocator {
         }
         Err(12)
     }
+    /// Reserve a fixed-address, naturally aligned ELF segment in the SRAM pool.
+    pub fn reserve(&mut self, owner: u32, base: usize, bytes: usize) -> Result<Region, u32> {
+        let size = bytes.max(PAGE).checked_next_power_of_two().ok_or(22u32)?;
+        if owner == 0 || bytes == 0 || base % size != 0 {
+            return Err(22);
+        }
+        let first = base.checked_sub(self.base).ok_or(12u32)? / PAGE;
+        let pages = size / PAGE;
+        if first >= self.pages || pages > self.pages - first {
+            return Err(12);
+        }
+        let mask = (u64::MAX >> (64 - pages)) << first;
+        if self.occupied & mask != 0 {
+            return Err(16);
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.owner == 0)
+            .ok_or(28u32)?;
+        let region = Region { base, size };
+        *entry = Allocation { owner, region };
+        self.occupied |= mask;
+        Ok(region)
+    }
     pub fn owns(&self, owner: u32, region: Region) -> bool {
         self.entries
             .iter()
