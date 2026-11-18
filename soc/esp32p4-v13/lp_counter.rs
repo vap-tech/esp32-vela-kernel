@@ -21,11 +21,39 @@ pub unsafe fn now() -> u64 {
 }
 /// # Safety
 /// LP held during HP boot, owns target1 and its local interrupt. Target0 untouched.
+#[allow(dead_code)] // HP bootstrap only in this shared HP/LP backend.
 pub unsafe fn initialize() {
     unsafe {
         write(0x3fc, read(0x3fc) | (1 << 31));
         write(0x40, read(0x40) & !(1 << 31));
         write(0x0c, read(0x0c) & 0xffff);
+        write(0x44, 1 << 31);
+        core::arch::asm!("fence iorw,iorw", options(nostack));
+    }
+}
+
+/// # Safety
+/// LP-only runtime ownership of target1 and IRQ27. No HP sleep/wakeup routing
+/// is changed: this is an interrupt deadline for a running LP, not sleep support.
+#[allow(dead_code)] // LP runtime only.
+pub unsafe fn deadline(target: Option<u64>) {
+    unsafe {
+        write(0x40, read(0x40) & !(1 << 31));
+        write(0x44, 1 << 31);
+        if let Some(target) = target {
+            write(0x0c, ((target >> 32) as u32) & 0xffff);
+            write(0x08, target as u32);
+            write(0x0c, (((target >> 32) as u32) & 0xffff) | (1 << 31));
+            write(0x40, read(0x40) | (1 << 31));
+        }
+        core::arch::asm!("fence iorw,iorw", options(nostack));
+    }
+}
+/// # Safety
+/// LP interrupt handler owns target1. Never acknowledge HP/target0 interrupts.
+#[allow(dead_code)] // LP runtime only.
+pub unsafe fn acknowledge() {
+    unsafe {
         write(0x44, 1 << 31);
         core::arch::asm!("fence iorw,iorw", options(nostack));
     }

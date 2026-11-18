@@ -30,7 +30,7 @@ _start:
     la t0, lp_vectors
     ori t0, t0, 1
     csrw mtvec, t0
-    li t0, (1 << 26)
+    li t0, ((1 << 26) | (1 << 27))
     csrw mie, t0
     csrsi mstatus, 8
 3:  wfi
@@ -45,7 +45,8 @@ lp_vectors:
     j lp_fault
     .endr
     j lp_mailbox
-    .rept 5
+    j lp_timer
+    .rept 4
     j lp_fault
     .endr
     .option pop
@@ -58,6 +59,9 @@ lp_mailbox:
     # registers. The standard Rust call preserves the stack and callee saves.
     call receive_command
     mret
+lp_timer:
+    call timer_event
+    mret
 "#
 );
 struct Transport {
@@ -68,6 +72,7 @@ struct Transport {
     last_request: u32,
     hz: u32,
     watch: watch::Watch,
+    reported_missed: u32,
 }
 struct Local(core::cell::UnsafeCell<Transport>);
 // SAFETY: only LP startup and non-nested LP IRQ handlers access this LP SRAM.
@@ -81,6 +86,7 @@ static LOCAL: Local = Local(core::cell::UnsafeCell::new(Transport {
     last_request: 0,
     hz: 0,
     watch: watch::Watch::new(),
+    reported_missed: 0,
 }));
 unsafe fn publish(local: &mut Transport, event: u32, request: u32, result: u32) {
     unsafe {
@@ -130,9 +136,26 @@ extern "C" fn receive_command() {
         if local.busy && mailbox::word(wire::EVENT_ACK).read_volatile() == local.published {
             local.busy = false;
         }
-        if local.busy || !local.pending {
-            return;
+        service(local);
+    }
+}
+unsafe fn service(local: &mut Transport) {
+    unsafe {
+        local.watch.sample(lp_counter::now());
+        if !local.busy && local.pending {
+            process_command(local);
         }
+        if !local.busy && local.reported_missed < local.watch.missed {
+            local.reported_missed += 1;
+            publish(local, wire::HEARTBEAT_MISSED, 0, wire::OK);
+        }
+        // Exact deadline, not a polling tick. Healthy heartbeat resets it; a
+        // missed/unarmed observer masks target1 until a new heartbeat arrives.
+        lp_counter::deadline(local.watch.deadline());
+    }
+}
+unsafe fn process_command(local: &mut Transport) {
+    unsafe {
         local.pending = false;
         let epoch = mailbox::word(wire::EPOCH).read_volatile();
         let sequence = mailbox::word(wire::REQUEST_SEQ).read_volatile();
@@ -157,6 +180,15 @@ extern "C" fn receive_command() {
         publish(local, event, sequence, result);
     }
 }
+#[unsafe(no_mangle)]
+extern "C" fn timer_event() {
+    // SAFETY: only assembly WFI can be interrupted; MIE=0 inside this handler.
+    unsafe {
+        lp_counter::acknowledge();
+        service(&mut *LOCAL.0.get());
+    }
+}
+
 fn idle() -> ! {
     loop {
         unsafe {

@@ -64,6 +64,8 @@ struct Runtime {
     sentinel_hz: u32,
     sentinel_heartbeat: bool,
     sentinel_next_beat: u64,
+    sentinel_notifications: u32,
+    sentinel_last_publish: u32,
     usb_rx_interrupts: u64,
     logged_block: bool,
     logged_wake: bool,
@@ -216,6 +218,8 @@ extern "C" fn rust_main() -> ! {
         sentinel_hz: 0,
         sentinel_heartbeat: true,
         sentinel_next_beat: 0,
+        sentinel_notifications: 0,
+        sentinel_last_publish: 0,
         usb_rx_interrupts: 0,
         logged_block: false,
         logged_wake: false,
@@ -1039,6 +1043,19 @@ impl Runtime {
                 *switch = true;
                 0
             }
+            syscall::SENTINEL_CONTROL => {
+                if self.processes.slots[current].id != 2 {
+                    return cap::EPERM;
+                }
+                if a0 > 1 {
+                    return syscall::EINVAL;
+                }
+                self.sentinel_heartbeat = a0 != 0;
+                if self.sentinel_heartbeat {
+                    self.sentinel_next_beat = 0;
+                }
+                0
+            }
             syscall::SENTINEL_HELLO | syscall::SENTINEL_QUERY => {
                 if self.processes.slots[current].id != 2 {
                     return cap::EPERM;
@@ -1362,9 +1379,17 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         runtime.scheduler.tick(uptime);
         switch = true;
     } else if interrupt && cause == soc::sentinel::LINE {
-        if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) } {
+        if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) }
+            && reply.published > runtime.sentinel_last_publish
+        {
+            runtime.sentinel_last_publish = reply.published;
             if reply.event == sentinel_wire::READY && reply.result == sentinel_wire::OK {
                 runtime.sentinel_ready = true;
+            } else if reply.event == sentinel_wire::HEARTBEAT_MISSED
+                && reply.request == 0
+                && reply.result == sentinel_wire::OK
+            {
+                runtime.sentinel_notifications = runtime.sentinel_notifications.saturating_add(1);
             } else if runtime.sentinel_pending
                 && reply.request == runtime.sentinel_sequence
                 && (reply.event == sentinel_wire::ACK || reply.event == sentinel_wire::STATUS)
@@ -1400,6 +1425,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
                                 }
                             };
                         runtime.scheduler.tasks[i].context.registers[8] = result;
+                        runtime.scheduler.tasks[i].context.registers[9] = runtime.sentinel_notifications;
                         runtime.scheduler.wake(i);
                     }
                 }

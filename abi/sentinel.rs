@@ -45,3 +45,5 @@ pub const UNARMED: u32 = 0;
 pub const HEALTHY: u32 = 1;
 pub const MISSED: u32 = 2;
 pub const STATUS_BYTES: usize = 24; // state,age_ms(lo/hi),calibrated_hz,beats,missed transitions
+
+pub const HEARTBEAT_MISSED: u32 = 0x484d_0000 | VERSION;

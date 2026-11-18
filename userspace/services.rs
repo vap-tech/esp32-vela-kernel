@@ -14,10 +14,15 @@ macro_rules! text {
 text!(PROMPT, b"vela:/$ ");
 text!(
     HELP,
-    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel | sentinel hello\n"
+    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume]\n"
 );
 text!(HELP_CMD, b"help");
 text!(RUN_DMA, b"run dma");
+text!(PAUSE_CMD, b"sentinel pause");
+text!(RESUME_CMD, b"sentinel resume");
+text!(PAUSED, b"Sentinel heartbeat paused\n");
+text!(RESUMED, b"Sentinel heartbeat resumed\n");
+text!(NOTICES, b" notices=");
 text!(STATUS_CMD, b"sentinel status");
 text!(STATUS_PREFIX, b"Sentinel state=");
 text!(UNARMED, b"unarmed");
@@ -408,9 +413,22 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
         if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
             write(FAILED.as_ptr(), FAILED.len());
         }
+    } else if line.matches(0, PAUSE_CMD.as_ptr(), PAUSE_CMD.len())
+        || line.matches(0, RESUME_CMD.as_ptr(), RESUME_CMD.len())
+    {
+        let resume = line.matches(0, RESUME_CMD.as_ptr(), RESUME_CMD.len());
+        if call(abi::SENTINEL_CONTROL, u32::from(resume), 0, 0, 0) == 0 {
+            if resume {
+                write(RESUMED.as_ptr(), RESUMED.len());
+            } else {
+                write(PAUSED.as_ptr(), PAUSED.len());
+            }
+        } else {
+            write(FAILED.as_ptr(), FAILED.len());
+        }
     } else if line.matches(0, STATUS_CMD.as_ptr(), STATUS_CMD.len()) {
         let mut data = Buffer::new();
-        let result = call(abi::SENTINEL_QUERY, data.mut_ptr() as u32, 24, 0, 0);
+        let (result, notices) = call6(abi::SENTINEL_QUERY, data.mut_ptr() as u32, 24, 0, 0, 0, 0);
         if result == 24 {
             data.len = 24;
             let mut out = Buffer::new();
@@ -428,6 +446,8 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
             out.decimal(data.word(16));
             out.append(MISSES.as_ptr(), MISSES.len());
             out.decimal(data.word(20));
+            out.append(NOTICES.as_ptr(), NOTICES.len());
+            out.decimal(notices);
             out.push(b'\n');
             write(out.ptr(), out.len);
         } else {

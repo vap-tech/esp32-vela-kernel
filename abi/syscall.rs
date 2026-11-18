@@ -42,3 +42,5 @@ pub const SENTINEL_STATUS: u32 = 26; // a0=acknowledged version (0 until READY),
 pub const SENTINEL_HELLO: u32 = 27; // blocks for ACK; returns sequence or errno
 
 pub const SENTINEL_QUERY: u32 = 28; // a0=writable 24-byte buffer,a1=size; blocking live GET_STATUS
+
+pub const SENTINEL_CONTROL: u32 = 29; // shell only, a0=0 pause / 1 resume automatic HP heartbeat

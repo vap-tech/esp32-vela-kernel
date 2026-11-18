@@ -31,6 +31,8 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `run dma` | Copy and verify 2048 bytes of SRAM using GDMA-AHB. |
 | `sentinel` | Show the LP protocol version and boot epoch acknowledged by HP. |
 | `sentinel hello` | Send HELLO via the hardware mailbox and print the acknowledged sequence. |
+| `sentinel status` | Read LP heartbeat state, age, counters and received missed notices. |
+| `sentinel pause`, `sentinel resume` | Stop/restart HP heartbeats without stopping HP or resetting LP. |
 
 ## Kernel and userspace
 
@@ -109,21 +111,38 @@ on this channel; PSRAM and cached user mappings require separate cache handling.
 
 ## LP Sentinel
 
-Sentinel is a separate `no_std` RV32IMAC image. HP stalls and resets LP,
-loads the image into LP SRAM at `0x50108000`, sets the boot address and
-clears stale mailbox interrupts before starting LP. Sentinel initializes its
-own stack and BSS. It then replies with READY and waits in WFI with LP
-mailbox interrupt 26 enabled. Heartbeat, diagnostics and sleep supervision
-are pending.
+Sentinel is a separate no_std RV32IMAC firmware in LP SRAM at 0x50108000.
+It runs no HP code, reads no HP runtime memory and waits in WFI. Mailbox IRQ26
+handles commands; LP TIMER target1 IRQ27 checks the exact heartbeat deadline.
+This is supervision of an active HP, not light/deep-sleep wakeup support.
 
-HP owns mailbox words 0 (boot epoch), 3 (request sequence) and 4 (command).
-LP owns words 1 (echoed epoch), 5 (reply sequence) and 2 (event). Each sender
-writes the payload before the word that triggers the receiver's interrupt.
-HP acknowledges READY and ACK on CLIC line 20. A HELLO caller resumes after
-an ACK matches both epoch and sequence. One request can be outstanding. A
-one-second timeout releases the caller and keeps the slot reserved until
-the matching ACK or the next boot.
+HP sends HEARTBEAT every second; LP uses its own 48-bit free-running counter
+with a three-second timeout. Its inherited slow-clock frequency is measured
+once against 16MHz SYSTIMER during ~20ms of stalled-LP startup. GET_STATUS
+reports state, age_ms, calibrated lp_hz, accepted beats and missed transitions.
+No heartbeat means unarmed until the first accepted heartbeat. A missed deadline
+increments the transition count once and publishes HEARTBEAT_MISSED. A new
+heartbeat restores healthy state without erasing counters. No automatic reset.
 
-The Tab5 v1.3 smoke test after reflashing returned `Sentinel READY v1, epoch 2`,
-then `Sentinel ACK seq 1` and `Sentinel ACK seq 2`. Both `uptime` and
-`cat /proc/loadavg` still worked.
+Commands: sentinel and sentinel hello retain READY/ACK diagnostics;
+sentinel status requests a fresh LP snapshot; sentinel pause/resume disable or
+enable only the HP heartbeat sender, for timeout/recovery checks. Status notices
+counts asynchronous missed notifications actually received by HP. A blocked
+status/HELLO request times out after one second; its transport slot stays
+reserved until the matching response, so a late reply cannot complete a new call.
+
+Wire version 2 uses scalar mailbox words only:
+HP owns 0(epoch), 3(request seq), 4(command doorbell), 6/7(args),
+13(LP publication ACK) and 15(calibrated Hz).
+LP owns 1(echoed epoch), 2(event doorbell), 5(reply seq), 8(result),
+9(state + missed count), 10/11(age ticks), 12(beat count), 14(publication seq).
+Payload precedes each doorbell. HP copies and clears IRQ before acknowledging
+the LP publication. LP never overwrites an unacknowledged response/event;
+commands take precedence over deferred missed notices. Epoch and sequence are
+checked before completion. Diagnostic journal and sleep supervision remain pending.
+
+Tab5 v1.3 smoke (2026-11-18): healthy, pause -> missed=1/notices=1,
+repeated GET_STATUS kept both at 1, resume -> healthy with growing beat count.
+HELLO, help, uptime and /proc/loadavg passed. Observed calibrated slow clock:
+130978 Hz; the value is measured anew at boot, not a platform constant.
+Log: target/sentinel-heartbeat-smoke.log. No power-cycle or stress campaign.
