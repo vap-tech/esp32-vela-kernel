@@ -5,6 +5,7 @@ mod journal;
 mod lp_counter;
 #[path = "../../soc/esp32p4-v13/mailbox.rs"]
 mod mailbox;
+mod wakeup;
 mod watch;
 #[path = "../../abi/sentinel.rs"]
 mod wire;
@@ -76,6 +77,7 @@ struct Transport {
     reported_missed: u32,
     journal: journal::Journal,
     diagnostic_pending: Option<journal::Record>,
+    wakeup: wakeup::Wakeup,
 }
 struct Local(core::cell::UnsafeCell<Transport>);
 // SAFETY: only LP startup and non-nested LP IRQ handlers access this LP SRAM.
@@ -92,6 +94,7 @@ static LOCAL: Local = Local(core::cell::UnsafeCell::new(Transport {
     reported_missed: 0,
     journal: journal::Journal::new(0),
     diagnostic_pending: None,
+    wakeup: wakeup::Wakeup::new(),
 }));
 fn observe(local: &mut Transport, now: u64) {
     let missed = local.watch.missed;
@@ -105,6 +108,11 @@ fn observe(local: &mut Transport, now: u64) {
             local.watch.beats,
             local.watch.missed,
         );
+    }
+    if let Some(event) = local.wakeup.sample(now) {
+        local
+            .journal
+            .append(event.at, wire::LOG_WAKE_FIRED, event.token, event.delay_ms);
     }
 }
 unsafe fn publish_words(local: &mut Transport, event: u32, request: u32, words: [u32; 5]) {
@@ -175,22 +183,48 @@ extern "C" fn receive_command() {
 }
 unsafe fn service(local: &mut Transport) {
     unsafe {
-        observe(local, lp_counter::now());
-        if !local.busy && local.pending {
-            process_command(local);
-        }
-        if !local.busy && local.reported_missed < local.watch.missed {
-            local.reported_missed += 1;
-            publish(local, wire::HEARTBEAT_MISSED, 0, wire::OK);
-        }
-        if !local.busy {
-            if let Some(record) = local.diagnostic_pending.take() {
-                publish_words(local, wire::DIAGNOSTIC_EVENT, 0, record.words());
+        // There are at most two deadlines. Re-check after programming: if one
+        // elapsed while we handled a command, service it before returning to WFI.
+        // Three passes cover both expirations and one final stable arming.
+        for _ in 0..3 {
+            let now = lp_counter::now();
+            observe(local, now);
+            if !local.busy && local.pending {
+                process_command(local);
+            }
+            if !local.busy {
+                if let Some(event) = local.wakeup.take_event() {
+                    let stamp = local.journal.elapsed(event.at);
+                    publish_words(
+                        local,
+                        wire::WAKE_EVENT,
+                        0,
+                        [
+                            wire::OK,
+                            event.token,
+                            stamp as u32,
+                            (stamp >> 32) as u32,
+                            event.delay_ms,
+                        ],
+                    );
+                }
+            }
+            if !local.busy && local.reported_missed < local.watch.missed {
+                local.reported_missed += 1;
+                publish(local, wire::HEARTBEAT_MISSED, 0, wire::OK);
+            }
+            if !local.busy {
+                if let Some(record) = local.diagnostic_pending.take() {
+                    publish_words(local, wire::DIAGNOSTIC_EVENT, 0, record.words());
+                }
+            }
+            let target = wakeup::earliest(now, local.watch.deadline(), local.wakeup.deadline());
+            lp_counter::deadline(target);
+            if target.is_none_or(|target| !wakeup::due(lp_counter::now(), target)) {
+                return;
             }
         }
-        // Exact deadline, not a polling tick. Healthy heartbeat resets it; a
-        // missed/unarmed observer masks target1 until a new heartbeat arrives.
-        lp_counter::deadline(local.watch.deadline());
+        unreachable!("more than two LP deadlines expired during one handler");
     }
 }
 unsafe fn process_command(local: &mut Transport) {
@@ -254,6 +288,32 @@ unsafe fn process_command(local: &mut Transport) {
                 }
                 (wire::ACK, wire::OK)
             }
+            wire::SET_WAKEUP if (1..=60_000).contains(&arg0) && arg1 == 0 => {
+                let now = lp_counter::now();
+                let ticks = (u64::from(local.hz) * u64::from(arg0) + 999) / 1000;
+                if local.wakeup.arm(sequence, now, ticks, arg0) {
+                    local
+                        .journal
+                        .append(now, wire::LOG_WAKE_ARMED, sequence, arg0);
+                    (wire::ACK, wire::OK)
+                } else {
+                    (wire::ACK, wire::LOG_BUSY)
+                }
+            }
+            wire::CANCEL_WAKEUP if arg0 != 0 && arg1 == 0 => {
+                let now = lp_counter::now();
+                observe(local, now);
+                match local.wakeup.cancel(arg0, now) {
+                    wakeup::Cancel::Cancelled(delay_ms) => {
+                        local
+                            .journal
+                            .append(now, wire::LOG_WAKE_CANCELLED, arg0, delay_ms);
+                        (wire::ACK, wire::OK)
+                    }
+                    wakeup::Cancel::TooLate => (wire::ACK, wire::WAKE_ALREADY),
+                    wakeup::Cancel::Unknown => (wire::ACK, wire::LOG_UNKNOWN),
+                }
+            }
             wire::DIAGNOSTIC => {
                 if local.diagnostic_pending.is_some() {
                     (wire::ACK, wire::LOG_BUSY)
@@ -268,9 +328,13 @@ unsafe fn process_command(local: &mut Transport) {
                     (wire::ACK, wire::LOG_EXHAUSTED)
                 }
             }
-            wire::HELLO | wire::GET_STATUS | wire::HEARTBEAT | wire::LOG_META | wire::LOG_READ => {
-                (wire::ACK, wire::BAD_ARGUMENT)
-            }
+            wire::HELLO
+            | wire::GET_STATUS
+            | wire::HEARTBEAT
+            | wire::LOG_META
+            | wire::LOG_READ
+            | wire::SET_WAKEUP
+            | wire::CANCEL_WAKEUP => (wire::ACK, wire::BAD_ARGUMENT),
             _ => (wire::ACK, wire::BAD_COMMAND),
         };
         publish(local, event, sequence, result);

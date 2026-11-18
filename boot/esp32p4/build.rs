@@ -43,6 +43,7 @@ fn build_sentinel(out: &std::path::Path) {
         source,
         script,
         "../../lp/sentinel/watch.rs",
+        "../../lp/sentinel/wakeup.rs",
         "../../lp/sentinel/journal.rs",
         "../../soc/esp32p4-v13/lp_counter.rs",
         "../../abi/sentinel.rs",

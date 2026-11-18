@@ -47,12 +47,15 @@ impl Journal {
             overwritten: 0,
         }
     }
+    pub fn elapsed(&self, now: u64) -> u64 {
+        now.wrapping_sub(self.origin) & MASK
+    }
     pub fn append(&mut self, now: u64, kind: u16, arg0: u32, arg1: u32) -> Option<Record> {
         // Retire the producer at sequence exhaustion instead of reviving old IDs.
         let next = self.next.checked_add(1)?;
         let record = Record {
             sequence: self.next,
-            timestamp: now.wrapping_sub(self.origin) & MASK,
+            timestamp: self.elapsed(now),
             kind,
             arguments: [arg0, arg1],
         };

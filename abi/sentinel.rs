@@ -69,3 +69,11 @@ pub const LOG_HP_EVENT: u16 = 5;
 // LOG_ENTRY/DIAGNOSTIC_EVENT words8..12:
 // sequence,ticks_lo,(type<<16)|ticks_hi16,arg0,arg1. Timestamp is 48-bit
 // LP ticks since Sentinel startup. No address/pointer appears on the wire.
+
+pub const SET_WAKEUP: u32 = 0x5357_0000 | VERSION; // arg0=1..60000ms,arg1=0; request sequence is wake token
+pub const CANCEL_WAKEUP: u32 = 0x4357_0000 | VERSION; // arg0=wake token,arg1=0
+pub const WAKE_EVENT: u32 = 0x5745_0000 | VERSION; // request=0; payload OK,token,ticks_lo,ticks_hi16,delay_ms
+pub const WAKE_ALREADY: u32 = 7;
+pub const LOG_WAKE_ARMED: u16 = 6;
+pub const LOG_WAKE_FIRED: u16 = 7;
+pub const LOG_WAKE_CANCELLED: u16 = 8;
