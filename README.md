@@ -36,6 +36,9 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `sentinel pause`, `sentinel resume` | Stop/restart HP heartbeats without stopping HP or resetting LP. |
 | `sentinel log` | Read the bounded LP diagnostic journal without consuming records. |
 | `sentinel mark` | Send an HP diagnostic MARK event with the current HP uptime tick as its value. |
+| `sentinel wake <ms>` | Arm an LP timer and block until its WAKE_EVENT. Range: 1–60000 ms. |
+| `sentinel arm <ms>`, `sentinel wait` | Arm without waiting for expiry; later consume the latched event. |
+| `sentinel cancel` | Cancel the current alarm before it fires; an already-fired event remains available to wait. |
 
 ## Kernel and userspace
 
@@ -116,7 +119,7 @@ on this channel; PSRAM and cached user mappings require separate cache handling.
 
 Sentinel is a separate no_std RV32IMAC firmware in LP SRAM at 0x50108000.
 It runs no HP code, reads no HP runtime memory and waits in WFI. Mailbox IRQ26
-handles commands; LP TIMER target1 IRQ27 checks the exact heartbeat deadline.
+handles commands; LP TIMER target1 IRQ27 serves the earliest heartbeat/wake deadline.
 This is supervision of an active HP, not light/deep-sleep wakeup support.
 
 HP sends HEARTBEAT every second; LP uses its own 48-bit free-running counter
@@ -178,3 +181,35 @@ records; diagnostic_notices=1, missed=1/notices=1 and healthy after recovery.
 Help, uptime and /proc/loadavg passed. Ring overwrite, packed timestamp wrap and
 sequence exhaustion passed three host tests; overwrite was not stress-tested on
 hardware. Log: target/sentinel-journal-smoke.log.
+
+### Active-HP wake events
+
+SET_WAKEUP arms one LP-local one-shot alarm; its token is the HP request
+sequence, scoped to the boot epoch. The command ACK only confirms arming.
+WAKE_EVENT is a separate acknowledged publication with token, actual LP firing
+timestamp and configured delay. LP target1 arbitrates the nearest wake/heartbeat
+deadline using the 48-bit counter. After programming, it rechecks expiry before
+returning to WFI, so a deadline crossed inside the handler is serviced.
+
+ARM/WAIT/CANCEL syscalls are process-owned and keep a single alarm slot.
+An early event is latched until WAIT; condition check and registration occur
+under masked hart0 IRQs. WAIT blocks a thread, never polls. It returns the token
+and actual elapsed SYSTIMER 10ms ticks at event receipt, not the requested delay.
+CANCEL succeeds only before LP observes expiry; a fired/pending event returns
+EALREADY and must still be collected. A second waiter or uncollected alarm is
+EBUSY. A safety timeout leaves the token reserved for a late event or cancellation;
+it cannot complete a newly allocated alarm. Epoch/token checks and process IDs
+prevent stale events waking unrelated processes or reused thread slots.
+
+The LP journal includes wake_armed, wake_fired and wake_cancelled, with
+(token,delay_ms) arguments. Wake notifications use the same payload/ACK protection
+as other events and survive mailbox backpressure. This is an event delivered to
+an active HP runtime, including ordinary kernel WFI. No PMU light/deep-sleep,
+power-domain wake source or sleep-resume state has been enabled.
+
+Tab5 smoke: wake 1000 returned elapsed_ticks=100; arm 10 followed by a later
+wait returned the retained event with elapsed_ticks=1; arm 2000/cancel left no
+pending event and no wake_fired record for that token. Heartbeat remained healthy
+with missed=0; log, status, help, uptime and /proc/loadavg passed. Four host tests
+cover one-shot/backpressure, cancellation, 48-bit wrap and deadline arbitration.
+Log: target/sentinel-wakeup-smoke.log.

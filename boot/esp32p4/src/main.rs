@@ -42,6 +42,21 @@ impl Call {
         server: None,
     };
 }
+#[derive(Clone, Copy)]
+enum WakePhase {
+    Requested,
+    Armed,
+    Fired(u32),
+}
+#[derive(Clone, Copy)]
+struct WakeTicket {
+    token: u32,
+    owner: u32,
+    started: u64,
+    expires: u64,
+    delay_ms: u32,
+    phase: WakePhase,
+}
 struct Runtime {
     scheduler: Scheduler<arch::TrapFrame>,
     processes: Processes,
@@ -58,6 +73,7 @@ struct Runtime {
     dma_deadline: u64,
     sentinel_epoch: Option<u32>,
     sentinel_ready: bool,
+    sentinel_wake: Option<WakeTicket>,
     sentinel_sequence: u32,
     sentinel_pending: bool,
     sentinel_command: u32,
@@ -214,6 +230,7 @@ extern "C" fn rust_main() -> ! {
         dma_deadline: 0,
         sentinel_epoch: None,
         sentinel_ready: false,
+        sentinel_wake: None,
         sentinel_sequence: 0,
         sentinel_pending: false,
         sentinel_command: 0,
@@ -285,6 +302,47 @@ fn grant(
     })
 }
 impl Runtime {
+    fn finish_wake_waiter(&mut self, ticket: WakeTicket, result: u32, elapsed: u32) -> bool {
+        if let Some(i) = self.scheduler.tasks.iter().position(|t| {
+            t.state == State::Blocked
+                && self.processes.slots[t.process].id == ticket.owner
+                && matches!(t.wait,Wait::SentinelWake {token,..} if token == ticket.token)
+        }) {
+            self.scheduler.tasks[i].context.registers[8] = result;
+            self.scheduler.tasks[i].context.registers[9] = elapsed;
+            self.scheduler.wake(i);
+            return true;
+        }
+        false
+    }
+    fn receive_wake(&mut self, reply: sentinel_wire::Reply) {
+        let Some(mut ticket) = self.sentinel_wake else {
+            return;
+        };
+        if reply.monitor != ticket.token
+            || reply.beats != ticket.delay_ms
+            || reply.age >> 48 != 0
+            || matches!(ticket.phase, WakePhase::Fired(_))
+        {
+            return;
+        }
+        // Read actual SYSTIMER elapsed time, not the requested delay or delivered IRQ count.
+        // SAFETY: MIE=0, hart0 has exclusive ownership of SYSTIMER snapshot.
+        let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wake snapshot");
+        let elapsed = now.saturating_sub(ticket.started).min(u64::from(u32::MAX)) as u32;
+        ticket.phase = WakePhase::Fired(elapsed);
+        self.sentinel_wake = Some(ticket);
+        let alive = self
+            .processes
+            .slots
+            .iter()
+            .any(|p| p.id == ticket.owner && p.state == Lifecycle::Alive);
+        if !alive || self.finish_wake_waiter(ticket, ticket.token, elapsed) {
+            self.sentinel_wake = None;
+        }
+        // Otherwise retain the event until WAIT. An IRQ between ARM ACK and
+        // userspace WAIT must not turn into a lost wakeup.
+    }
     fn sentinel_request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, u32> {
         if !self.sentinel_ready {
             return Err(syscall::EAGAIN);
@@ -329,6 +387,12 @@ impl Runtime {
                 self.sentinel_diagnostics = self.sentinel_diagnostics.saturating_add(1);
                 return;
             }
+            sentinel_wire::WAKE_EVENT
+                if reply.request == 0 && reply.result == sentinel_wire::OK =>
+            {
+                self.receive_wake(reply);
+                return;
+            }
             _ => (),
         }
         if !self.sentinel_pending || reply.request != self.sentinel_sequence {
@@ -347,6 +411,33 @@ impl Runtime {
             return;
         }
         self.sentinel_pending = false;
+        let error_code = match reply.result {
+            sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => (-75i32) as u32,
+            sentinel_wire::LOG_UNKNOWN => (-2i32) as u32,
+            sentinel_wire::LOG_BUSY => (-16i32) as u32,
+            sentinel_wire::WAKE_ALREADY => (-114i32) as u32,
+            _ => syscall::EINVAL,
+        };
+        if command == sentinel_wire::SET_WAKEUP {
+            if let Some(mut ticket) = self.sentinel_wake {
+                if ticket.token == reply.request {
+                    if error {
+                        self.finish_wake_waiter(ticket, error_code, 0);
+                        self.sentinel_wake = None;
+                    } else if matches!(ticket.phase, WakePhase::Requested) {
+                        ticket.phase = WakePhase::Armed;
+                        self.sentinel_wake = Some(ticket);
+                    }
+                }
+            }
+        } else if command == sentinel_wire::CANCEL_WAKEUP && !error {
+            if let Some(ticket) = self.sentinel_wake {
+                if ticket.token == self.sentinel_argument {
+                    self.finish_wake_waiter(ticket, (-125i32) as u32, 0);
+                    self.sentinel_wake = None;
+                }
+            }
+        }
         let Some(i) = self.scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked
                 && matches!(t.wait,Wait::Sentinel {sequence,..} if sequence == reply.request)
@@ -357,12 +448,7 @@ impl Runtime {
             unreachable!()
         };
         let result = if error {
-            match reply.result {
-                sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => (-75i32) as u32,
-                sentinel_wire::LOG_UNKNOWN => (-2i32) as u32,
-                sentinel_wire::LOG_BUSY => (-16i32) as u32,
-                _ => syscall::EINVAL,
-            }
+            error_code
         } else if pointer == 0 {
             reply.request
         } else {
@@ -1184,6 +1270,98 @@ impl Runtime {
                 }
                 0
             }
+            syscall::SENTINEL_ARM_WAKE => {
+                let owner = self.processes.slots[current].id;
+                if owner != 2 {
+                    return cap::EPERM;
+                }
+                if !(1..=60_000).contains(&a0) {
+                    return syscall::EINVAL;
+                }
+                if self.sentinel_wake.is_some() {
+                    return (-16i32) as u32;
+                }
+                // SAFETY: sole hart snapshot owner under masked IRQs.
+                let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER arm snapshot");
+                let sequence = match self.sentinel_request(sentinel_wire::SET_WAKEUP, a0, 0) {
+                    Ok(seq) => seq,
+                    Err(e) => return e,
+                };
+                self.sentinel_wake = Some(WakeTicket {
+                    token: sequence,
+                    owner,
+                    started: now,
+                    expires: now + (u64::from(a0) + 9) / 10 + 100,
+                    delay_ms: a0,
+                    phase: WakePhase::Requested,
+                });
+                self.scheduler.block(Wait::Sentinel {
+                    sequence,
+                    deadline: now + 100,
+                    pointer: 0,
+                });
+                *switch = true;
+                0
+            }
+            syscall::SENTINEL_WAIT_WAKE => {
+                let Some(ticket) = self.sentinel_wake else {
+                    return (-2i32) as u32;
+                };
+                if ticket.owner != self.processes.slots[current].id {
+                    return cap::EPERM;
+                }
+                if a0 != 0 && a0 != ticket.token {
+                    return (-2i32) as u32;
+                }
+                if let WakePhase::Fired(elapsed) = ticket.phase {
+                    self.sentinel_wake = None;
+                    frame.registers[9] = elapsed;
+                    return ticket.token;
+                }
+                if self.scheduler.tasks.iter().any(|t| {
+                    t.state == State::Blocked
+                        && matches!(t.wait,Wait::SentinelWake {token,..} if token == ticket.token)
+                }) {
+                    return (-16i32) as u32;
+                }
+                // SAFETY: masked hart0 snapshot owner, no scheduler references escape.
+                let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wait snapshot");
+                if now >= ticket.expires {
+                    return (-110i32) as u32;
+                }
+                self.scheduler.block(Wait::SentinelWake {
+                    token: ticket.token,
+                    deadline: ticket.expires,
+                });
+                *switch = true;
+                0
+            }
+            syscall::SENTINEL_CANCEL_WAKE => {
+                let Some(ticket) = self.sentinel_wake else {
+                    return (-2i32) as u32;
+                };
+                if ticket.owner != self.processes.slots[current].id {
+                    return cap::EPERM;
+                }
+                if a0 != 0 && a0 != ticket.token {
+                    return (-2i32) as u32;
+                }
+                if matches!(ticket.phase, WakePhase::Fired(_)) {
+                    return (-114i32) as u32;
+                }
+                let sequence =
+                    match self.sentinel_request(sentinel_wire::CANCEL_WAKEUP, ticket.token, 0) {
+                        Ok(seq) => seq,
+                        Err(e) => return e,
+                    };
+                self.scheduler.block(Wait::Sentinel {
+                    sequence,
+                    deadline: self.scheduler.snapshot().uptime_ticks + 100,
+                    pointer: 0,
+                });
+                *switch = true;
+                0
+            }
             syscall::SENTINEL_HELLO
             | syscall::SENTINEL_QUERY
             | syscall::SENTINEL_DIAG
@@ -1515,6 +1693,16 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
                     runtime.scheduler.tasks[i].context.registers[8] = (-110i32) as u32;
                     runtime.scheduler.wake(i);
                 }
+            }
+        }
+        for i in 0..TASKS {
+            if runtime.scheduler.tasks[i].state == State::Blocked
+                && matches!(runtime.scheduler.tasks[i].wait,Wait::SentinelWake {deadline,..} if uptime >= deadline)
+            {
+                runtime.scheduler.tasks[i].context.registers[8] = (-110i32) as u32;
+                runtime.scheduler.tasks[i].context.registers[9] = 0;
+                runtime.scheduler.wake(i);
+                // Keep the LP token reserved: a late event cannot complete a new alarm.
             }
         }
         runtime.sentinel_tick(uptime);

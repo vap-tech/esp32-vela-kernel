@@ -23,6 +23,26 @@ text!(RESUME_CMD, b"sentinel resume");
 text!(PAUSED, b"Sentinel heartbeat paused\n");
 text!(RESUMED, b"Sentinel heartbeat resumed\n");
 text!(NOTICES, b" notices=");
+text!(WAKE_PREFIX, b"sentinel wake ");
+text!(ARM_PREFIX, b"sentinel arm ");
+text!(WAIT_CMD, b"sentinel wait");
+text!(CANCEL_CMD, b"sentinel cancel");
+text!(
+    WAKE_HELP,
+    b"sentinel wake/arm <ms> | sentinel wait/cancel\n"
+);
+text!(WAKE_ARMED, b"Sentinel wake armed token=");
+text!(WAKE_FIRED, b"Sentinel WAKE_EVENT token=");
+text!(WAKE_ELAPSED, b" elapsed_ticks=");
+text!(WAKE_CANCELLED, b"Sentinel wake cancelled\n");
+text!(WAKE_RANGE, b"wake delay must be 1..60000 ms\n");
+text!(WAKE_BUSY, b"wake busy; collect or cancel prior alarm\n");
+text!(WAKE_NONE, b"no pending wake\n");
+text!(WAKE_LATE, b"wake already fired; use sentinel wait\n");
+text!(WAKE_TIMEOUT, b"wake timeout; LP slot retained\n");
+text!(EVENT_ARMED, b" wake_armed");
+text!(EVENT_FIRED, b" wake_fired");
+text!(EVENT_CANCELLED, b" wake_cancelled");
 text!(LOG_CMD, b"sentinel log");
 text!(MARK_CMD, b"sentinel mark");
 text!(LOG_HEADER, b"Sentinel log epoch=");
@@ -155,6 +175,37 @@ impl Buffer {
         }
     }
     #[inline(always)]
+    fn starts(&self, pointer: *const u8, length: usize) -> bool {
+        if self.len < length {
+            return false;
+        }
+        for i in 0..length {
+            // SAFETY: caller passes static user RX bytes of the specified length.
+            if self.get(i) != unsafe { pointer.add(i).read_volatile() } {
+                return false;
+            }
+        }
+        true
+    }
+    #[inline(always)]
+    fn delay_ms(&self, offset: usize) -> Option<u32> {
+        if offset >= self.len {
+            return None;
+        }
+        let mut value = 0u32;
+        for i in offset..self.len {
+            let byte = self.get(i);
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+            if value > 60_000 {
+                return None;
+            }
+        }
+        (value != 0).then_some(value)
+    }
+    #[inline(always)]
     fn matches(&self, offset: usize, pointer: *const u8, length: usize) -> bool {
         if self.len != offset + length {
             return false;
@@ -167,7 +218,8 @@ impl Buffer {
         }
         true
     }
-    #[inline(always)]
+    #[unsafe(link_section = ".user.text")]
+    #[inline(never)]
     fn word(&self, offset: usize) -> u32 {
         u32::from(self.get(offset))
             | (u32::from(self.get(offset + 1)) << 8)
@@ -497,6 +549,9 @@ fn sentinel_log() {
             3 => (EVENT_TIMEOUT.as_ptr(), EVENT_TIMEOUT.len()),
             4 => (EVENT_RECOVERED.as_ptr(), EVENT_RECOVERED.len()),
             5 => (EVENT_HP.as_ptr(), EVENT_HP.len()),
+            6 => (EVENT_ARMED.as_ptr(), EVENT_ARMED.len()),
+            7 => (EVENT_FIRED.as_ptr(), EVENT_FIRED.len()),
+            8 => (EVENT_CANCELLED.as_ptr(), EVENT_CANCELLED.len()),
             _ => (EVENT_UNKNOWN.as_ptr(), EVENT_UNKNOWN.len()),
         };
         out.append(name, length);
@@ -508,13 +563,86 @@ fn sentinel_log() {
         write(out.ptr(), out.len);
     }
 }
+#[unsafe(link_section = ".user.text")]
+#[inline(never)]
+fn wake_command(line: &Buffer) -> bool {
+    let wait = line.matches(0, WAIT_CMD.as_ptr(), WAIT_CMD.len());
+    let cancel = line.matches(0, CANCEL_CMD.as_ptr(), CANCEL_CMD.len());
+    let arm = line.starts(ARM_PREFIX.as_ptr(), ARM_PREFIX.len());
+    let wake = line.starts(WAKE_PREFIX.as_ptr(), WAKE_PREFIX.len());
+    if !wait && !cancel && !arm && !wake {
+        return false;
+    }
+    let number = if cancel {
+        abi::SENTINEL_CANCEL_WAKE
+    } else if wait {
+        abi::SENTINEL_WAIT_WAKE
+    } else {
+        abi::SENTINEL_ARM_WAKE
+    };
+    let argument = if arm || wake {
+        let Some(ms) = line.delay_ms(if arm {
+            ARM_PREFIX.len()
+        } else {
+            WAKE_PREFIX.len()
+        }) else {
+            write(WAKE_RANGE.as_ptr(), WAKE_RANGE.len());
+            return true;
+        };
+        ms
+    } else {
+        0
+    };
+    let mut result = (0, 0);
+    for _ in 0..8 {
+        result = call6(number, argument, 0, 0, 0, 0, 0);
+        if result.0 != (-16i32) as u32 {
+            break;
+        }
+        sleep();
+    }
+    if wake && (result.0 as i32) > 0 {
+        result = call6(abi::SENTINEL_WAIT_WAKE, result.0, 0, 0, 0, 0, 0);
+    }
+    if (result.0 as i32) <= 0 {
+        let (text, length) = match result.0 {
+            r if r == (-16i32) as u32 => (WAKE_BUSY.as_ptr(), WAKE_BUSY.len()),
+            r if r == (-2i32) as u32 => (WAKE_NONE.as_ptr(), WAKE_NONE.len()),
+            r if r == (-114i32) as u32 => (WAKE_LATE.as_ptr(), WAKE_LATE.len()),
+            r if r == (-110i32) as u32 => (WAKE_TIMEOUT.as_ptr(), WAKE_TIMEOUT.len()),
+            _ => (FAILED.as_ptr(), FAILED.len()),
+        };
+        write(text, length);
+    } else if cancel {
+        write(WAKE_CANCELLED.as_ptr(), WAKE_CANCELLED.len());
+    } else {
+        let mut out = Buffer::new();
+        if arm {
+            out.append(WAKE_ARMED.as_ptr(), WAKE_ARMED.len());
+        } else {
+            out.append(WAKE_FIRED.as_ptr(), WAKE_FIRED.len());
+        }
+        out.decimal(result.0);
+        if !arm {
+            out.append(WAKE_ELAPSED.as_ptr(), WAKE_ELAPSED.len());
+            out.decimal(result.1);
+        }
+        out.push(b'\n');
+        write(out.ptr(), out.len);
+    }
+    true
+}
 #[inline(always)]
 fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     if line.len == 0 {
         return;
     }
+    if wake_command(line) {
+        return;
+    }
     if line.matches(0, HELP_CMD.as_ptr(), HELP_CMD.len()) {
         write(HELP.as_ptr(), HELP.len());
+        write(WAKE_HELP.as_ptr(), WAKE_HELP.len());
     } else if line.matches(0, RUN_HELLO.as_ptr(), RUN_HELLO.len())
         || line.matches(0, RUN_PIC.as_ptr(), RUN_PIC.len())
         || line.matches(0, RUN_DMA.as_ptr(), RUN_DMA.len())

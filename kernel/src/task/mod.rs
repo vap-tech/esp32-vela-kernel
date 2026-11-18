@@ -28,6 +28,10 @@ pub enum Wait {
         deadline: u64,
         pointer: usize,
     },
+    SentinelWake {
+        token: u32,
+        deadline: u64,
+    },
     Dma,
     Event {
         object: crate::capability::Object,

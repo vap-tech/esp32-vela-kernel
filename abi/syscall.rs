@@ -49,3 +49,7 @@ pub const SENTINEL_DIAG: u32 = 30; // shell only: a0=code,a1=value; blocking ACK
 pub const SENTINEL_LOG: u32 = 31; // a0=sequence (0 metadata),a1=writable 24B,a2=size
 // Metadata: epoch,oldest,newest,overwritten,capacity,clock_hz; a1=received diag notices.
 // Record: sequence,type,timestamp_lo,timestamp_hi16,arg0,arg1 (LP ticks since LP startup).
+
+pub const SENTINEL_ARM_WAKE: u32 = 32; // a0=1..60000ms; returns LP-acknowledged wake token
+pub const SENTINEL_WAIT_WAKE: u32 = 33; // a0=token (0=current own alarm); returns token,a1=elapsed HP 10ms ticks
+pub const SENTINEL_CANCEL_WAKE: u32 = 34; // a0=token (0=current own alarm); returns cancel ACK or EALREADY
