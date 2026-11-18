@@ -28,6 +28,9 @@ SECTIONS {
   _user_stack2 = .; . += 4096;
   . = ALIGN(16); _bss_end = .;
  } > UPPER
+ _dma_page = ORIGIN(STACK) - 8192;
+ _dma_descriptors = _dma_page + 4096;
+ ASSERT(_bss_end <= _dma_page, "Runtime overlaps DMA arena")
  _boot_stack_top = ORIGIN(BOOT_STACK) + LENGTH(BOOT_STACK);
  _stack_bottom = ORIGIN(STACK);
  _stack_top = ORIGIN(STACK) + LENGTH(STACK);

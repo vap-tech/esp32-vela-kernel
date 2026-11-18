@@ -14,9 +14,10 @@ macro_rules! text {
 text!(PROMPT, b"vela:/$ ");
 text!(
     HELP,
-    b"help | cat <path> | uptime | run hello | run pic | memtest\n"
+    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest\n"
 );
 text!(HELP_CMD, b"help");
+text!(RUN_DMA, b"run dma");
 text!(RUN_PIC, b"run pic");
 text!(RUN_HELLO, b"run hello");
 text!(MEMTEST_CMD, b"memtest");
@@ -382,8 +383,13 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
         write(HELP.as_ptr(), HELP.len());
     } else if line.matches(0, RUN_HELLO.as_ptr(), RUN_HELLO.len())
         || line.matches(0, RUN_PIC.as_ptr(), RUN_PIC.len())
+        || line.matches(0, RUN_DMA.as_ptr(), RUN_DMA.len())
     {
-        let selector = u32::from(line.len == RUN_PIC.len());
+        let selector = if line.matches(0, RUN_DMA.as_ptr(), RUN_DMA.len()) {
+            2
+        } else {
+            u32::from(line.len == RUN_PIC.len())
+        };
         if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
             write(FAILED.as_ptr(), FAILED.len());
         }

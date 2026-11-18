@@ -51,6 +51,9 @@ struct Runtime {
     calls: [Call; TASKS],
     idle_frame: arch::TrapFrame,
     in_idle: bool,
+    dma: vela_kernel::dma::Lease,
+    dma_length: usize,
+    dma_deadline: u64,
     usb_rx_interrupts: u64,
     logged_block: bool,
     logged_wake: bool,
@@ -74,6 +77,7 @@ unsafe extern "C" {
     static _user_stack2: u8;
     static _stack_top: u8;
     static _stack_bottom: u8;
+    static _dma_page: u8;
     static _bss_end: u8;
     fn vela_trap_entry();
 }
@@ -185,12 +189,15 @@ extern "C" fn rust_main() -> ! {
         processes,
         allocator: RegionAllocator::new(
             core::ptr::addr_of!(_bss_end) as usize,
-            core::ptr::addr_of!(_stack_bottom) as usize,
+            core::ptr::addr_of!(_dma_page) as usize,
         ),
         ipc,
         calls: [Call::EMPTY; TASKS],
         idle_frame: idle,
         in_idle: false,
+        dma: vela_kernel::dma::Lease::Free,
+        dma_length: 0,
+        dma_deadline: 0,
         usb_rx_interrupts: 0,
         logged_block: false,
         logged_wake: false,
@@ -414,6 +421,7 @@ impl Runtime {
         {
             return;
         }
+        self.dma.release_process(self.processes.slots[process].id);
         self.processes.slots[process].state = Lifecycle::Dying;
         let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
         for i in 0..TASKS {
@@ -451,7 +459,7 @@ impl Runtime {
             }
         }
     }
-    fn spawn_elf(&mut self, bytes: &[u8]) -> Result<u32, u32> {
+    fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<u32, u32> {
         let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| 8u32)?;
         let process = self.processes.create(AddressSpace::EMPTY)?;
         let owner = self.processes.slots[process].id;
@@ -517,12 +525,25 @@ impl Runtime {
             let entry = bias + image.entry;
             let stack = self.allocator.allocate(owner, 4096)?;
             space.insert(stack, READ | WRITE)?;
+            let arg = if dma_driver {
+                if !self.dma.acquire(owner) {
+                    return Err(16);
+                }
+                let page = soc::dma::page();
+                space.insert(page, READ | WRITE)?;
+                unsafe {
+                    core::ptr::write_bytes(page.base as *mut u8, 0, page.size);
+                }
+                page.base as u32
+            } else {
+                0
+            };
             let prepared = pmp::Prepared::new(&space)?;
             unsafe {
                 core::ptr::write_bytes(stack.base as *mut u8, 0, stack.size);
                 core::arch::asm!("fence.i", options(nostack));
             }
-            let frame = arch::TrapFrame::user(entry, stack.base + stack.size, 0);
+            let frame = arch::TrapFrame::user(entry, stack.base + stack.size, arg);
             self.scheduler
                 .create_thread(process, frame, stack, entry, 1, 1)?;
             self.processes.slots[process].memory = space;
@@ -530,10 +551,37 @@ impl Runtime {
             Ok(owner)
         })();
         if result.is_err() {
+            self.dma.release_process(owner);
             self.allocator.release_owner(owner);
             self.processes.slots[process] = vela_kernel::process::Process::EMPTY;
         }
         result
+    }
+    fn complete_dma(&mut self, success: bool) {
+        let Some(owner) = self.dma.finish(success) else {
+            return;
+        };
+        let Some(process) = self
+            .processes
+            .slots
+            .iter()
+            .position(|p| p.id == owner && p.state == Lifecycle::Alive)
+        else {
+            return;
+        };
+        if success {
+            self.processes.slots[process]
+                .memory
+                .dma_access(soc::dma::page(), true)
+                .unwrap();
+        }
+        for i in 0..TASKS {
+            let t = &mut self.scheduler.tasks[i];
+            if t.process == process && t.state == State::Blocked && matches!(t.wait, Wait::Dma) {
+                t.context.registers[8] = if success { 0 } else { (-5i32) as u32 };
+                self.scheduler.wake(i);
+            }
+        }
     }
     fn dispatch(&mut self, frame: &mut arch::TrapFrame, switch: &mut bool) -> u32 {
         let a0 = frame.registers[8];
@@ -548,10 +596,11 @@ impl Runtime {
                 }
                 let bytes: &[u8] = match a0 {
                     0 => include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
+                    2 => include_bytes!(concat!(env!("OUT_DIR"), "/dma.elf")),
                     1 => include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
                     _ => return syscall::EINVAL,
                 };
-                self.spawn_elf(bytes)
+                self.spawn_elf(bytes, a0 == 2)
                     .unwrap_or_else(|e| (-(e as i32)) as u32)
             }
             syscall::WRITE => {
@@ -1075,6 +1124,33 @@ impl Runtime {
                     }
                 }
             }
+            syscall::DMA_COPY => {
+                let pid = self.processes.slots[current].id;
+                if self.dma != vela_kernel::dma::Lease::Cpu(pid) {
+                    return cap::EPERM;
+                }
+                let len = a0 as usize;
+                if len == 0 || len > soc::dma::HALF || len % 4 != 0 {
+                    return syscall::EINVAL;
+                }
+                let space = &mut self.processes.slots[current].memory;
+                if let Err(e) = space.dma_access(soc::dma::page(), false) {
+                    return (-(e as i32)) as u32;
+                }
+                let prepared = pmp::Prepared::new(space).unwrap();
+                assert!(unsafe { prepared.activate() });
+                self.pmp_images[current] = Some((space.revision, prepared));
+                self.active_space = Some((current, space.revision));
+                assert!(self.dma.submit(pid));
+                self.dma_length = len;
+                self.dma_deadline = self.scheduler.snapshot().uptime_ticks.saturating_add(100);
+                self.scheduler.block(Wait::Dma);
+                unsafe {
+                    soc::dma::start(len);
+                }
+                *switch = true;
+                0
+            }
             syscall::EVENT_WAIT => {
                 let caps = &self.processes.slots[current].capabilities;
                 match caps.get(a0, cap::WAIT | cap::ACK) {
@@ -1148,7 +1224,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     if from_idle {
         let idle_pc = arch::vela_idle_entry as *const () as u32;
         if !interrupt
-            || !matches!(cause, 17 | soc::console::RX_LINE)
+            || !matches!(cause, 17 | soc::console::RX_LINE | soc::dma::LINE)
             || frame.mepc.wrapping_sub(idle_pc) >= 8
         {
             fatal(frame);
@@ -1168,9 +1244,23 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             soc::timer::acknowledge();
         }
         let uptime = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER snapshot timeout");
+        if matches!(
+            runtime.dma,
+            vela_kernel::dma::Lease::Device(_) | vela_kernel::dma::Lease::Detached
+        ) && uptime >= runtime.dma_deadline
+        {
+            unsafe {
+                soc::dma::finish(runtime.dma_length);
+            }
+            runtime.complete_dma(false);
+        }
         runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
+    } else if interrupt && cause == soc::dma::LINE {
+        let ok = unsafe { soc::dma::finish(runtime.dma_length) };
+        runtime.complete_dma(ok);
+        switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::console::RX_LINE {
         runtime.usb_rx_interrupts += 1;
         runtime.console.mask_rx_irq();

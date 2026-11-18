@@ -63,3 +63,27 @@ mod tests {
         assert!(!lease.acquire(5));
     }
 }
+
+#[cfg(test)]
+mod mapping_tests {
+    use crate::{
+        process::{AddressSpace, READ, WRITE},
+        task::Region,
+    };
+
+    #[test]
+    fn device_owned_page_retains_its_slot_but_denies_access() {
+        let mut space = AddressSpace::EMPTY;
+        let page = Region {
+            base: 0x10000,
+            size: 4096,
+        };
+        space.insert(page, READ | WRITE).unwrap();
+        space.dma_access(page, false).unwrap();
+        assert!(!space.permits(page.base, 1, READ));
+        assert!(!space.permits(page.base, 1, WRITE));
+        assert!(space.insert(page, READ | WRITE).is_err());
+        space.dma_access(page, true).unwrap();
+        assert!(space.permits(page.base, page.size, READ | WRITE));
+    }
+}

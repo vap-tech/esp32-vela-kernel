@@ -71,6 +71,22 @@ impl AddressSpace {
         self.revision = self.revision.checked_add(1).ok_or(75u32)?;
         Ok(())
     }
+    /// Keep the mapping slot reserved while device ownership denies U-mode access.
+    pub fn dma_access(&mut self, region: Region, allow: bool) -> Result<(), u32> {
+        let revision = self.revision.checked_add(1).ok_or(75u32)?;
+        let m = self
+            .maps
+            .iter_mut()
+            .find(|m| m.region == region && region.size != 0)
+            .ok_or(22u32)?;
+        let rw = READ | WRITE;
+        if m.permissions != if allow { 0 } else { rw } {
+            return Err(22);
+        }
+        m.permissions = if allow { rw } else { 0 };
+        self.revision = revision;
+        Ok(())
+    }
     pub fn permits(&self, address: usize, length: usize, rights: u8) -> bool {
         self.maps.iter().any(|m| {
             m.region.size != 0

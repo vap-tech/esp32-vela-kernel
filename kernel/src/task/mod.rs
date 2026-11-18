@@ -23,6 +23,7 @@ pub enum State {
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Wait {
+    Dma,
     Event {
         object: crate::capability::Object,
     },

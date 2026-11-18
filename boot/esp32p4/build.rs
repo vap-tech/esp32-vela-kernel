@@ -5,9 +5,10 @@ fn main() {
     println!("cargo:rerun-if-changed=link.x");
     println!("cargo:rerun-if-changed=entry.S");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    for (name, pie) in [("hello", false), ("pic", true)] {
+    for (name, pie) in [("hello", false), ("pic", true), ("dma", true)] {
         let source = format!("../../userspace/{name}/main.S");
-        let script = format!("../../userspace/{name}/link.x");
+        let layout = if pie { "pic" } else { name };
+        let script = format!("../../userspace/{layout}/link.x");
         println!("cargo:rerun-if-changed={source}");
         println!("cargo:rerun-if-changed={script}");
         let status = std::process::Command::new("clang")

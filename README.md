@@ -69,7 +69,7 @@ whole-region release. Raw pointers expire at release; sharing requires userspace
 synchronization. No global allocator or individual free. `memtest` exercises
 alignment, writable allocations, exhaustion and release in U-mode.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
-No SMP, DMA, Sentinel, POSIX, kernel VFS or dynamic IRQ registration.
+No SMP, Sentinel, POSIX, kernel VFS or dynamic IRQ registration.
 
 The shell launches a fixed-address ET_EXEC with `run hello` and a static PIE
 with `run pic`. Building both programs requires clang with the RISC-V target
@@ -79,3 +79,14 @@ fault release its SRAM. Each PIE receives one aligned backing allocation and
 separate PMP mappings for its segments. The supported relocation is symbol-free
 R_RISCV_RELATIVE with an aligned RW destination and an in-image addend.
 The spawn ABI selects a bundled executable by index.
+
+On Tab5 v1.3, `run dma` launches an isolated driver that checks a 2048-byte
+SRAM copy byte by byte. GDMA-AHB channel 1 uses kernel-owned descriptors and
+a linker-reserved page split into source and destination halves. The syscall
+accepts only a word-aligned length of 4–2048 bytes from the owning PID.
+CPU accesses use the direct uncached SRAM alias exclusively. Before starting
+the transfer the kernel disables the user PMP mapping. The RX completion IRQ
+checks descriptor ownership and length before restoring access and waking
+the caller. Exit defers page reuse until completion. Failure or a one-second
+timeout quarantines the page until reboot. The buffer supports internal SRAM
+on this channel; PSRAM and cached user mappings require separate cache handling.

@@ -11,4 +11,5 @@ pub unsafe fn memory_ready() -> bool {
     }
 }
 
+pub mod dma;
 pub mod timer;
