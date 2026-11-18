@@ -25,6 +25,8 @@ text!(MEM_FAIL, b"arena: FAIL\n");
 text!(UPTIME_CMD, b"uptime");
 text!(CAT, b"cat ");
 text!(LOADAVG, b"/proc/loadavg");
+text!(INTERRUPTS, b"/proc/interrupts");
+text!(TIMER_IRQ, b"systimer0 ");
 text!(UPTIME, b"/proc/uptime");
 text!(NOT_FOUND, b"procfs: no such file\n");
 text!(BAD_REQUEST, b"procfs: bad request\n");
@@ -157,7 +159,8 @@ impl Buffer {
         self.push(b'0' + ((number / 10) % 10) as u8);
         self.push(b'0' + (number % 10) as u8);
     }
-    #[inline(always)]
+    #[inline(never)]
+    #[unsafe(link_section = ".user.text")]
     fn decimal64(&mut self, mut low: u32, mut high: u32) {
         let mut digits = MaybeUninit::<[u8; 20]>::uninit();
         let ptr = digits.as_mut_ptr().cast::<u8>();
@@ -248,7 +251,8 @@ fn read_node(request: &Buffer, response: &mut Buffer) {
     }
     let load = request.matches(1, LOADAVG.as_ptr(), LOADAVG.len());
     let uptime = request.matches(1, UPTIME.as_ptr(), UPTIME.len());
-    if !load && !uptime {
+    let interrupts = request.matches(1, INTERRUPTS.as_ptr(), INTERRUPTS.len());
+    if !load && !uptime && !interrupts {
         response.push(1);
         response.append(NOT_FOUND.as_ptr(), NOT_FOUND.len());
         return;
@@ -279,6 +283,10 @@ fn read_node(request: &Buffer, response: &mut Buffer) {
         response.decimal(snapshot.word(0));
         response.push(b' ');
         response.decimal(snapshot.word(12));
+        response.push(b'\n');
+    } else if interrupts {
+        response.append(TIMER_IRQ.as_ptr(), TIMER_IRQ.len());
+        response.decimal64(snapshot.word(16), snapshot.word(20));
         response.push(b'\n');
     } else {
         let (low, high, remainder) = div64(snapshot.word(24), snapshot.word(28), 100);

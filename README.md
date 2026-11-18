@@ -9,7 +9,8 @@ Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
     ./scripts/monitor.sh /dev/ttyACM0
 
 Monitor Ctrl-R resets; Ctrl-C detaches. Shell: help, cat <path>, uptime, memtest.
-Try cat /proc/loadavg and cat /proc/uptime. File lookup and formatting run in
+Try cat /proc/loadavg and cat /proc/uptime. /proc/interrupts reports the 64-bit
+count of delivered SYSTIMER interrupts on hart0. File lookup and formatting run in
 userspace procfs, requested through IPC; no kernel VFS or hardcoded file output.
 
 IPC: endpoint_create/send/recv/endpoint_close, eight endpoints, four queued
