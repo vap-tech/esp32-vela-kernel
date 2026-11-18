@@ -23,9 +23,32 @@ fn fence() {
     }
 }
 
+pub struct Boot {
+    pub epoch: u32,
+    pub hz: u32,
+}
+/// Measure inherited slow-clock rate against 16MHz SYSTIMER once, before LP
+/// owns the snapshot. Bounded ~20ms startup calibration, no guessed RC frequency.
+unsafe fn calibrate() -> Option<u32> {
+    unsafe {
+        super::lp_counter::initialize();
+        let hp_start = super::timer::counter_16mhz()?;
+        let lp_start = super::lp_counter::now();
+        for _ in 0..2_000_000 {
+            let hp_elapsed = super::timer::counter_16mhz()?.wrapping_sub(hp_start);
+            if hp_elapsed >= 320_000 {
+                let lp_elapsed =
+                    super::lp_counter::now().wrapping_sub(lp_start) & super::lp_counter::MASK;
+                let hz = ((lp_elapsed * 16_000_000 + hp_elapsed / 2) / hp_elapsed) as u32;
+                return (1000..=1_000_000).contains(&hz).then_some(hz);
+            }
+        }
+        None
+    }
+}
 /// Exclusive boot-time ownership; machine interrupts masked. A stalled or
 /// retained LP cannot fetch partially replaced instructions.
-pub unsafe fn start() -> Option<u32> {
+pub unsafe fn start() -> Option<Boot> {
     unsafe {
         write(LP_CLOCK, read(LP_CLOCK) | 1 << 31);
         write(POWER, read(POWER) | FORCE_STALL | 1 << 29 | 1 << 30);
@@ -39,6 +62,7 @@ pub unsafe fn start() -> Option<u32> {
         if !(0..100_000).any(|_| read(POWER) & 2 != 0) {
             return None;
         }
+        let hz = calibrate()?;
         for (i, chunk) in IMAGE.chunks(4).enumerate() {
             let mut bytes = [0u8; 4];
             bytes[..chunk.len()].copy_from_slice(chunk);
@@ -49,6 +73,7 @@ pub unsafe fn start() -> Option<u32> {
         word(wire::EVENT_ACK).write_volatile(0);
         let epoch = word(wire::EPOCH).read_volatile().wrapping_add(1).max(1);
         word(wire::EPOCH).write_volatile(epoch);
+        word(wire::CLOCK_HZ).write_volatile(hz);
         write(BASE + 0x5c, 0xffff);
         write(0x500d_6010, LINE);
         write(0x2080_1050, 0x3fc00100);
@@ -59,7 +84,7 @@ pub unsafe fn start() -> Option<u32> {
         write(POWER, read(POWER) & !FORCE_STALL);
         write(WAKE, 1 << 31);
         fence();
-        Some(epoch)
+        Some(Boot { epoch, hz })
     }
 }
 /// Consume the LP doorbell only after seeing the hardware status bit.

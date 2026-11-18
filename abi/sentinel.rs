@@ -2,6 +2,8 @@
 //! HP owns 0,3,4,6,7,13,15; LP owns 1,2,5,8..12,14.
 //! COMMAND/EVENT are doorbells, written last. LP may not republish until HP
 //! acknowledges PUBLISH_SEQ via EVENT_ACK. One HP request outstanding.
+// HP and LP intentionally consume different subsets of this wire-only module.
+#![allow(dead_code)]
 pub const VERSION: u32 = 2;
 pub const EPOCH: usize = 0;
 pub const ECHO: usize = 1;
@@ -34,3 +36,12 @@ pub struct Reply {
     pub beats: u32,
     pub published: u32,
 }
+
+pub const HEARTBEAT: u32 = 0x4842_0000 | VERSION;
+pub const GET_STATUS: u32 = 0x5354_0000 | VERSION;
+pub const STATUS: u32 = 0x5353_0000 | VERSION;
+pub const BAD_ARGUMENT: u32 = 2;
+pub const UNARMED: u32 = 0;
+pub const HEALTHY: u32 = 1;
+pub const MISSED: u32 = 2;
+pub const STATUS_BYTES: usize = 24; // state,age_ms(lo/hi),calibrated_hz,beats,missed transitions

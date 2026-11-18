@@ -15,3 +15,5 @@ pub mod dma;
 mod mailbox;
 pub mod sentinel;
 pub mod timer;
+
+pub mod lp_counter;

@@ -44,16 +44,22 @@ pub unsafe fn acknowledge() {
 /// Unlike delivered interrupt count this does not lose time under backpressure.
 /// # Safety
 /// Only the outermost masked handler may own the unit0 snapshot registers.
-pub unsafe fn uptime_ticks() -> Option<u64> {
+pub unsafe fn counter_16mhz() -> Option<u64> {
     unsafe {
         write(0x500e2004, (1 << 29) | (1 << 30));
         for _ in 0..10_000 {
             if read(0x500e2004) & (1 << 29) != 0 {
                 let high = read(0x500e2040) & 0xf_ffff;
                 let low = read(0x500e2044);
-                return Some(((u64::from(high) << 32) | u64::from(low)) / 160_000);
+                return Some((u64::from(high) << 32) | u64::from(low));
             }
         }
         None
     }
+}
+
+/// # Safety
+/// Exclusive snapshot owner, as for counter_16mhz.
+pub unsafe fn uptime_ticks() -> Option<u64> {
+    unsafe { counter_16mhz().map(|ticks| ticks / 160_000) }
 }

@@ -18,6 +18,15 @@ text!(
 );
 text!(HELP_CMD, b"help");
 text!(RUN_DMA, b"run dma");
+text!(STATUS_CMD, b"sentinel status");
+text!(STATUS_PREFIX, b"Sentinel state=");
+text!(UNARMED, b"unarmed");
+text!(HEALTHY, b"healthy");
+text!(MISSED, b"missed");
+text!(AGE_MS, b" age_ms=");
+text!(LP_HZ, b" lp_hz=");
+text!(BEATS, b" beats=");
+text!(MISSES, b" missed=");
 text!(HELLO_CMD, b"sentinel hello");
 text!(ACK_MSG, b"Sentinel ACK seq ");
 text!(SENTINEL, b"sentinel");
@@ -397,6 +406,31 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
             u32::from(line.len == RUN_PIC.len())
         };
         if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
+            write(FAILED.as_ptr(), FAILED.len());
+        }
+    } else if line.matches(0, STATUS_CMD.as_ptr(), STATUS_CMD.len()) {
+        let mut data = Buffer::new();
+        let result = call(abi::SENTINEL_QUERY, data.mut_ptr() as u32, 24, 0, 0);
+        if result == 24 {
+            data.len = 24;
+            let mut out = Buffer::new();
+            out.append(STATUS_PREFIX.as_ptr(), STATUS_PREFIX.len());
+            match data.word(0) {
+                0 => out.append(UNARMED.as_ptr(), UNARMED.len()),
+                1 => out.append(HEALTHY.as_ptr(), HEALTHY.len()),
+                _ => out.append(MISSED.as_ptr(), MISSED.len()),
+            }
+            out.append(AGE_MS.as_ptr(), AGE_MS.len());
+            out.decimal64(data.word(4), data.word(8));
+            out.append(LP_HZ.as_ptr(), LP_HZ.len());
+            out.decimal(data.word(12));
+            out.append(BEATS.as_ptr(), BEATS.len());
+            out.decimal(data.word(16));
+            out.append(MISSES.as_ptr(), MISSES.len());
+            out.decimal(data.word(20));
+            out.push(b'\n');
+            write(out.ptr(), out.len);
+        } else {
             write(FAILED.as_ptr(), FAILED.len());
         }
     } else if line.matches(0, HELLO_CMD.as_ptr(), HELLO_CMD.len()) {

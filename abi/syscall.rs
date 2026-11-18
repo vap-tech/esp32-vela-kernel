@@ -40,3 +40,5 @@ pub const EVENT_WAIT: u32 = 24; // a0=boot-bound USB RX event; acknowledge, rear
 pub const DMA_COPY: u32 = 25; // bundled DMA driver: copy a0 bytes between private page halves, block until IRQ
 pub const SENTINEL_STATUS: u32 = 26; // a0=acknowledged version (0 until READY), a1=startup epoch
 pub const SENTINEL_HELLO: u32 = 27; // blocks for ACK; returns sequence or errno
+
+pub const SENTINEL_QUERY: u32 = 28; // a0=writable 24-byte buffer,a1=size; blocking live GET_STATUS

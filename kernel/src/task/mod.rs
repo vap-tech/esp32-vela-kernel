@@ -26,6 +26,7 @@ pub enum Wait {
     Sentinel {
         sequence: u32,
         deadline: u64,
+        pointer: usize,
     },
     Dma,
     Event {

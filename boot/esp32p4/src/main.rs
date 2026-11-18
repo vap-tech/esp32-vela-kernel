@@ -59,7 +59,11 @@ struct Runtime {
     sentinel_epoch: Option<u32>,
     sentinel_ready: bool,
     sentinel_sequence: u32,
-    hello_pending: bool,
+    sentinel_pending: bool,
+    sentinel_command: u32,
+    sentinel_hz: u32,
+    sentinel_heartbeat: bool,
+    sentinel_next_beat: u64,
     usb_rx_interrupts: u64,
     logged_block: bool,
     logged_wake: bool,
@@ -207,7 +211,11 @@ extern "C" fn rust_main() -> ! {
         sentinel_epoch: None,
         sentinel_ready: false,
         sentinel_sequence: 0,
-        hello_pending: false,
+        sentinel_pending: false,
+        sentinel_command: 0,
+        sentinel_hz: 0,
+        sentinel_heartbeat: true,
+        sentinel_next_beat: 0,
         usb_rx_interrupts: 0,
         logged_block: false,
         logged_wake: false,
@@ -219,7 +227,10 @@ extern "C" fn rust_main() -> ! {
         let _ = writeln!(runtime.console, "[sched] preemptive scheduler online");
         soc::timer::start(vela_trap_entry as *const () as usize);
         runtime.console.route_rx_irq();
-        runtime.sentinel_epoch = soc::sentinel::start();
+        if let Some(boot) = soc::sentinel::start() {
+            runtime.sentinel_epoch = Some(boot.epoch);
+            runtime.sentinel_hz = boot.hz;
+        }
         arch::enter(&runtime.scheduler.current().context);
     }
 }
@@ -266,6 +277,38 @@ fn grant(
     })
 }
 impl Runtime {
+    fn sentinel_request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, u32> {
+        if !self.sentinel_ready {
+            return Err(syscall::EAGAIN);
+        }
+        if self.sentinel_pending {
+            return Err((-16i32) as u32);
+        }
+        if self.sentinel_sequence == i32::MAX as u32 {
+            return Err((-75i32) as u32);
+        }
+        self.sentinel_sequence += 1;
+        self.sentinel_pending = true;
+        self.sentinel_command = command;
+        // SAFETY: hart0 MIE=0, only one pending request until its exact response.
+        unsafe {
+            soc::sentinel::request(self.sentinel_sequence, command, arg0, arg1);
+        }
+        Ok(self.sentinel_sequence)
+    }
+    fn sentinel_tick(&mut self, uptime: u64) {
+        if self.sentinel_ready
+            && self.sentinel_heartbeat
+            && !self.sentinel_pending
+            && uptime >= self.sentinel_next_beat
+            && self
+                .sentinel_request(sentinel_wire::HEARTBEAT, 3000, 0)
+                .is_ok()
+        {
+            self.sentinel_next_beat = uptime.saturating_add(100);
+        }
+    }
+
     fn bind_reply(&mut self, token: u32, server: usize) {
         if token == 0 {
             return;
@@ -996,27 +1039,32 @@ impl Runtime {
                 *switch = true;
                 0
             }
-            syscall::SENTINEL_HELLO => {
+            syscall::SENTINEL_HELLO | syscall::SENTINEL_QUERY => {
                 if self.processes.slots[current].id != 2 {
                     return cap::EPERM;
                 }
-                if !self.sentinel_ready {
-                    return syscall::EAGAIN;
+                let query = frame.registers[15] == syscall::SENTINEL_QUERY;
+                if query
+                    && (a1 as usize != sentinel_wire::STATUS_BYTES
+                        || !self.writable(a0 as usize, sentinel_wire::STATUS_BYTES))
+                {
+                    return syscall::EFAULT;
                 }
-                if self.hello_pending {
-                    return (-16i32) as u32;
-                }
-                if self.sentinel_sequence == i32::MAX as u32 {
-                    return (-75i32) as u32;
-                }
-                self.sentinel_sequence += 1;
-                self.hello_pending = true;
-                let sequence = self.sentinel_sequence;
+                let command = if query {
+                    sentinel_wire::GET_STATUS
+                } else {
+                    sentinel_wire::HELLO
+                };
+                let sequence = match self.sentinel_request(command, 0, 0) {
+                    Ok(seq) => seq,
+                    Err(e) => return e,
+                };
                 let deadline = self.scheduler.snapshot().uptime_ticks.saturating_add(100);
-                self.scheduler.block(Wait::Sentinel { sequence, deadline });
-                unsafe {
-                    soc::sentinel::request(sequence, sentinel_wire::HELLO, 0, 0);
-                }
+                self.scheduler.block(Wait::Sentinel {
+                    sequence,
+                    deadline,
+                    pointer: if query { a0 as usize } else { 0 },
+                });
                 *switch = true;
                 0
             }
@@ -1300,7 +1348,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             }
             runtime.complete_dma(false);
         }
-        if runtime.hello_pending {
+        if runtime.sentinel_pending {
             for i in 0..TASKS {
                 if matches!(runtime.scheduler.tasks[i].wait, Wait::Sentinel {deadline,..} if uptime>=deadline)
                 {
@@ -1309,6 +1357,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
                 }
             }
         }
+        runtime.sentinel_tick(uptime);
         runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
@@ -1316,17 +1365,43 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) } {
             if reply.event == sentinel_wire::READY && reply.result == sentinel_wire::OK {
                 runtime.sentinel_ready = true;
-            } else if reply.event == sentinel_wire::ACK
-                && runtime.hello_pending
+            } else if runtime.sentinel_pending
                 && reply.request == runtime.sentinel_sequence
+                && (reply.event == sentinel_wire::ACK || reply.event == sentinel_wire::STATUS)
             {
-                runtime.hello_pending = false;
-                if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
-                    t.state == State::Blocked && matches!(t.wait,Wait::Sentinel {sequence,..} if sequence == reply.request)
-                }) {
-                    runtime.scheduler.tasks[i].context.registers[8] =
-                        if reply.result == sentinel_wire::OK { reply.request } else { syscall::EINVAL };
-                    runtime.scheduler.wake(i);
+                let command = runtime.sentinel_command;
+                let expected = if command == sentinel_wire::GET_STATUS {
+                    sentinel_wire::STATUS
+                } else {
+                    sentinel_wire::ACK
+                };
+                if reply.event == expected || reply.result != sentinel_wire::OK {
+                    runtime.sentinel_pending = false;
+                    if let Some(i) = runtime.scheduler.tasks.iter().position(|t| t.state == State::Blocked
+                        && matches!(t.wait,Wait::Sentinel {sequence,..} if sequence == reply.request)) {
+                        let Wait::Sentinel {pointer,..} = runtime.scheduler.tasks[i].wait else { unreachable!() };
+                        let result = if reply.result != sentinel_wire::OK { syscall::EINVAL }
+                            else if pointer == 0 { reply.request }
+                            else {
+                                let process = runtime.scheduler.tasks[i].process;
+                                if !runtime.processes.slots[process].memory.permits(pointer,sentinel_wire::STATUS_BYTES,WRITE) {
+                                    syscall::EFAULT
+                                } else {
+                                    let age_ms = reply.age * 1000 / u64::from(runtime.sentinel_hz);
+                                    let values = [reply.monitor & 3,age_ms as u32,(age_ms >> 32) as u32,
+                                        runtime.sentinel_hz,reply.beats,reply.monitor >> 2];
+                                    for (index,value) in values.into_iter().enumerate() {
+                                        for (byte_index,byte) in value.to_le_bytes().into_iter().enumerate() {
+                                            // SAFETY: revalidated receiver mapping; synchronous masked IRQ completion.
+                                            unsafe { (pointer as *mut u8).add(index*4+byte_index).write(byte); }
+                                        }
+                                    }
+                                    sentinel_wire::STATUS_BYTES as u32
+                                }
+                            };
+                        runtime.scheduler.tasks[i].context.registers[8] = result;
+                        runtime.scheduler.wake(i);
+                    }
                 }
             }
         }

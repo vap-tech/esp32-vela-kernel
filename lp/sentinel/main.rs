@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
+#[path = "../../soc/esp32p4-v13/lp_counter.rs"]
+mod lp_counter;
 #[path = "../../soc/esp32p4-v13/mailbox.rs"]
 mod mailbox;
+mod watch;
 #[path = "../../abi/sentinel.rs"]
 mod wire;
 use core::arch::{asm, global_asm};
@@ -63,6 +66,8 @@ struct Transport {
     busy: bool,
     pending: bool,
     last_request: u32,
+    hz: u32,
+    watch: watch::Watch,
 }
 struct Local(core::cell::UnsafeCell<Transport>);
 // SAFETY: only LP startup and non-nested LP IRQ handlers access this LP SRAM.
@@ -74,6 +79,8 @@ static LOCAL: Local = Local(core::cell::UnsafeCell::new(Transport {
     busy: false,
     pending: false,
     last_request: 0,
+    hz: 0,
+    watch: watch::Watch::new(),
 }));
 unsafe fn publish(local: &mut Transport, event: u32, request: u32, result: u32) {
     unsafe {
@@ -82,10 +89,13 @@ unsafe fn publish(local: &mut Transport, event: u32, request: u32, result: u32) 
         mailbox::word(wire::ECHO).write_volatile(local.epoch);
         mailbox::word(wire::REPLY_SEQ).write_volatile(request);
         mailbox::word(wire::RESULT).write_volatile(result);
-        mailbox::word(wire::MONITOR).write_volatile(0); // not armed
-        mailbox::word(wire::AGE_LO).write_volatile(0);
-        mailbox::word(wire::AGE_HI).write_volatile(0);
-        mailbox::word(wire::BEATS).write_volatile(0);
+        let now = lp_counter::now();
+        local.watch.sample(now);
+        let age = local.watch.age(now);
+        mailbox::word(wire::MONITOR).write_volatile(local.watch.state | (local.watch.missed << 2));
+        mailbox::word(wire::AGE_LO).write_volatile(age as u32);
+        mailbox::word(wire::AGE_HI).write_volatile((age >> 32) as u32);
+        mailbox::word(wire::BEATS).write_volatile(local.watch.beats);
         mailbox::word(wire::PUBLISH_SEQ).write_volatile(local.published);
         asm!("fence iorw, iorw", options(nostack));
         mailbox::word(wire::EVENT).write_volatile(event);
@@ -101,6 +111,8 @@ extern "C" fn sentinel_main() {
         ((mailbox::BASE + 0x48) as *mut u32).write_volatile(irq);
         let local = &mut *LOCAL.0.get();
         local.epoch = mailbox::word(wire::EPOCH).read_volatile();
+        local.hz = mailbox::word(wire::CLOCK_HZ).read_volatile();
+        assert!((1000..=1_000_000).contains(&local.hz));
         publish(local, wire::READY, 0, wire::OK);
     }
 }
@@ -129,14 +141,20 @@ extern "C" fn receive_command() {
             return;
         }
         local.last_request = sequence;
-        let args_ok = mailbox::word(wire::ARG0).read_volatile() == 0
-            && mailbox::word(wire::ARG1).read_volatile() == 0;
-        let result = if command == wire::HELLO && args_ok {
-            wire::OK
-        } else {
-            wire::BAD_COMMAND
+        let arg0 = mailbox::word(wire::ARG0).read_volatile();
+        let arg1 = mailbox::word(wire::ARG1).read_volatile();
+        let (event, result) = match command {
+            wire::HELLO if arg0 == 0 && arg1 == 0 => (wire::ACK, wire::OK),
+            wire::GET_STATUS if arg0 == 0 && arg1 == 0 => (wire::STATUS, wire::OK),
+            wire::HEARTBEAT if (100..=60_000).contains(&arg0) && arg1 == 0 => {
+                let timeout = (u64::from(local.hz) * u64::from(arg0) + 999) / 1000;
+                local.watch.heartbeat(lp_counter::now(), timeout);
+                (wire::ACK, wire::OK)
+            }
+            wire::HELLO | wire::GET_STATUS | wire::HEARTBEAT => (wire::ACK, wire::BAD_ARGUMENT),
+            _ => (wire::ACK, wire::BAD_COMMAND),
         };
-        publish(local, wire::ACK, sequence, result);
+        publish(local, event, sequence, result);
     }
 }
 fn idle() -> ! {

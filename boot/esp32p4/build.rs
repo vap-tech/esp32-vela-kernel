@@ -41,6 +41,8 @@ fn build_sentinel(out: &std::path::Path) {
     for path in [
         source,
         script,
+        "../../lp/sentinel/watch.rs",
+        "../../soc/esp32p4-v13/lp_counter.rs",
         "../../abi/sentinel.rs",
         "../../soc/esp32p4-v13/mailbox.rs",
     ] {
