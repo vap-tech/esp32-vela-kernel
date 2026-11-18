@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=entry.S");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     build_sentinel(&out);
+    let linker = user_linker();
     for (name, pie) in [("hello", false), ("pic", true), ("dma", true)] {
         let source = format!("../../userspace/{name}/main.S");
         let layout = if pie { "pic" } else { name };
@@ -17,7 +18,6 @@ fn main() {
                 "--target=riscv32-none-elf",
                 "-march=rv32imac",
                 "-mabi=ilp32",
-                "-fuse-ld=lld",
                 "-nostdlib",
                 "-Wl,--strip-all",
                 "-Xlinker",
@@ -26,6 +26,7 @@ fn main() {
                 &script,
                 &source,
             ])
+            .arg(&linker)
             .args(pie.then_some("-Wl,-pie"))
             .arg("-o")
             .arg(out.join(format!("{name}.elf")))
@@ -66,4 +67,31 @@ fn build_sentinel(out: &std::path::Path) {
         .status()
         .expect("run rustc for Sentinel");
     assert!(status.success(), "building LP Sentinel failed");
+}
+
+// Clang is required for the bundled user assembly; a separately installed LLD
+// is optional because the pinned Rust toolchain already supplies GNU-flavour LLD.
+fn user_linker() -> String {
+    if std::process::Command::new("ld.lld")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return "-fuse-ld=lld".into();
+    }
+    let output = std::process::Command::new(std::env::var_os("RUSTC").unwrap())
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("query Rust sysroot");
+    assert!(output.status.success(), "query Rust sysroot failed");
+    let root = String::from_utf8(output.stdout).expect("UTF-8 Rust sysroot");
+    let linker = std::path::Path::new(root.trim())
+        .join("lib/rustlib")
+        .join(std::env::var_os("HOST").unwrap())
+        .join("bin/gcc-ld/ld.lld");
+    assert!(
+        linker.is_file(),
+        "install ld.lld: Rust bundled linker not found"
+    );
+    format!("--ld-path={}", linker.display())
 }

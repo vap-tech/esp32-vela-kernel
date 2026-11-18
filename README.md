@@ -6,8 +6,9 @@ Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
 
 ## Build and run
 
-The build requires Rustup, Clang with RISC-V support, `ld.lld`, `espflash`
-and Python 3. The pinned toolchain in `rust-toolchain.toml` includes the HP
+The build requires Rustup, Clang with RISC-V support, `espflash`
+and Python 3. It uses system `ld.lld` or the Rust toolchain bundled linker.
+The pinned toolchain in `rust-toolchain.toml` includes the HP
 and LP targets. The build produces `target/firmware.bin` with the bundled
 userspace programs and the separate LP Sentinel image.
 
