@@ -280,3 +280,20 @@ heartbeat timeout window. HP remains active throughout this protocol check.
 On Tab5 a cancelled 800 ms interval left no pending wake after its original
 deadline. A 4500 ms interval produced one event at 450 HP ticks. STATUS
 changed from prepared to healthy, with zero missed transitions and notices.
+
+### Display bring-up checkpoint
+
+The vertical bars have been visually confirmed on Tab5. Backlight now uses
+LEDC channel 0 at 39.06 kHz with 62.5% duty, checked through duty readback.
+
+Experimental shell command `display orbit` renders the 64×64 asset derived
+from `orbit.svg` into a reserved internal SRAM band and attempts continuous
+RGB565 scanout through DW-GDMA. The latest Tab5 run returned display error 8
+with FIFO underrun and zero completed frames. Continuous icon scanout still
+requires work. The command prints DMA diagnostics and stops scanout on this
+failure. Error 7 reports a backlight PWM readback timeout.
+
+Regenerate the checked-in coverage asset using `/usr/bin/python3
+tools/orbit_asset.py` with PyGObject, Pycairo and librsvg installed.
+The lower SRAM display reservation occupies 148224 bytes within
+0x4ff00000..0x4ff26000, before the boot stack.

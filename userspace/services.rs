@@ -16,6 +16,8 @@ text!(
     HELP,
     b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n"
 );
+text!(ORBIT, b"display orbit");
+text!(ORBIT_OK, b"Orbit scanout active\n");
 text!(DISPLAY, b"display test");
 text!(BARS, b"ST7121 DSI bars enabled\n");
 text!(DISPLAY_ERROR, b"display error ");
@@ -35,7 +37,7 @@ text!(WAIT_CMD, b"sentinel wait");
 text!(CANCEL_CMD, b"sentinel cancel");
 text!(
     WAKE_HELP,
-    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test\n"
+    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit\n"
 );
 text!(WAKE_ARMED, b"Sentinel wake armed token=");
 text!(WAKE_FIRED, b"Sentinel WAKE_EVENT token=");
@@ -660,14 +662,21 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     if line.matches(0, HELP_CMD.as_ptr(), HELP_CMD.len()) {
         write(HELP.as_ptr(), HELP.len());
         write(WAKE_HELP.as_ptr(), WAKE_HELP.len());
-    } else if line.matches(0, DISPLAY.as_ptr(), DISPLAY.len()) {
-        let mut rc = call(abi::DISPLAY_TEST, 1, 0, 0, 0);
+    } else if line.matches(0, DISPLAY.as_ptr(), DISPLAY.len())
+        || line.matches(0, ORBIT.as_ptr(), ORBIT.len())
+    {
+        let orbit = line.len == ORBIT.len();
+        let mut rc = call(abi::DISPLAY_TEST, 1 + u32::from(orbit), 0, 0, 0);
         while (rc as i32) > 0 {
             call(abi::SLEEP, rc, 0, 0, 0);
             rc = call(abi::DISPLAY_TEST, 0, 0, 0, 0);
         }
         if rc == 0 {
-            write(BARS.as_ptr(), BARS.len());
+            if orbit {
+                write(ORBIT_OK.as_ptr(), ORBIT_OK.len());
+            } else {
+                write(BARS.as_ptr(), BARS.len());
+            }
         } else {
             let mut out = Buffer::new();
             out.append(DISPLAY_ERROR.as_ptr(), DISPLAY_ERROR.len());

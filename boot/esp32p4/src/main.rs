@@ -67,6 +67,7 @@ struct Runtime {
     sentinel_diagnostics: u32,
     sentinel_hz: u32,
     heartbeat_link: vela_kernel::sentinel::Heartbeat,
+    display_orbit: bool,
     display_stage: u8,
     sentinel_heartbeat: bool,
     sentinel_next_beat: u64,
@@ -226,6 +227,7 @@ extern "C" fn rust_main() -> ! {
         sentinel_diagnostics: 0,
         sentinel_hz: 0,
         heartbeat_link: Default::default(),
+        display_orbit: false,
         display_stage: u8::MAX,
         sentinel_heartbeat: true,
         sentinel_next_beat: 0,
@@ -1282,12 +1284,14 @@ impl Runtime {
                 if self.processes.slots[current].id != 2 {
                     return cap::EPERM;
                 }
-                if a0 == 1 {
+                if matches!(a0, 1 | 2) {
+                    soc::scanout::stop();
+                    self.display_orbit = a0 == 2;
                     self.display_stage = 0;
                 } else if a0 != 0 {
                     return syscall::EINVAL;
                 }
-                match board::display_step(self.display_stage) {
+                match board::display_step(self.display_stage, self.display_orbit) {
                     Ok(delay) => {
                         self.display_stage = if delay == 0 {
                             u8::MAX
@@ -1769,6 +1773,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
                 // Keep the LP token reserved: a late event cannot complete a new alarm.
             }
         }
+        soc::scanout::tick();
         runtime.sentinel_tick(uptime);
         runtime.expire_calls(uptime);
         runtime.scheduler.tick(uptime);

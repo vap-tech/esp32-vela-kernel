@@ -56,4 +56,4 @@ pub const SENTINEL_CANCEL_WAKE: u32 = 34; // a0=token (0=current own alarm); ret
 
 pub const SENTINEL_PREPARE_SLEEP: u32 = 35; // a0=ms, returns wake token; WAIT/CANCEL use the same ticket
 
-pub const DISPLAY_TEST: u32 = 36; // boot shell only: a0=1 restart, 0 advance; returns delay ticks, 0 done, negative error
+pub const DISPLAY_TEST: u32 = 36; // boot shell only: a0=1 restart bars, 2 restart orbit, 0 advance; returns delay ticks, 0 done, negative error

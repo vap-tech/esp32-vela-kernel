@@ -103,3 +103,26 @@ impl Bus {
         stop.and(result)
     }
 }
+
+/// LEDC timer 0, channel 0. XTAL / 4 / 256 gives 39.06 kHz without CPU service.
+pub fn backlight_pwm(pin: usize, duty: u8) -> bool {
+    const CLK: usize = 0x500e6000;
+    const LEDC: usize = 0x500d3000;
+    unsafe {
+        write(CLK + 0x20, read(CLK + 0x20) | 1);
+        write(CLK + 0xc4, read(CLK + 0xc4) & !(1 << 29));
+        write(CLK + 0x9c, (read(CLK + 0x9c) & !7) | 4);
+        write(LEDC + 0xa0, 8 | ((4 * 256) << 5) | (1 << 26));
+        write(LEDC + 4, 0);
+        write(LEDC + 8, u32::from(duty) << 4);
+        write(LEDC + 0xc, 1 << 31);
+        write(LEDC, (1 << 4) | (1 << 2));
+        for _ in 0..10000 {
+            if read(LEDC + 0x10) >> 4 == u32::from(duty) {
+                write(GPIO + 0x558 + 4 * pin, 126 | (1 << 10));
+                return true;
+            }
+        }
+    }
+    false
+}

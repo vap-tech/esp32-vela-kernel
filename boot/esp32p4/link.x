@@ -2,11 +2,17 @@ OUTPUT_ARCH(riscv)
 ENTRY(_start)
 MEMORY {
  ENTRY (rx) : ORIGIN = 0x30100000, LENGTH = 8K
+ DISPLAY (rw) : ORIGIN = 0x4ff00000, LENGTH = 152K
  BOOT_STACK (rw) : ORIGIN = 0x4ff26000, LENGTH = 8K
  UPPER (rwx) : ORIGIN = 0x4ff40000, LENGTH = 432K
  STACK (rw) : ORIGIN = 0x4ffac000, LENGTH = 80K
 }
 SECTIONS {
+ .display (NOLOAD) : ALIGN(64) {
+  _orbit_lli = .; . += 4 * 39 * 64;
+  _orbit_black = .; . += 720 * 32 * 2;
+  _orbit_band = .; . += 720 * 64 * 2;
+ } > DISPLAY
  .entry : ALIGN(16) { _entry_start = .; KEEP(*(.text.entry)); _entry_end = .; } > ENTRY
  .upper : ALIGN(64) {
   _upper_start = .;

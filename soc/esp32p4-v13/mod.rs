@@ -19,3 +19,4 @@ pub mod timer;
 pub mod display_io;
 pub mod dsi;
 pub mod lp_counter;
+pub mod scanout;

@@ -142,7 +142,7 @@ pub fn dcs(bytes: &[u8]) -> Result<(), ()> {
     set(PACKET_HEADER, header);
     wait(PACKET_STATUS, 5, 5).then_some(()).ok_or(())
 }
-pub fn bars() -> bool {
+pub fn video(bars: bool) -> bool {
     // 240 MHz / 3 = 80 MHz DPI. 120 MHz lane byte clock, ratio 3/2.
     update(CLK + 0x28, 1 << 30, 1 << 30); // REF_240M gate
     update(CLK + 0x3c, 0xffe0, 2 << 8 | 1 << 7 | 1 << 5);
@@ -155,7 +155,7 @@ pub fn bars() -> bool {
     set(V_BACK_PORCH, 24);
     set(V_FRONT_PORCH, 200);
     set(V_ACTIVE, 1280);
-    set(VIDEO_MODE, 1 << 16 | 0x3f00 | 2); // vertical bars, burst video
+    set(VIDEO_MODE, u32::from(bars) << 16 | 0x3f00 | 2); // vertical bars, burst video
     set(MODE, 0);
     set(LANE_CLOCK, 3);
     wait(PHY_STATUS, 1, 1)

@@ -19,7 +19,7 @@ fn backlight(on: bool) {
 }
 /// Sequential trusted operations. Positive result is a minimum delay in 10ms
 /// ticks before the next stage. The shell sleeps between stages.
-pub fn display_step(stage: u8) -> Result<u32, u32> {
+pub fn display_step(stage: u8, orbit: bool) -> Result<u32, u32> {
     match stage {
         0 => {
             BUS.init();
@@ -61,10 +61,31 @@ pub fn display_step(stage: u8) -> Result<u32, u32> {
             for command in [&[0x35, 0][..], &[0x36, 0], &[0x3a, 0x55]] {
                 dsi::dcs(command).map_err(|_| 4u32)?;
             }
-            if !dsi::bars() {
+            if !dsi::video(!orbit) {
                 return Err(5);
             }
-            backlight(true);
+            if !io::backlight_pwm(22, 160) {
+                return Err(7);
+            }
+            if orbit {
+                crate::soc::scanout::start(include_bytes!("orbit.a8"), [0x85, 0xbf, 0xff]);
+                return Ok(12);
+            }
+            Ok(0)
+        }
+        6 if orbit => {
+            crate::soc::scanout::debug();
+            use core::fmt::Write;
+            let _ = writeln!(
+                unsafe { crate::soc::console::Console::new() },
+                "[scan] frames={} underrun={}",
+                crate::soc::scanout::frames(),
+                crate::soc::scanout::underrun()
+            );
+            if crate::soc::scanout::frames() < 2 || crate::soc::scanout::underrun() {
+                crate::soc::scanout::stop();
+                return Err(8);
+            }
             Ok(0)
         }
         _ => Err(6),
