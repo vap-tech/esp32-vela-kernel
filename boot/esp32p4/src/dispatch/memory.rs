@@ -4,7 +4,7 @@ use vela_kernel::{
     id::{Handle, ProcSlot, ThreadSlot},
     process::{READ, WRITE},
     sched::TASKS,
-    task::{Region, State, Wait},
+    task::{Context, Region, State, Wait},
 };
 
 use super::Args;
@@ -71,7 +71,7 @@ impl Runtime {
         unsafe {
             core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
         }
-        frame.registers[9] = region.size as u32;
+        frame.set_return2(region.size as u32);
         Ok(region.base as u32)
     }
 
@@ -111,8 +111,7 @@ impl Runtime {
             } = self.scheduler.task(thread).wait
             {
                 if region.contains(pointer, capacity) {
-                    self.scheduler.task_mut(thread).context.registers[8] = Errno::Efault.to_abi();
-                    self.scheduler.wake(thread);
+                    self.scheduler.wake_with(thread, Errno::Efault.to_abi());
                 }
             }
         }

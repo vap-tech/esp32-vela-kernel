@@ -1,5 +1,6 @@
 use core::fmt::Write;
 use vela_kernel::{
+    call::CallTable,
     capability::{self as cap, Capability},
     id::ProcSlot,
     ipc::Ipc,
@@ -11,7 +12,6 @@ use vela_kernel::{
 
 use crate::{
     arch, board,
-    calls::CallTable,
     display::DisplayControl,
     dma::DmaChannel,
     pmp,

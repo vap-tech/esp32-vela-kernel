@@ -79,16 +79,20 @@ impl SentinelClient {
         }
     }
 
-    pub fn status(&self) -> (u32, Result<u32, Errno>) {
-        let epoch = self.epoch.unwrap_or(0);
-        let result = if self.heartbeat_link.offline {
+    pub fn epoch_or_zero(&self) -> u32 {
+        self.epoch.unwrap_or(0)
+    }
+
+    /// Protocol version once READY, `0` before, `Etimedout` when the LP
+    /// heartbeat link is offline.
+    pub fn link_status(&self) -> Result<u32, Errno> {
+        if self.heartbeat_link.offline {
             Err(Errno::Etimedout)
         } else if self.ready {
             Ok(sentinel_wire::VERSION)
         } else {
             Ok(0)
-        };
-        (epoch, result)
+        }
     }
 
     pub fn request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, Errno> {
@@ -145,8 +149,7 @@ impl SentinelClient {
                     scheduler.task(thread).wait,
                     Wait::Sentinel { deadline, .. } if uptime >= deadline
                 ) {
-                    scheduler.task_mut(thread).context.registers[8] = Errno::Etimedout.to_abi();
-                    scheduler.wake(thread);
+                    scheduler.wake_with(thread, Errno::Etimedout.to_abi());
                 }
             }
         }
@@ -158,9 +161,7 @@ impl SentinelClient {
                     Wait::SentinelWake { deadline, .. } if uptime >= deadline
                 )
             {
-                scheduler.task_mut(thread).context.registers[8] = Errno::Etimedout.to_abi();
-                scheduler.task_mut(thread).context.registers[9] = 0;
-                scheduler.wake(thread);
+                scheduler.wake_with2(thread, Errno::Etimedout.to_abi(), 0);
                 // Keep the LP token reserved: a late event cannot complete a new alarm.
             }
         }
@@ -179,9 +180,7 @@ impl SentinelClient {
                 && matches!(t.wait, Wait::SentinelWake { token, .. } if token == ticket.token)
         }) {
             let thread = ThreadSlot(i);
-            scheduler.task_mut(thread).context.registers[8] = result;
-            scheduler.task_mut(thread).context.registers[9] = elapsed;
-            scheduler.wake(thread);
+            scheduler.wake_with2(thread, result, elapsed);
             return true;
         }
         false
@@ -280,31 +279,53 @@ impl SentinelClient {
             sentinel_wire::WAKE_ALREADY => Errno::Ealready,
             _ => Errno::Einval,
         };
+        self.settle_wake_ticket(
+            command,
+            &reply,
+            error.then_some(error_code),
+            scheduler,
+            processes,
+        );
+        self.complete_waiter(
+            command,
+            &reply,
+            error.then_some(error_code),
+            scheduler,
+            processes,
+        );
+    }
+
+    /// Advance or finish the single wake alarm after the LP acknowledged
+    /// `command`. `error` is `Some` when the LP rejected it.
+    fn settle_wake_ticket(
+        &mut self,
+        command: u32,
+        reply: &sentinel_wire::Reply,
+        error: Option<Errno>,
+        scheduler: &mut Scheduler<arch::TrapFrame>,
+        processes: &Processes,
+    ) {
         if matches!(
             command,
             sentinel_wire::SET_WAKEUP | sentinel_wire::PREPARE_SLEEP
         ) {
-            if let Some(mut ticket) = self.wake {
-                if ticket.token == reply.request {
-                    if error {
-                        Self::finish_wake_waiter(
-                            scheduler,
-                            processes,
-                            ticket,
-                            error_code.to_abi(),
-                            0,
-                        );
-                        self.wake = None;
-                    } else if matches!(ticket.phase, WakePhase::Requested) {
-                        ticket.phase = WakePhase::Armed;
-                        self.wake = Some(ticket);
-                    }
-                }
+            let Some(mut ticket) = self.wake else {
+                return;
+            };
+            if ticket.token != reply.request {
+                return;
+            }
+            if let Some(code) = error {
+                Self::finish_wake_waiter(scheduler, processes, ticket, code.to_abi(), 0);
+                self.wake = None;
+            } else if matches!(ticket.phase, WakePhase::Requested) {
+                ticket.phase = WakePhase::Armed;
+                self.wake = Some(ticket);
             }
         } else if matches!(
             command,
             sentinel_wire::CANCEL_WAKEUP | sentinel_wire::CANCEL_SLEEP
-        ) && !error
+        ) && error.is_none()
         {
             if let Some(ticket) = self.wake {
                 if ticket.token == self.argument {
@@ -319,6 +340,54 @@ impl SentinelClient {
                 }
             }
         }
+    }
+
+    /// Words copied to userspace for the three data-returning commands.
+    fn payload(&self, command: u32, reply: &sentinel_wire::Reply) -> [u32; 6] {
+        match command {
+            sentinel_wire::GET_STATUS => {
+                // Unstarted LP reports hz == 0; never divide by it.
+                let age_ms = (reply.age * 1000)
+                    .checked_div(u64::from(self.hz))
+                    .unwrap_or(0);
+                [
+                    reply.monitor & 3,
+                    age_ms as u32,
+                    (age_ms >> 32) as u32,
+                    self.hz,
+                    reply.beats,
+                    reply.monitor >> 2,
+                ]
+            }
+            sentinel_wire::LOG_META => [
+                self.epoch.unwrap_or(0),
+                reply.monitor,
+                reply.age as u32,
+                (reply.age >> 32) as u32,
+                reply.beats,
+                self.hz,
+            ],
+            sentinel_wire::LOG_READ => [
+                reply.result,
+                (reply.age as u32) >> 16,
+                reply.monitor,
+                (reply.age as u32) & 0xffff,
+                (reply.age >> 32) as u32,
+                reply.beats,
+            ],
+            _ => unreachable!(),
+        }
+    }
+
+    /// Complete the thread blocked on this request, if any.
+    fn complete_waiter(
+        &self,
+        command: u32,
+        reply: &sentinel_wire::Reply,
+        error: Option<Errno>,
+        scheduler: &mut Scheduler<arch::TrapFrame>,
+        processes: &Processes,
+    ) {
         let Some(i) = scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked
                 && matches!(t.wait, Wait::Sentinel { sequence, .. } if sequence == reply.request)
@@ -329,47 +398,17 @@ impl SentinelClient {
         let Wait::Sentinel { pointer, .. } = scheduler.task(thread).wait else {
             unreachable!()
         };
-        let result = if error {
-            error_code.to_abi()
+        let result = if let Some(code) = error {
+            code.to_abi()
         } else if pointer == 0 {
             reply.request
         } else {
-            let values = match command {
-                sentinel_wire::GET_STATUS => {
-                    let age_ms = reply.age * 1000 / u64::from(self.hz);
-                    [
-                        reply.monitor & 3,
-                        age_ms as u32,
-                        (age_ms >> 32) as u32,
-                        self.hz,
-                        reply.beats,
-                        reply.monitor >> 2,
-                    ]
-                }
-                sentinel_wire::LOG_META => [
-                    self.epoch.unwrap_or(0),
-                    reply.monitor,
-                    reply.age as u32,
-                    (reply.age >> 32) as u32,
-                    reply.beats,
-                    self.hz,
-                ],
-                sentinel_wire::LOG_READ => [
-                    reply.result,
-                    (reply.age as u32) >> 16,
-                    reply.monitor,
-                    (reply.age as u32) & 0xffff,
-                    (reply.age >> 32) as u32,
-                    reply.beats,
-                ],
-                _ => unreachable!(),
-            };
-            let process = scheduler.task(thread).process;
+            let values = self.payload(command, reply);
             if command == sentinel_wire::LOG_READ && values[0] != self.argument {
-                scheduler.task_mut(thread).context.registers[8] = Errno::Einval.to_abi();
-                scheduler.wake(thread);
+                scheduler.wake_with(thread, Errno::Einval.to_abi());
                 return;
             }
+            let process = scheduler.task(thread).process;
             let mut buffer = [0u8; sentinel_wire::LOG_BYTES];
             for (index, value) in values.into_iter().enumerate() {
                 buffer[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
@@ -379,12 +418,11 @@ impl SentinelClient {
                 Err(e) => e.to_abi(),
             }
         };
-        scheduler.task_mut(thread).context.registers[8] = result;
-        scheduler.task_mut(thread).context.registers[9] = if command == sentinel_wire::LOG_META {
+        let extra = if command == sentinel_wire::LOG_META {
             self.diagnostics
         } else {
             self.notifications
         };
-        scheduler.wake(thread);
+        scheduler.wake_with2(thread, result, extra);
     }
 }

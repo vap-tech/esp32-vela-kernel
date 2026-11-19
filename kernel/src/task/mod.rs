@@ -1,5 +1,12 @@
 use crate::id::{Handle, ProcSlot, ThreadSlot, Ticks, Tid};
 
+/// Architecture-owned saved CPU state: the only view the kernel crate has of
+/// the syscall return registers (a0, a1).
+pub trait Context: Copy {
+    fn set_return(&mut self, value: u32);
+    fn set_return2(&mut self, value: u32);
+}
+
 /// Half-open user mapping. No overflow or cross-region syscall buffers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Region {

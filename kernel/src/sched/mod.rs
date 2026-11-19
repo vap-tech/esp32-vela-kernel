@@ -2,7 +2,7 @@ use crate::{
     errno::Errno,
     id::{ProcSlot, ThreadSlot, Ticks, Tid},
     stats::{HZ, LoadAverage, Snapshot},
-    task::{Region, State, Thread, Wait},
+    task::{Context, Region, State, Thread, Wait},
 };
 
 pub const TASKS: usize = 8;
@@ -248,6 +248,20 @@ impl<C: Copy> Scheduler<C> {
             uptime_ticks: self.uptime.raw(),
             load_q16: self.load.values(),
         }
+    }
+}
+
+impl<C: Context> Scheduler<C> {
+    /// Store `a0` as the blocked task's syscall result, then make it runnable.
+    pub fn wake_with(&mut self, task: ThreadSlot, a0: u32) {
+        self.task_mut(task).context.set_return(a0);
+        self.wake(task);
+    }
+    /// Like [`Self::wake_with`] with a second result register.
+    pub fn wake_with2(&mut self, task: ThreadSlot, a0: u32, a1: u32) {
+        self.task_mut(task).context.set_return(a0);
+        self.task_mut(task).context.set_return2(a1);
+        self.wake(task);
     }
 }
 

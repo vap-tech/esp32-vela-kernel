@@ -2,7 +2,7 @@ use vela_kernel::{
     errno::Errno,
     id::{Pid, ProcSlot, Ticks},
     sentinel::{WakePhase, WakeTicket},
-    task::{State, Wait},
+    task::{Context, State, Wait},
 };
 
 use super::Args;
@@ -86,7 +86,7 @@ impl Runtime {
         }
         if let WakePhase::Fired(elapsed) = ticket.phase {
             self.sentinel.set_wake_ticket(None);
-            frame.registers[9] = elapsed;
+            frame.set_return2(elapsed);
             return Ok(ticket.token);
         }
         if self.scheduler.tasks.iter().any(|t| {
@@ -191,8 +191,7 @@ impl Runtime {
     }
 
     pub(super) fn sys_sentinel_status(&self, frame: &mut arch::TrapFrame) -> Result<u32, Errno> {
-        let (epoch, status) = self.sentinel.status();
-        frame.registers[9] = epoch;
-        status
+        frame.set_return2(self.sentinel.epoch_or_zero());
+        self.sentinel.link_status()
     }
 }

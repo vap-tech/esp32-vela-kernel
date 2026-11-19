@@ -1,5 +1,6 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
+    call::CallTable,
     capability::{self as cap, Capability, Object},
     errno::Errno,
     id::{Handle, Pid, ProcSlot, ThreadSlot},
@@ -7,12 +8,12 @@ use vela_kernel::{
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
-    task::{Region, State, Wait},
+    task::{Context, Region, State, Wait},
 };
 
 use crate::{
-    arch, calls::CallTable, display::DisplayControl, dma::DmaChannel, pmp,
-    sentinel::SentinelClient, soc, usermem::copy_to_user_within,
+    arch, display::DisplayControl, dma::DmaChannel, pmp, sentinel::SentinelClient, soc,
+    usermem::copy_to_user_within,
 };
 
 pub struct BootLogs {
@@ -134,9 +135,7 @@ impl Runtime {
                             } = self.scheduler.task(thread).wait
                             {
                                 if region.contains(pointer, capacity) {
-                                    self.scheduler.task_mut(thread).context.registers[8] =
-                                        Errno::Efault.to_abi();
-                                    self.scheduler.wake(thread);
+                                    self.scheduler.wake_with(thread, Errno::Efault.to_abi());
                                 }
                             }
                         }
@@ -186,7 +185,10 @@ impl Runtime {
                     Ok(Some(message)) => {
                         self.calls
                             .bind_reply(&mut self.scheduler, message.reply_token, thread);
-                        self.scheduler.task_mut(thread).context.registers[9] = message.reply_token;
+                        self.scheduler
+                            .task_mut(thread)
+                            .context
+                            .set_return2(message.reply_token);
                         match copy_to_user_within(
                             &self.processes.slot(task.process).memory,
                             pointer,
@@ -201,8 +203,7 @@ impl Runtime {
                 };
                 // Blocked ecall already advanced mepc and was saved. Update its
                 // own return register before making the task runnable.
-                self.scheduler.task_mut(thread).context.registers[8] = value;
-                self.scheduler.wake(thread);
+                self.scheduler.wake_with(thread, value);
                 if let Wait::Receive { .. } = task.wait {
                     self.scheduler.prefer(thread);
                 }
@@ -389,10 +390,10 @@ impl Runtime {
         }
         for i in 0..TASKS {
             let thread = ThreadSlot(i);
-            let t = self.scheduler.task_mut(thread);
+            let t = self.scheduler.task(thread);
             if t.process == process && t.state == State::Blocked && matches!(t.wait, Wait::Dma) {
-                t.context.registers[8] = if success { 0 } else { Errno::Eio.to_abi() };
-                self.scheduler.wake(thread);
+                let result = if success { 0 } else { Errno::Eio.to_abi() };
+                self.scheduler.wake_with(thread, result);
             }
         }
     }

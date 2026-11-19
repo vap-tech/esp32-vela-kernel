@@ -5,7 +5,7 @@ use vela_kernel::{
     id::{Handle, Pid, ProcSlot, ThreadSlot},
     ipc::{self, Message},
     sched::TASKS,
-    task::{State, Wait},
+    task::{Context, State, Wait},
 };
 
 use super::Args;
@@ -122,9 +122,8 @@ impl Runtime {
             capacity,
             &message.data[..length],
         )?;
-        self.scheduler.task_mut(client).context.registers[8] = args.a2;
         self.calls.deactivate(client);
-        self.scheduler.wake(client);
+        self.scheduler.wake_with(client, args.a2);
         self.scheduler.inherit();
         self.scheduler.prefer(client);
         *switch = self.scheduler.should_preempt();
@@ -268,7 +267,7 @@ impl Runtime {
                 let server = self.scheduler.current;
                 self.calls
                     .bind_reply(&mut self.scheduler, message.reply_token, server);
-                frame.registers[9] = message.reply_token;
+                frame.set_return2(message.reply_token);
                 copy_to_user_within(
                     self.memory(),
                     args.a1 as usize,

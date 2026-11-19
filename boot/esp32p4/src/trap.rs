@@ -1,7 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{
     id::{ThreadSlot, Ticks},
-    task::{State, Wait},
+    task::{Context, State, Wait},
 };
 
 use crate::{
@@ -82,7 +82,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         }
     } else if !interrupt && cause == 8 && !from_idle {
         frame.mepc = frame.mepc.wrapping_add(4);
-        frame.registers[8] = runtime.dispatch(frame, &mut switch);
+        let result = runtime.dispatch(frame, &mut switch);
+        frame.set_return(result);
     } else if !interrupt && !from_idle {
         let _ = writeln!(
             runtime.console,

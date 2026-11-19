@@ -19,7 +19,7 @@ mod syscall;
 mod users;
 
 mod boot;
-mod calls;
+mod context;
 mod dispatch;
 mod display;
 mod dma;
