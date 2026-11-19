@@ -290,12 +290,12 @@ LEDC channel 0 at 39.06 kHz with 62.5% duty, checked through duty readback.
 `display orbit` renders the 64×64 asset derived from `orbit.svg` into a
 64-row RGB565 band centered on the 720×1280 display. Each frame uses three
 DW-GDMA spans for black, the band and black again. The black spans repeatedly
-read one 64-bit zero word. The driver keeps four frames of descriptors and
+read a 256-byte zero source block with 16-item source bursts. The driver keeps four frames of descriptors and
 rearms consumed entries from the existing 100 Hz timer.
 
-The image band occupies 92160 bytes, the zero word 8 bytes and twelve DMA
-descriptors 768 bytes. With 56 bytes of alignment padding, the display
-section occupies 92992 bytes within a 96 KiB linker reservation. This uses
+The image band occupies 92160 bytes, the zero block 256 bytes and twelve DMA
+descriptors 768 bytes. The display
+section occupies 93184 bytes within a 96 KiB linker reservation. This uses
 internal SRAM. The coverage asset occupies another 4096 bytes in the firmware.
 The raster is prepared once when the command starts.
 
@@ -312,9 +312,9 @@ and keep the reservation below the boot stack at 0x4ff26000.
 ### Minimal pixel scanout
 
 `display pixel` initializes ST7121 and enables one white RGB565 pixel at
-(360, 640) on a black 720×1280 image. The DMA source uses two 64-bit words
-and twelve 64-byte descriptors (784 bytes actively used). The shared
-92992-byte display section also serves Orbit.
+(360, 640) on a black 720×1280 image. The DMA source uses a 256-byte zero block, one 64-bit pixel word
+and twelve 64-byte descriptors (1032 bytes actively used). The shared
+93184-byte display section also serves Orbit.
 No additional pixel buffer is allocated.
 
 Display initialization selects the fixed rev1.x CPU/MEM/SYS 180 MHz, APB
@@ -336,3 +336,10 @@ Hardware log is `target/display-pixel-smoke.log`.
 Tab5 Orbit smoke passed 40 frames without recurring FIFO underrun at DPI
 80 MHz and CPU/MEM 180 MHz. Shell, procfs and Sentinel remained operational.
 Hardware log is `target/display-orbit-smoke.log`.
+
+
+The centered Orbit image and the black background were visually confirmed
+on Tab5. An initial single-word black source produced vertical artifacts
+outside the image band despite a clear underrun latch. A 256-byte zero
+source and 16-item source bursts removed those artifacts. Pixel and Orbit
+share the same zero source.

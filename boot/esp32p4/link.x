@@ -10,7 +10,7 @@ MEMORY {
 SECTIONS {
  .display (NOLOAD) : ALIGN(64) {
   _orbit_lli = .; . += 4 * 3 * 64;
-  _orbit_black = .; . += 8;
+  _orbit_black = .; . += 256;
   . = ALIGN(64);
   _orbit_band = .; . += 720 * 64 * 2;
  } > DISPLAY

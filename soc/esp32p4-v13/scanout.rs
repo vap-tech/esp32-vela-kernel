@@ -1,5 +1,5 @@
 //! RGB565 scanout on the dedicated DesignWare AXI DMA channel 0.
-//! HP0 owns a four-frame ring. Each frame has a fixed black source, an
+//! HP0 owns a four-frame ring. Each frame has a reusable black source block, an
 //! incrementing image span, and the fixed black source again.
 //! Orbit stores a 64-row RGB565 band. Pixel mode uses a single source word.
 //! All CPU accesses use the direct SRAM alias.
@@ -94,7 +94,9 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
     let black = core::ptr::addr_of!(_orbit_black) as usize;
     let band = core::ptr::addr_of!(_orbit_band) as usize;
     let band_bytes = if pixel_only { 8 } else { WIDTH * ICON * 2 };
-    for off in (0..8).step_by(4) {
+    // Cover the source burst footprint. An eight-byte source exposed nearby
+    // image data as vertical stripes on rev1.3 despite a clear underrun latch.
+    for off in (0..256).step_by(4) {
         put(DIRECT + black + off, 0);
     }
     for off in (0..band_bytes).step_by(4) {
@@ -142,7 +144,12 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
 
         put(
             DIRECT + desc + 32,
-            1 | (u32::from(fixed) << 4) | (1 << 6) | (3 << 8) | (3 << 11) | (8 << 14) | (7 << 18),
+            1 | (u32::from(fixed) << 4)
+                | (1 << 6)
+                | (3 << 8)
+                | (3 << 11)
+                | ((if fixed { 3 } else { 8 }) << 14)
+                | (7 << 18),
         );
     }
     put(0x500e6014, reg(0x500e6014) | (1 << 13));
