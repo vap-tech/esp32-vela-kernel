@@ -13,7 +13,6 @@ mod pmp;
 mod sentinel_wire;
 #[path = "../../../soc/esp32p4-v13/mod.rs"]
 mod soc;
-#[allow(dead_code)]
 #[path = "../../../abi/syscall.rs"]
 mod syscall;
 #[path = "../../../userspace/services.rs"]

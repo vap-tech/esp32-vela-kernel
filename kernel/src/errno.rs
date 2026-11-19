@@ -35,15 +35,65 @@ impl Errno {
 mod tests {
     use super::Errno;
 
+    /// Exhaustive on purpose: adding a variant without pinning its ABI value
+    /// here is a compile error.
+    fn linux_value(e: Errno) -> i32 {
+        match e {
+            Errno::Eperm => 1,
+            Errno::Enoent => 2,
+            Errno::Eio => 5,
+            Errno::Enoexec => 8,
+            Errno::Ebadf => 9,
+            Errno::Eagain => 11,
+            Errno::Enomem => 12,
+            Errno::Efault => 14,
+            Errno::Ebusy => 16,
+            Errno::Einval => 22,
+            Errno::Enospc => 28,
+            Errno::Epipe => 32,
+            Errno::Edeadlk => 35,
+            Errno::Enosys => 38,
+            Errno::Eoverflow => 75,
+            Errno::Emsgsize => 90,
+            Errno::Etimedout => 110,
+            Errno::Ealready => 114,
+            Errno::Ecanceled => 125,
+        }
+    }
+
+    const ALL: [Errno; 19] = [
+        Errno::Eperm,
+        Errno::Enoent,
+        Errno::Eio,
+        Errno::Enoexec,
+        Errno::Ebadf,
+        Errno::Eagain,
+        Errno::Enomem,
+        Errno::Efault,
+        Errno::Ebusy,
+        Errno::Einval,
+        Errno::Enospc,
+        Errno::Epipe,
+        Errno::Edeadlk,
+        Errno::Enosys,
+        Errno::Eoverflow,
+        Errno::Emsgsize,
+        Errno::Etimedout,
+        Errno::Ealready,
+        Errno::Ecanceled,
+    ];
+
     #[test]
-    fn abi_encoding_is_two_complement_negative_errno() {
-        assert_eq!(Errno::Eperm.to_abi(), (-1i32) as u32);
-        assert_eq!(Errno::Ebadf.to_abi(), (-9i32) as u32);
-        assert_eq!(Errno::Eagain.to_abi(), (-11i32) as u32);
-        assert_eq!(Errno::Efault.to_abi(), (-14i32) as u32);
-        assert_eq!(Errno::Einval.to_abi(), (-22i32) as u32);
-        assert_eq!(Errno::Enosys.to_abi(), (-38i32) as u32);
-        assert_eq!(Errno::Etimedout.to_abi(), (-110i32) as u32);
-        assert_eq!(Errno::Ecanceled.to_abi(), (-125i32) as u32);
+    fn abi_values_match_linux_errno_and_are_distinct_negatives() {
+        for (i, e) in ALL.into_iter().enumerate() {
+            let v = linux_value(e);
+            assert_eq!(e as i32, v);
+            assert_eq!(e.to_abi(), (-v) as u32);
+            // Userspace treats any `(result as i32) < 0` as an error.
+            assert!((e.to_abi() as i32) < 0, "{e:?} must decode as negative");
+            for other in &ALL[..i] {
+                assert_ne!(e.to_abi(), other.to_abi());
+            }
+        }
     }
 }
