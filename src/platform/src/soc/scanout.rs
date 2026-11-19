@@ -59,9 +59,22 @@ impl fmt::Display for Snapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamTelemetry {
+    pub mode: u8,
+    pub running: bool,
+    pub frames: u32,
+    pub underruns: u32,
+    pub dma_errors: u32,
+    pub fifo_level: u32,
+}
+
 pub struct Scanout {
+    mode: u8,
     blocks: u32,
     frames: u32,
+    underruns: u32,
+    dma_errors: u32,
     running: bool,
 }
 
@@ -81,9 +94,32 @@ fn descriptors() -> usize {
 impl Scanout {
     pub const fn new() -> Self {
         Self {
+            mode: 0,
             blocks: PER_FRAME as u32,
             frames: 0,
+            underruns: 0,
+            dma_errors: 0,
             running: false,
+        }
+    }
+
+    /// Read live scanout counters and (while active) DSI bridge FIFO occupancy.
+    ///
+    /// # Safety
+    /// Exclusive ownership of DSI bridge registers under masked IRQs.
+    pub unsafe fn telemetry(&self) -> StreamTelemetry {
+        let fifo_level = if self.running {
+            unsafe { reg(BRIDGE + 0x14) & 0x3fff }
+        } else {
+            0
+        };
+        StreamTelemetry {
+            mode: self.mode,
+            running: self.running,
+            frames: self.frames,
+            underruns: self.underruns,
+            dma_errors: self.dma_errors,
+            fifo_level,
         }
     }
 
@@ -110,6 +146,17 @@ impl Scanout {
                     }
                 }
             }
+            if self.frames > 0 {
+                if reg(BRIDGE + 0x58) & 1 != 0 {
+                    self.underruns = self.underruns.saturating_add(1);
+                    put(BRIDGE + 0x54, 1);
+                }
+                let err = reg(DMA + 0x188) & ERRORS;
+                if err != 0 {
+                    self.dma_errors = self.dma_errors.saturating_add(1);
+                    put(DMA + 0x198, err);
+                }
+            }
             barrier();
         }
     }
@@ -134,7 +181,12 @@ impl Scanout {
     /// # Safety
     /// Exclusive ownership of DSI bridge registers under masked IRQs.
     pub unsafe fn clear_underrun(&mut self) {
-        unsafe { put(BRIDGE + 0x54, 1) };
+        self.underruns = 0;
+        self.dma_errors = 0;
+        unsafe {
+            put(BRIDGE + 0x54, 1);
+            put(DMA + 0x198, ERRORS);
+        }
     }
 
     /// # Safety
@@ -159,7 +211,7 @@ impl Scanout {
                 clk: [reg(0x500e6004), reg(0x500e6008), reg(0x500e600c)],
                 lp: reg(0x50111040),
                 frames: self.frames,
-                underrun: self.underrun(),
+                underrun: self.underruns != 0 || self.underrun(),
             }
         }
     }
@@ -259,7 +311,10 @@ impl Scanout {
             put(DMA + 0x198, u32::MAX);
             put(DMA + 0x180, FRAME_DONE | ERRORS);
             put(DMA + 0x190, 0);
+            self.mode = mode;
             self.frames = 0;
+            self.underruns = 0;
+            self.dma_errors = 0;
             self.running = true;
             put(BRIDGE + 0x30, 1280 << 16 | 1524);
             put(BRIDGE + 0x34, 20 << 16 | 24);

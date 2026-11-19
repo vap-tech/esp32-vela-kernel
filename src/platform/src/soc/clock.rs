@@ -76,3 +76,25 @@ pub unsafe fn display_speed() -> Result<(), ()> {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RatesMhz {
+    pub cpu: u32,
+    pub apb: u32,
+}
+
+/// Read the active HP root/CPU and APB clock rates from `HP_SYS_CLKRST`.
+///
+/// # Safety
+/// Mapped `HP_SYS_CLKRST` readback under masked IRQs on HP0.
+pub unsafe fn rates_mhz() -> RatesMhz {
+    unsafe {
+        let root_sel = (get(CLK + 4) >> 5) & 3;
+        let root_mhz = if root_sel == 1 { 180 } else { 40 };
+        let cpu_div = (get(CLK + 8) & 0xff) + 1;
+        let cpu = (root_mhz / cpu_div).max(1);
+        let apb_div = ((get(CLK + 0xc) >> 16) & 0xff) + 1;
+        let apb = (cpu / apb_div).max(1);
+        RatesMhz { cpu, apb }
+    }
+}

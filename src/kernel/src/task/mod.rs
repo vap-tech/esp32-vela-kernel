@@ -76,5 +76,24 @@ pub struct Thread<C: Copy> {
     pub affinity: u8,
     pub stack: Region,
     pub runtime_ticks: u64,
+    pub user_cycles: u64,
     pub preemptions: u64,
+}
+
+impl<C: Copy> Thread<C> {
+    /// Compact ABI state code: 0=term, 1=run, 2=ready, 3=sleep, 4=recv, 5=reply, 6=event, 7=dev.
+    pub const fn state_code(&self) -> u8 {
+        match self.state {
+            State::Terminated => 0,
+            State::Running => 1,
+            State::Ready => 2,
+            State::Blocked => match self.wait {
+                Wait::Sleep => 3,
+                Wait::Receive { .. } => 4,
+                Wait::Reply { .. } => 5,
+                Wait::Event { .. } => 6,
+                Wait::Device { .. } | Wait::None => 7,
+            },
+        }
+    }
 }

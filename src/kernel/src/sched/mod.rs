@@ -51,6 +51,7 @@ impl<C: Copy> Scheduler<C> {
             affinity: 1,
             stack: stacks[i.min(BOOT_THREADS - 1)],
             runtime_ticks: 0,
+            user_cycles: 0,
             preemptions: 0,
         });
         Self {
@@ -78,6 +79,7 @@ impl<C: Copy> Scheduler<C> {
             affinity: 1,
             stack: Region { base: 0, size: 0 },
             runtime_ticks: 0,
+            user_cycles: 0,
             preemptions: 0,
         }; TASKS];
         Self {
@@ -136,6 +138,7 @@ impl<C: Copy> Scheduler<C> {
             deadline: None,
             state: State::Ready,
             runtime_ticks: 0,
+            user_cycles: 0,
             preemptions: 0,
         };
         self.last_id = id;

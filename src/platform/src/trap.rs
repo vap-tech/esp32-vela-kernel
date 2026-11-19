@@ -12,6 +12,7 @@ use crate::{
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
+    let entry_cycles = arch::mcycle();
     let interrupt = frame.mcause >> 31 != 0;
     let cause = frame.mcause & 0xfff;
     let from_idle = frame.mstatus & (3 << 11) != 0;
@@ -35,15 +36,27 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     if from_idle && !runtime.in_idle {
         fatal(frame);
     }
+    let user_delta = runtime.cycles.on_trap_entry(entry_cycles, from_idle);
+    if !from_idle {
+        let cur = runtime.scheduler.current;
+        let updated = runtime
+            .scheduler
+            .task(cur)
+            .user_cycles
+            .saturating_add(user_delta);
+        runtime.scheduler.task_mut(cur).user_cycles = updated;
+    }
     let mut switch = false;
     if interrupt && cause == 17 {
         // SAFETY: sole timer owner under masked IRQs. Only bounded O(TASKS)
         // wakeup/accounting, no USB polling or console formatting in timer ISR.
-        unsafe {
+        let raw_16m = unsafe {
             soc::timer::acknowledge();
-        }
-        let uptime =
-            Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER snapshot timeout"));
+            soc::timer::counter_16mhz().expect("SYSTIMER snapshot timeout")
+        };
+        let live_tick = runtime.scheduler.snapshot().scheduler_ticks > 0;
+        runtime.cycles.on_timer_irq(raw_16m, 160_000, live_tick);
+        let uptime = Ticks(raw_16m / 160_000);
         if runtime.dma.timed_out(uptime) {
             unsafe {
                 soc::dma::finish(runtime.dma.length());
@@ -55,6 +68,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         runtime.scheduler.tick(uptime, &mut runtime.calls);
         switch = true;
     } else if interrupt && cause == soc::sentinel::LINE {
+        runtime.sentinel_interrupts += 1;
         if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel.epoch()) } {
             runtime
                 .sentinel
@@ -62,6 +76,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         }
         switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::dma::LINE {
+        runtime.dma_interrupts += 1;
         let ok = unsafe { soc::dma::finish(runtime.dma.length()) };
         runtime.complete_dma(ok);
         switch = from_idle || runtime.scheduler.should_preempt();
@@ -111,6 +126,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             runtime.logs.idle = true;
             let _ = writeln!(runtime.console, "[idle] wfi (no runnable tasks)");
         }
+        runtime.cycles.on_trap_exit(arch::mcycle());
         return &runtime.idle_frame;
     }
     runtime.in_idle = false;
@@ -134,7 +150,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         }
         runtime.active_space = Some((process, memory.revision));
     }
-    &task.context
+    runtime.cycles.on_trap_exit(arch::mcycle());
+    &runtime.scheduler.task(current_thread).context
 }
 
 fn fatal(frame: &arch::TrapFrame) -> ! {

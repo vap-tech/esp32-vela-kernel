@@ -33,6 +33,11 @@ impl DisplayControl {
         }
     }
 
+    pub fn telemetry(&self) -> soc::scanout::StreamTelemetry {
+        // SAFETY: DisplayControl owns DSI bridge registers under MIE=0.
+        unsafe { self.scanout.telemetry() }
+    }
+
     pub fn step(&mut self, arg: u32) -> (Option<board::Diagnostic>, Result<u32, Errno>) {
         if matches!(arg, 1..=5) {
             // SAFETY: DisplayControl owns DW-GDMA CH0 and DSI bridge under MIE=0.

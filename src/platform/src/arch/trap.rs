@@ -56,3 +56,38 @@ pub fn halt() -> ! {
     }
 }
 const _: () = assert!(core::mem::size_of::<TrapFrame>() == 144);
+
+/// Enable `mcycle` (`mcountinhibit.CY = 0`) and permit unprivileged `rdcycle`/`rdcycleh`
+/// reads (`mcounteren.CY = 1`) on HP0.
+///
+/// # Safety
+/// Must be called in M-mode on the active HP hart.
+pub unsafe fn init_counters() {
+    unsafe {
+        core::arch::asm!("csrci 0x320, 1", "csrsi 0x306, 1", options(nomem, nostack));
+    }
+}
+
+/// Read the 64-bit hardware `mcycle` counter without high/low word tearing on RV32.
+pub fn mcycle() -> u64 {
+    // SAFETY: side-effect-free M-mode CSR reads.
+    unsafe {
+        loop {
+            let hi1: u32;
+            let lo: u32;
+            let hi2: u32;
+            core::arch::asm!(
+                "csrr {0}, mcycleh",
+                "csrr {1}, mcycle",
+                "csrr {2}, mcycleh",
+                out(reg) hi1,
+                out(reg) lo,
+                out(reg) hi2,
+                options(nomem, nostack)
+            );
+            if hi1 == hi2 {
+                return (u64::from(hi1) << 32) | u64::from(lo);
+            }
+        }
+    }
+}

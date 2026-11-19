@@ -8,6 +8,7 @@ use vela_kernel::{
     memory::RegionAllocator,
     process::{PROCESSES, Processes},
     sched::Scheduler,
+    stats::CycleAccounting,
 };
 
 use crate::{
@@ -35,6 +36,7 @@ extern "C" fn rust_main() -> ! {
     // SAFETY: M-mode startup owns scratch and console, IRQs masked.
     unsafe {
         core::arch::asm!("csrw mscratch, zero", options(nostack));
+        arch::init_counters();
     }
     let mut console = unsafe { soc::console::Console::new() };
     assert_eq!(arch::hart_id(), 0);
@@ -72,6 +74,9 @@ extern "C" fn rust_main() -> ! {
             sentinel: SentinelClient::new(),
             display: DisplayControl::new(),
             usb_rx_interrupts: 0,
+            dma_interrupts: 0,
+            sentinel_interrupts: 0,
+            cycles: CycleAccounting::new(),
             logs: BootLogs::EMPTY,
         })
     };
@@ -183,6 +188,9 @@ extern "C" fn rust_main() -> ! {
         if let Some(boot) = soc::sentinel::start() {
             runtime.sentinel.set_boot_info(boot.epoch, boot.hz);
         }
+        let rates = soc::clock::rates_mhz();
+        let now_16m = soc::timer::counter_16mhz().expect("SYSTIMER boot snapshot");
+        runtime.cycles.start(arch::mcycle(), now_16m, rates.cpu);
         let initial_ctx = &raw const runtime.scheduler.tasks[0].context;
         arch::enter(initial_ctx);
     }

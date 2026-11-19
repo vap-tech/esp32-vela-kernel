@@ -9,6 +9,7 @@ use vela_kernel::{
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Process, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
+    stats::CycleAccounting,
     task::{Region, State, Wait},
 };
 
@@ -54,6 +55,9 @@ pub struct Runtime {
     pub sentinel: SentinelClient,
     pub display: DisplayControl,
     pub usb_rx_interrupts: u64,
+    pub dma_interrupts: u64,
+    pub sentinel_interrupts: u64,
+    pub cycles: CycleAccounting,
     pub logs: BootLogs,
 }
 

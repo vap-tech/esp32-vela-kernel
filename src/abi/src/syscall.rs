@@ -5,9 +5,19 @@ pub const WRITE: u32 = 1; // a0=readable user buffer, a1=len (<=128 bytes)
 pub const YIELD: u32 = 2;
 pub const EXIT: u32 = 3;
 pub const TICKS: u32 = 4; // low 32 bits of 100Hz uptime; wraps after ~497 days
-pub const STATS: u32 = 5; // a0=writable user buffer, a1=STATS_BYTES or STATS_IRQ_BYTES
+pub const STATS: u32 = 5; // a0=writable user buffer, a1=byte len, a2=STATS_* selector
+pub const STATS_SUMMARY: u32 = 0; // legacy summary (+ optional USB RX count)
 pub const STATS_BYTES: usize = 44; // 4*u32, 2*u64, 3*u32, little-endian
 pub const STATS_IRQ_BYTES: usize = STATS_BYTES + 8; // optional USB RX IRQ count at byte 44
+pub const STATS_CPU: u32 = 1; // hart, clocks, mcycle breakdown, capacity, IRQ latency
+pub const STATS_CPU_BYTES: usize = 56;
+pub const STATS_IRQ: u32 = 2; // u64 counts: systimer0, usb_rx, gdma_ahb_ch1, lp_sentinel
+pub const STATS_IRQ_ALL_BYTES: usize = 32;
+pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
+pub const STATS_STREAMS_BYTES: usize = 36;
+pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
+pub const STATS_TASK_WORDS: usize = 9;
+pub const STATS_TASKS_BYTES: usize = 8 * STATS_TASK_WORDS * 4;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EINVAL: u32 = (-22i32) as u32;

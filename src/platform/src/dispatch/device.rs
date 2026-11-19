@@ -33,7 +33,17 @@ impl Runtime {
             Authority::Display,
             cap::CONTROL,
         )?;
+        let before_rates = unsafe { soc::clock::rates_mhz() };
+        if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
+            self.cycles.sync_clock(now_16m, before_rates.cpu);
+        }
         let (diag, result) = self.display.step(args.a1);
+        let after_rates = unsafe { soc::clock::rates_mhz() };
+        if after_rates.cpu != before_rates.cpu {
+            if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
+                self.cycles.sync_clock(now_16m, after_rates.cpu);
+            }
+        }
         if let Some(diag) = diag {
             use core::fmt::Write;
             let _ = write!(self.console, "{diag}");

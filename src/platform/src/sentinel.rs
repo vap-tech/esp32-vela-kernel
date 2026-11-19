@@ -45,6 +45,10 @@ impl SentinelClient {
         self.epoch
     }
 
+    pub const fn hz(&self) -> u32 {
+        self.hz
+    }
+
     pub const fn is_offline(&self) -> bool {
         self.link.is_offline()
     }
