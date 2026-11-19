@@ -30,7 +30,11 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `help` | List shell commands. |
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
-| `cat /proc/interrupts` | Read 64-bit SYSTIMER and USB Serial/JTAG RX interrupt counts on hart0. |
+| `cat /proc/interrupts` | Read 64-bit hart0 interrupt counts (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`). |
+| `cat /proc/cpuinfo` | Read live hart0/APB/LP clocks, frequency-aware `mcycle` utilization (`user`/`kernel`/`idle`/`capacity`) and measured SYSTIMER IRQ latency. |
+| `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, ticks, measured `user_cycles`, preemptions and stack size. |
+| `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
+| `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
 | `display diag` | Show the full-screen diagnostic image from PSRAM, in keyboard-down landscape. |
 | `display boot` | Show the Vela boot artwork from the same PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |

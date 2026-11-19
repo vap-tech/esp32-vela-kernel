@@ -89,12 +89,16 @@ pub struct RatesMhz {
 /// Mapped `HP_SYS_CLKRST` readback under masked IRQs on HP0.
 pub unsafe fn rates_mhz() -> RatesMhz {
     unsafe {
-        let root_sel = (get(CLK + 4) >> 5) & 3;
-        let root_mhz = if root_sel == 1 { 180 } else { 40 };
-        let cpu_div = (get(CLK + 8) & 0xff) + 1;
-        let cpu = (root_mhz / cpu_div).max(1);
+        let src_sel = get(0x50111040) & 3;
+        let src_mhz = if src_sel == 1 { 360 } else { 40 };
+        let cpu_div = ((get(CLK + 4) >> 5) & 0xff) + 1;
+        let mem_div = (get(CLK + 8) & 0xff) + 1;
+        let sys_div = (get(CLK + 0xc) & 0xff) + 1;
         let apb_div = ((get(CLK + 0xc) >> 16) & 0xff) + 1;
-        let apb = (cpu / apb_div).max(1);
+        let cpu = (src_mhz / cpu_div).max(1);
+        let mem = (cpu / mem_div).max(1);
+        let sys = (mem / sys_div).max(1);
+        let apb = (sys / apb_div).max(1);
         RatesMhz { cpu, apb }
     }
 }

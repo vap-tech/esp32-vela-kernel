@@ -2,7 +2,7 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, arena::Arena, sys};
+use vela_user::{Buffer, TextBuf, arena::Arena, sys, word_le};
 
 vela_user::entry!(main);
 
@@ -17,27 +17,171 @@ struct Caps {
 }
 
 fn read_file(path: &[u8], request_handle: u32) {
-    let mut request = Buffer::new();
-    request.push(1);
-    request.append(path);
-    let mut response = Buffer::new();
-    let result = sys::call6(
-        abi::IPC_CALL,
-        request_handle,
-        request.ptr() as u32,
-        request.len() as u32,
-        response.mut_ptr() as u32,
-        abi::IPC_BYTES as u32,
-        100,
+    let mut out = TextBuf::<512>::new();
+    let mut offset = 0u16;
+    for _ in 0..16 {
+        let mut request = Buffer::new();
+        request.push(2);
+        request.push(offset as u8);
+        request.push((offset >> 8) as u8);
+        request.append(path);
+        let mut response = Buffer::new();
+        let result = sys::call6(
+            abi::IPC_CALL,
+            request_handle,
+            request.ptr() as u32,
+            request.len() as u32,
+            response.mut_ptr() as u32,
+            abi::IPC_BYTES as u32,
+            100,
+        )
+        .0;
+        if result < 2 || result > abi::IPC_BYTES as u32 {
+            sys::write(FAILED);
+            return;
+        }
+        response.set_len(result as usize);
+        let status = response.get(0);
+        let more = response.get(1);
+        let payload = &response.as_slice()[2..];
+        // Error replies carry userspace diagnostics, never fabricated file data.
+        out.append(payload);
+        if status != 0 || more == 0 || payload.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(payload.len() as u16);
+    }
+    sys::write(out.as_slice());
+}
+
+extern "C" fn yield_worker(iters: u32) -> ! {
+    for _ in 0..iters {
+        sys::call(abi::YIELD, 0, 0, 0, 0);
+    }
+    sys::exit();
+}
+
+fn bench_syscall() -> u32 {
+    sys::sleep();
+    let start = sys::rdcycle64();
+    for _ in 0..64 {
+        core::hint::black_box(sys::call(abi::TICKS, 0, 0, 0, 0));
+    }
+    let elapsed = sys::rdcycle64().wrapping_sub(start);
+    ((elapsed + 32) >> 6) as u32
+}
+
+fn bench_ctx_switch() -> Option<u32> {
+    let (base, size) = sys::call6(abi::MEM_ALLOC, 4096, 0, 0, 0, 0, 0);
+    if (base as i32) < 0 || size < 4096 {
+        return None;
+    }
+    sys::sleep();
+    let tid = sys::call6(
+        abi::THREAD_CREATE,
+        yield_worker as *const () as usize as u32,
+        base,
+        size,
+        64,
+        1,
+        1,
     )
     .0;
-    if result == 0 || result > abi::IPC_BYTES as u32 {
+    if (tid as i32) <= 0 {
+        let _ = sys::call(abi::MEM_FREE, base, size, 0, 0);
+        return None;
+    }
+    let start = sys::rdcycle64();
+    for _ in 0..64 {
+        sys::call(abi::YIELD, 0, 0, 0, 0);
+    }
+    let elapsed = sys::rdcycle64().wrapping_sub(start);
+    for _ in 0..4 {
+        sys::call(abi::YIELD, 0, 0, 0, 0);
+        if sys::call(abi::MEM_FREE, base, size, 0, 0) == 0 {
+            return Some(((elapsed + 64) >> 7) as u32);
+        }
+    }
+    None
+}
+
+fn bench_ipc_rtt(request_handle: u32) -> Option<u32> {
+    let req = [0u8];
+    let mut resp = [0u8; 4];
+    sys::sleep();
+    let start = sys::rdcycle64();
+    for _ in 0..64 {
+        let rc = sys::call6(
+            abi::IPC_CALL,
+            request_handle,
+            req.as_ptr() as u32,
+            1,
+            resp.as_mut_ptr() as u32,
+            resp.len() as u32,
+            100,
+        )
+        .0;
+        if rc != 1 || resp[0] != 0 {
+            return None;
+        }
+    }
+    let elapsed = sys::rdcycle64().wrapping_sub(start);
+    Some(((elapsed + 32) >> 6) as u32)
+}
+
+fn run_bench(request_handle: u32) {
+    let syscall_c = bench_syscall();
+    let Some(switch_c) = bench_ctx_switch() else {
+        sys::write(FAILED);
+        return;
+    };
+    let Some(ipc_c) = bench_ipc_rtt(request_handle) else {
+        sys::write(FAILED);
+        return;
+    };
+    let mut cpu = [0u8; abi::STATS_CPU_BYTES];
+    if sys::call(
+        abi::STATS,
+        cpu.as_mut_ptr() as u32,
+        abi::STATS_CPU_BYTES as u32,
+        abi::STATS_CPU,
+        0,
+    ) != 0
+    {
         sys::write(FAILED);
         return;
     }
-    response.set_len(result as usize);
-    // Error replies carry userspace diagnostics, never fabricated file data.
-    sys::write(&response.as_slice()[1..]);
+    let cpu_mhz = word_le(&cpu, 4);
+    let lat_last_16m = word_le(&cpu, 48);
+    let lat_max_16m = word_le(&cpu, 52);
+    let lat_last_ns = ((u64::from(lat_last_16m) * 125 + 1) >> 1) as u32;
+    let lat_max_ns = ((u64::from(lat_max_16m) * 125 + 1) >> 1) as u32;
+    let lat_last_c = ((u64::from(lat_last_16m) * u64::from(cpu_mhz) + 8) >> 4) as u32;
+    let lat_max_c = ((u64::from(lat_max_16m) * u64::from(cpu_mhz) + 8) >> 4) as u32;
+
+    let mut out = Buffer::new();
+    out.append(b"bench cpu_mhz=");
+    out.decimal(cpu_mhz);
+    out.append(b" syscall=");
+    out.decimal(syscall_c);
+    out.append(b"c ctx_switch=");
+    out.decimal(switch_c);
+    out.append(b"c ipc_rtt=");
+    out.decimal(ipc_c);
+    out.append(b"c\n");
+    sys::write(out.as_slice());
+
+    out.clear();
+    out.append(b"irq_latency last=");
+    out.decimal(lat_last_ns);
+    out.append(b"ns(");
+    out.decimal(lat_last_c);
+    out.append(b"c) max=");
+    out.decimal(lat_max_ns);
+    out.append(b"ns(");
+    out.decimal(lat_max_c);
+    out.append(b"c)\n");
+    sys::write(out.as_slice());
 }
 
 fn arena_probe() -> bool {
@@ -254,7 +398,7 @@ fn command(line: &Buffer, caps: Caps) {
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
+                b"help | cat <path> | uptime | bench | run hello/pic/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
             );
             sys::write(
                 b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot\n",
@@ -399,6 +543,7 @@ fn command(line: &Buffer, caps: Caps) {
                 sys::write(b"arena: FAIL\n");
             }
         }
+        b"bench" => run_bench(caps.request),
         b"uptime" => read_file(b"/proc/uptime", caps.request),
         _ if text.len() > 4 && text.starts_with(b"cat ") => {
             read_file(&text[4..], caps.request);

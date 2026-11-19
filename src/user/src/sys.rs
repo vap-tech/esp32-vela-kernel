@@ -76,3 +76,27 @@ macro_rules! entry {
         }
     };
 }
+
+#[inline(always)]
+pub fn rdcycle64() -> u64 {
+    // SAFETY: U-mode read-only shadow CSRs `cycle`/`cycleh` enabled via `mcounteren.CY = 1`.
+    unsafe {
+        loop {
+            let hi1: u32;
+            let lo: u32;
+            let hi2: u32;
+            core::arch::asm!(
+                "rdcycleh {0}",
+                "rdcycle {1}",
+                "rdcycleh {2}",
+                out(reg) hi1,
+                out(reg) lo,
+                out(reg) hi2,
+                options(nomem, nostack)
+            );
+            if hi1 == hi2 {
+                return (u64::from(hi1) << 32) | u64::from(lo);
+            }
+        }
+    }
+}

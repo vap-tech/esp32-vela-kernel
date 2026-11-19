@@ -214,3 +214,90 @@ pub fn div64(low: u32, high: u32, divisor: u32) -> (u32, u32, u32) {
     }
     (qlow, qhigh, remainder)
 }
+
+pub fn word_le(bytes: &[u8], offset: usize) -> u32 {
+    let b = |i: usize| bytes.get(offset + i).copied().unwrap_or(0);
+    u32::from(b(0)) | (u32::from(b(1)) << 8) | (u32::from(b(2)) << 16) | (u32::from(b(3)) << 24)
+}
+
+pub fn dword_le(bytes: &[u8], offset: usize) -> (u32, u32) {
+    (word_le(bytes, offset), word_le(bytes, offset + 4))
+}
+
+pub struct TextBuf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> TextBuf<N> {
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    pub fn push(&mut self, byte: u8) {
+        if self.len < N {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    pub fn append(&mut self, slice: &[u8]) {
+        for &b in slice {
+            self.push(b);
+        }
+    }
+
+    pub fn decimal(&mut self, mut number: u32) {
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (number % 10) as u8;
+            count += 1;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            self.push(digits[count]);
+        }
+    }
+
+    pub fn hundredths(&mut self, number: u32) {
+        self.decimal(number / 100);
+        self.push(b'.');
+        self.push(b'0' + ((number / 10) % 10) as u8);
+        self.push(b'0' + (number % 10) as u8);
+    }
+
+    pub fn decimal64(&mut self, mut low: u32, mut high: u32) {
+        let mut digits = [0u8; 20];
+        let mut count = 0;
+        loop {
+            let (next_low, next_high, remainder) = div64(low, high, 10);
+            digits[count] = b'0' + remainder as u8;
+            count += 1;
+            low = next_low;
+            high = next_high;
+            if low == 0 && high == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            self.push(digits[count]);
+        }
+    }
+}

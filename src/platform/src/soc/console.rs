@@ -53,8 +53,12 @@ impl Console {
     }
 
     fn flush(&mut self) {
-        // SAFETY: exclusive config register ownership.
-        unsafe { crate::pac::write(CONFIG, 1) };
+        // SAFETY: exclusive config register ownership; serialize FIFO writes before WR_DONE.
+        unsafe {
+            core::arch::asm!("fence iorw, iorw", options(nostack));
+            crate::pac::write(CONFIG, 1);
+            core::arch::asm!("fence iorw, iorw", options(nostack));
+        }
     }
 
     /// Read one host byte if available; never blocks.
