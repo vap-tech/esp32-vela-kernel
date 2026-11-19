@@ -22,6 +22,7 @@ the provided PNG files preserve the rasterized fonts.
 Vela integration
 ----------------
 The Cargo build runs tools/display_assets.py (Python 3 with Pillow).
-It generates clockwise-rotated RGB565 run streams inside Cargo OUT_DIR.
+It generates counterclockwise-rotated RGB565 run streams inside Cargo OUT_DIR.
+The keyboard connector is along the bottom edge in this landscape orientation.
 The command display diag selects the diagnostic image, and display boot
 selects the boot artwork. Both use one kernel-owned PSRAM framebuffer.

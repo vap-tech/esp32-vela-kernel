@@ -1,4 +1,4 @@
-//! PNG-derived RGB565 assets, rotated clockwise for portrait scanout.
+//! PNG-derived RGB565 assets, rotated counterclockwise for keyboard-down landscape.
 pub static DIAGNOSTIC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vela_display_test.rle"));
 pub static BOOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vela_boot.rle"));
 

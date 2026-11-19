@@ -31,7 +31,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
 | `cat /proc/interrupts` | Read 64-bit SYSTIMER and USB Serial/JTAG RX interrupt counts on hart0. |
-| `display diag` | Show the full-screen diagnostic image from PSRAM, rotated clockwise into landscape. |
+| `display diag` | Show the full-screen diagnostic image from PSRAM, in keyboard-down landscape. |
 | `display boot` | Show the Vela boot artwork from the same PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
 | `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
@@ -353,7 +353,8 @@ share the same zero source.
 
 `display diag` and `display boot` use the PNG masters in
 `vela_boot_and_display_assets`. During the build, `tools/display_assets.py`
-rotates each 1280×720 PNG clockwise into the 720×1280 scanout layout,
+rotates each 1280×720 PNG counterclockwise into the 720×1280 scanout layout,
+placing the keyboard connector along the bottom edge,
 quantizes it to RGB565 and encodes little-endian (u16 count, u16 pixel)
 runs. The converter checks its output by an exact round trip.
 

@@ -9,7 +9,8 @@ from PIL import Image
 def encode(image):
     if image.size != (1280, 720):
         raise ValueError("Expected a 1280x720 landscape image")
-    portrait = image.convert("RGB").transpose(Image.Transpose.ROTATE_270)
+    # Counterclockwise storage puts the keyboard connector along the bottom.
+    portrait = image.convert("RGB").transpose(Image.Transpose.ROTATE_90)
     pixels = [(r >> 3) << 11 | (g >> 2) << 5 | (b >> 3) for r, g, b in portrait.getdata()]
     encoded = bytearray()
     for pixel, group in groupby(pixels):
