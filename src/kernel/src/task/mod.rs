@@ -1,4 +1,7 @@
-use crate::id::{Handle, ProcSlot, ThreadSlot, Ticks, Tid};
+use crate::{
+    capability::Object,
+    id::{Handle, ProcSlot, ThreadSlot, Ticks, Tid},
+};
 
 /// Architecture-owned saved CPU state: the only view the kernel crate has of
 /// the syscall return registers (a0, a1).
@@ -30,22 +33,13 @@ pub enum State {
     Blocked,
     Terminated,
 }
-#[derive(Clone, Copy, Debug)]
+
+/// Platform-independent wait reasons. Timeouts live uniformly on
+/// [`Thread::deadline`] rather than per-variant fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    Sentinel {
-        sequence: u32,
-        deadline: Ticks,
-        pointer: usize,
-    },
-    SentinelWake {
-        token: u32,
-        deadline: Ticks,
-    },
-    Dma,
-    Event {
-        object: crate::capability::Object,
-    },
     None,
+    Sleep,
     Receive {
         endpoint: usize,
         handle: Handle,
@@ -57,16 +51,22 @@ pub enum Wait {
         pointer: usize,
         capacity: usize,
         server: ThreadSlot,
-        until: Option<Ticks>,
     },
-    Sleep {
-        until: Ticks,
+    Event {
+        object: Object,
+    },
+    Device {
+        domain: u8,
+        token: u32,
+        pointer: usize,
     },
 }
+
 #[derive(Clone, Copy)]
 pub struct Thread<C: Copy> {
     pub id: Tid,
     pub wait: Wait,
+    pub deadline: Option<Ticks>,
     pub state: State,
     pub context: C,
     pub entry: usize,

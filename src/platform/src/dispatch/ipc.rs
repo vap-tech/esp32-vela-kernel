@@ -73,13 +73,15 @@ impl Runtime {
         } else {
             Some(self.scheduler.uptime().saturating_add(u64::from(timeout)))
         };
-        self.scheduler.block(Wait::Reply {
-            token,
-            pointer: args.a3 as usize,
-            capacity,
-            server,
+        self.scheduler.block_opt(
+            Wait::Reply {
+                token,
+                pointer: args.a3 as usize,
+                capacity,
+                server,
+            },
             until,
-        });
+        );
         self.complete_receivers(ep, false);
         self.scheduler.inherit();
         *switch = true;

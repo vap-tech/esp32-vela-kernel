@@ -50,13 +50,9 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             }
             runtime.complete_dma(false);
         }
-        runtime
-            .sentinel
-            .expire_waiters(&mut runtime.scheduler, uptime);
         soc::scanout::tick();
         runtime.sentinel.tick(uptime);
-        runtime.calls.expire(&mut runtime.scheduler, uptime);
-        runtime.scheduler.tick(uptime);
+        runtime.scheduler.tick(uptime, &mut runtime.calls);
         switch = true;
     } else if interrupt && cause == soc::sentinel::LINE {
         if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel.epoch()) } {

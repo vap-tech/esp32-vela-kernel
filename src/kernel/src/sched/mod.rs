@@ -1,4 +1,5 @@
 use crate::{
+    call::CallTable,
     errno::Errno,
     id::{ProcSlot, ThreadSlot, Ticks, Tid},
     stats::{HZ, LoadAverage, Snapshot},
@@ -8,9 +9,9 @@ use crate::{
 pub const TASKS: usize = 8;
 pub const BOOT_THREADS: usize = 3;
 
-/// Static three-slot round robin. Only accessed by hart0 with machine interrupts
-/// disabled; all context switches happen at the outermost user trap boundary.
-/// C is architecture-owned saved CPU state; this crate has no SoC dependency.
+/// Static round-robin + priority scheduler. Only accessed by hart0 with machine
+/// interrupts disabled; all context switches happen at the outermost trap boundary.
+/// `C` is architecture-owned saved CPU state; this crate has no SoC dependency.
 pub struct Scheduler<C: Copy> {
     pub tasks: [Thread<C>; TASKS],
     pub current: ThreadSlot,
@@ -34,6 +35,7 @@ impl<C: Copy> Scheduler<C> {
                 Tid::NONE
             },
             wait: Wait::None,
+            deadline: None,
             state: if i >= BOOT_THREADS {
                 State::Terminated
             } else if i == 0 {
@@ -99,6 +101,7 @@ impl<C: Copy> Scheduler<C> {
             effective_priority: priority,
             affinity,
             wait: Wait::None,
+            deadline: None,
             state: State::Ready,
             runtime_ticks: 0,
             preemptions: 0,
@@ -111,26 +114,6 @@ impl<C: Copy> Scheduler<C> {
     }
     pub fn save(&mut self, context: C) {
         self.tasks[self.current.index()].context = context;
-    }
-    pub fn tick(&mut self, uptime: Ticks) {
-        self.ticks += 1;
-        let cur = self.current.index();
-        if self.tasks[cur].state == State::Running {
-            self.tasks[cur].runtime_ticks += uptime.saturating_sub(self.uptime);
-        }
-        for task in &mut self.tasks {
-            if task.state == State::Blocked
-                && matches!(task.wait, Wait::Sleep { until } if until <= uptime)
-            {
-                task.wait = Wait::None;
-                task.state = State::Ready;
-            }
-        }
-        self.uptime = uptime;
-        while self.uptime.saturating_sub(self.sampled_at) >= 5 * HZ {
-            self.load.sample(self.snapshot().runnable_tasks);
-            self.sampled_at = self.sampled_at.saturating_add(5 * HZ);
-        }
     }
     pub fn select(&mut self, preemptive: bool) -> Option<ThreadSlot> {
         let cur = self.current.index();
@@ -210,20 +193,29 @@ impl<C: Copy> Scheduler<C> {
         }
     }
     pub fn block(&mut self, wait: Wait) {
+        self.block_opt(wait, None);
+    }
+    pub fn block_until(&mut self, wait: Wait, deadline: Ticks) {
+        self.block_opt(wait, Some(deadline));
+    }
+    pub fn block_opt(&mut self, wait: Wait, deadline: Option<Ticks>) {
         let cur = self.current.index();
         self.tasks[cur].wait = wait;
+        self.tasks[cur].deadline = deadline;
         self.tasks[cur].state = State::Blocked;
     }
     pub fn wake(&mut self, task: ThreadSlot) {
         let idx = task.index();
         if self.tasks[idx].state == State::Blocked {
             self.tasks[idx].wait = Wait::None;
+            self.tasks[idx].deadline = None;
             self.tasks[idx].state = State::Ready;
         }
     }
     pub fn terminate(&mut self) {
         let cur = self.current.index();
         self.tasks[cur].wait = Wait::None;
+        self.tasks[cur].deadline = None;
         self.tasks[cur].state = State::Terminated;
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -263,13 +255,66 @@ impl<C: Context> Scheduler<C> {
         self.task_mut(task).context.set_return2(a1);
         self.wake(task);
     }
+    /// Advance kernel time, expire all elapsed thread deadlines in a single
+    /// O(TASKS) pass, and update 5-second load samples.
+    pub fn tick(&mut self, uptime: Ticks, calls: &mut CallTable) {
+        self.ticks += 1;
+        let cur = self.current.index();
+        if self.tasks[cur].state == State::Running {
+            self.tasks[cur].runtime_ticks += uptime.saturating_sub(self.uptime);
+        }
+        for i in 0..TASKS {
+            let slot = ThreadSlot(i);
+            if self.tasks[i].state != State::Blocked {
+                continue;
+            }
+            if !self.tasks[i].deadline.is_some_and(|d| d <= uptime) {
+                continue;
+            }
+            match self.tasks[i].wait {
+                Wait::Sleep => self.wake(slot),
+                Wait::Reply { .. } => {
+                    calls.deactivate(slot);
+                    self.wake_with(slot, Errno::Etimedout.to_abi());
+                }
+                _ => self.wake_with(slot, Errno::Etimedout.to_abi()),
+            }
+        }
+        self.uptime = uptime;
+        let windows = self.uptime.saturating_sub(self.sampled_at) / (5 * HZ);
+        if windows > 0 {
+            let runnable = self.snapshot().runnable_tasks;
+            // Q16 EWMA reaches its integer fixed point well within 2048 windows;
+            // bounding the loop keeps the masked-IRQ timer path strictly O(1).
+            for _ in 0..windows.min(2048) {
+                self.load.sample(runnable);
+            }
+            self.sampled_at = self
+                .sampled_at
+                .saturating_add(windows.saturating_mul(5 * HZ));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_scheduler() -> Scheduler<u32> {
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    struct TestCtx {
+        a0: u32,
+        a1: u32,
+    }
+    impl Context for TestCtx {
+        fn set_return(&mut self, value: u32) {
+            self.a0 = value;
+        }
+        fn set_return2(&mut self, value: u32) {
+            self.a1 = value;
+        }
+    }
+
+    fn test_scheduler() -> Scheduler<TestCtx> {
         let stacks = [
             Region {
                 base: 0x1000,
@@ -284,7 +329,7 @@ mod tests {
                 size: 4096,
             },
         ];
-        Scheduler::new([0, 1, 2], [0x100, 0x200, 0x300], stacks)
+        Scheduler::new([TestCtx::default(); 3], [0x100, 0x200, 0x300], stacks)
     }
 
     #[test]
@@ -322,7 +367,6 @@ mod tests {
             pointer: 0,
             capacity: 0,
             server: ThreadSlot(0),
-            until: None,
         });
         s.current = ThreadSlot(2);
         s.tasks[2].state = State::Running;
@@ -331,7 +375,6 @@ mod tests {
             pointer: 0,
             capacity: 0,
             server: ThreadSlot(1),
-            until: None,
         });
 
         s.inherit();
@@ -345,19 +388,63 @@ mod tests {
     }
 
     #[test]
-    fn tick_wakes_sleepers_tracks_runtime_and_samples_load() {
+    fn tick_wakes_sleepers_expires_device_and_reply_waits_and_samples_load() {
         let mut s = test_scheduler();
-        s.block(Wait::Sleep { until: Ticks(10) });
+        let mut calls = CallTable::new();
+
+        // Thread 0: Sleep until 10 (keeps a0 = 0).
+        s.block_until(Wait::Sleep, Ticks(10));
         assert_eq!(s.select(false), Some(ThreadSlot(1)));
-        s.tick(Ticks(5));
+
+        // Thread 1: Device wait until 15 (wakes with ETIMEDOUT).
+        s.block_until(
+            Wait::Device {
+                domain: 2,
+                token: 42,
+                pointer: 0,
+            },
+            Ticks(15),
+        );
+        assert_eq!(s.select(false), Some(ThreadSlot(2)));
+
+        // Thread 2: Reply wait until 20 (deactivates CallTable + ETIMEDOUT).
+        let (generation, token) = calls.next_token(ThreadSlot(2)).unwrap();
+        calls.activate(ThreadSlot(2), generation, 0);
+        calls.bind_reply(&mut s, token, ThreadSlot(0));
+        s.block_until(
+            Wait::Reply {
+                token,
+                pointer: 0,
+                capacity: 8,
+                server: ThreadSlot(0),
+            },
+            Ticks(20),
+        );
+
+        s.tick(Ticks(5), &mut calls);
         assert_eq!(s.tasks[0].state, State::Blocked);
-        assert_eq!(s.tasks[1].runtime_ticks, 5);
+        assert_eq!(s.tasks[1].state, State::Blocked);
+        assert_eq!(s.tasks[2].state, State::Blocked);
 
-        s.tick(Ticks(10));
+        s.tick(Ticks(10), &mut calls);
         assert_eq!(s.tasks[0].state, State::Ready);
+        assert_eq!(s.tasks[0].deadline, None);
+        assert_eq!(s.tasks[0].context.a0, 0);
+        assert_eq!(s.tasks[1].state, State::Blocked);
 
-        // Advance past 5-second sampling window.
-        s.tick(Ticks(5 * HZ));
+        s.tick(Ticks(15), &mut calls);
+        assert_eq!(s.tasks[1].state, State::Ready);
+        assert_eq!(s.tasks[1].context.a0, Errno::Etimedout.to_abi());
+        assert_eq!(s.tasks[2].state, State::Blocked);
+
+        s.tick(Ticks(20), &mut calls);
+        assert_eq!(s.tasks[2].state, State::Ready);
+        assert_eq!(s.tasks[2].context.a0, Errno::Etimedout.to_abi());
+        assert_eq!(calls.lookup_for_reply(token), Err(Errno::Epipe));
+
+        // Advance past 5-second sampling window with thread 0 running.
+        assert_eq!(s.select(false), Some(ThreadSlot(0)));
+        s.tick(Ticks(5 * HZ), &mut calls);
         let snap = s.snapshot();
         assert_eq!(snap.uptime_ticks, 5 * HZ);
         assert!(snap.load_q16[0] > 0);
@@ -372,24 +459,26 @@ mod tests {
             size: 4096,
         };
         assert_eq!(
-            s.create_thread(ProcSlot(0), 0, stack, 0x400, 4, 1),
+            s.create_thread(ProcSlot(0), TestCtx::default(), stack, 0x400, 4, 1),
             Err(Errno::Einval)
         );
         assert_eq!(
-            s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 0),
+            s.create_thread(ProcSlot(0), TestCtx::default(), stack, 0x400, 1, 0),
             Err(Errno::Einval)
         );
         assert_eq!(
-            s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 4),
+            s.create_thread(ProcSlot(0), TestCtx::default(), stack, 0x400, 1, 4),
             Err(Errno::Einval)
         );
 
         for i in 0..(TASKS - BOOT_THREADS) {
-            let tid = s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 1).unwrap();
+            let tid = s
+                .create_thread(ProcSlot(0), TestCtx::default(), stack, 0x400, 1, 1)
+                .unwrap();
             assert_eq!(tid, Tid(BOOT_THREADS as u32 + i as u32 + 1));
         }
         assert_eq!(
-            s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 1),
+            s.create_thread(ProcSlot(0), TestCtx::default(), stack, 0x400, 1, 1),
             Err(Errno::Enospc)
         );
     }

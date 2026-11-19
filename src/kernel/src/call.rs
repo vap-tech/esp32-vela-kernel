@@ -5,7 +5,7 @@
 
 use crate::{
     errno::Errno,
-    id::{ThreadSlot, Ticks},
+    id::ThreadSlot,
     sched::{Scheduler, TASKS},
     task::{Context, Thread, Wait},
 };
@@ -109,7 +109,6 @@ impl CallTable {
             token,
             pointer,
             capacity,
-            until,
             ..
         } = scheduler.task(client).wait
         {
@@ -117,7 +116,6 @@ impl CallTable {
                 token,
                 pointer,
                 capacity,
-                until,
                 server,
             };
         }
@@ -160,16 +158,6 @@ impl CallTable {
     ) {
         self.fail_where(scheduler, error, |call, _| call.endpoint == endpoint);
     }
-
-    /// Time out calls whose `Wait::Reply.until` deadline has passed.
-    pub fn expire<C: Context>(&mut self, scheduler: &mut Scheduler<C>, uptime: Ticks) {
-        self.fail_where(scheduler, Errno::Etimedout, |_, task| {
-            matches!(
-                task.wait,
-                Wait::Reply { until: Some(deadline), .. } if deadline <= uptime
-            )
-        });
-    }
 }
 
 #[cfg(test)]
@@ -199,17 +187,6 @@ mod tests {
         Scheduler::new([Ctx::default(); 3], [0; 3], [region; 3])
     }
 
-    fn block_reply(s: &mut Scheduler<Ctx>, client: usize, token: u32, until: Option<Ticks>) {
-        s.current = ThreadSlot(client);
-        s.block(Wait::Reply {
-            token,
-            pointer: 0x100,
-            capacity: 8,
-            server: ThreadSlot(2),
-            until,
-        });
-    }
-
     fn start_call(
         calls: &mut CallTable,
         s: &mut Scheduler<Ctx>,
@@ -219,7 +196,16 @@ mod tests {
     ) -> u32 {
         let (generation, token) = calls.next_token(ThreadSlot(client)).unwrap();
         calls.activate(ThreadSlot(client), generation, endpoint);
-        block_reply(s, client, token, until);
+        s.current = ThreadSlot(client);
+        s.block_opt(
+            Wait::Reply {
+                token,
+                pointer: 0x100,
+                capacity: 8,
+                server: ThreadSlot(2),
+            },
+            until,
+        );
         token
     }
 
@@ -259,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_updates_client_wait_and_ignores_stale_or_zero_tokens() {
+    fn bind_updates_client_wait_and_preserves_thread_deadline() {
         let mut calls = CallTable::new();
         let mut s = scheduler();
         let token = start_call(&mut calls, &mut s, 1, 0, Some(Ticks(50)));
@@ -274,12 +260,12 @@ mod tests {
             s.task(ThreadSlot(1)).wait,
             Wait::Reply {
                 server,
-                until: Some(Ticks(50)),
                 capacity: 8,
                 pointer: 0x100,
                 ..
             } if server == ThreadSlot(0)
         ));
+        assert_eq!(s.task(ThreadSlot(1)).deadline, Some(Ticks(50)));
     }
 
     #[test]
@@ -314,20 +300,22 @@ mod tests {
     }
 
     #[test]
-    fn expire_times_out_only_passed_deadlines() {
+    fn scheduler_tick_expires_only_passed_call_deadlines() {
         let mut calls = CallTable::new();
         let mut s = scheduler();
-        start_call(&mut calls, &mut s, 0, 1, Some(Ticks(10)));
-        start_call(&mut calls, &mut s, 1, 1, Some(Ticks(20)));
+        let t0 = start_call(&mut calls, &mut s, 0, 1, Some(Ticks(10)));
+        let t1 = start_call(&mut calls, &mut s, 1, 1, Some(Ticks(20)));
         start_call(&mut calls, &mut s, 2, 1, None);
-        calls.expire(&mut s, Ticks(9));
+        s.tick(Ticks(9), &mut calls);
         assert!((0..3).all(|i| s.task(ThreadSlot(i)).state == State::Blocked));
-        calls.expire(&mut s, Ticks(10));
+        s.tick(Ticks(10), &mut calls);
         assert_eq!(s.task(ThreadSlot(0)).state, State::Ready);
         assert_eq!(s.task(ThreadSlot(0)).context.a0, Errno::Etimedout.to_abi());
+        assert_eq!(calls.lookup_for_reply(t0), Err(Errno::Epipe));
         assert_eq!(s.task(ThreadSlot(1)).state, State::Blocked);
-        calls.expire(&mut s, Ticks(u64::MAX));
+        s.tick(Ticks(u64::MAX), &mut calls);
         assert_eq!(s.task(ThreadSlot(1)).state, State::Ready);
+        assert_eq!(calls.lookup_for_reply(t1), Err(Errno::Epipe));
         assert_eq!(s.task(ThreadSlot(2)).state, State::Blocked);
     }
 }

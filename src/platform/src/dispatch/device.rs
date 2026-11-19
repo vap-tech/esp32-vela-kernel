@@ -8,7 +8,7 @@ use vela_kernel::{
 use super::Args;
 use crate::{
     pmp,
-    runtime::{CONSOLE_RX, Runtime},
+    runtime::{CONSOLE_RX, Runtime, device_wait},
     soc,
     usermem::{copy_from_user, copy_to_user_within},
 };
@@ -53,7 +53,11 @@ impl Runtime {
         self.active_space = Some((current, space.revision));
         self.dma
             .submit(pid, len, self.scheduler.uptime().saturating_add(100));
-        self.scheduler.block(Wait::Dma);
+        self.scheduler.block(Wait::Device {
+            domain: device_wait::DMA,
+            token: 0,
+            pointer: 0,
+        });
         unsafe {
             soc::dma::start(len);
         }

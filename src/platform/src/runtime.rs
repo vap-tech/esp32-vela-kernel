@@ -48,6 +48,12 @@ pub struct Runtime {
     pub logs: BootLogs,
 }
 
+pub mod device_wait {
+    pub const DMA: u8 = 1;
+    pub const SENTINEL_REQ: u8 = 2;
+    pub const SENTINEL_WAKE: u8 = 3;
+}
+
 pub const CONSOLE_RX: Object = Object::Event {
     index: 0,
     generation: 1,
@@ -391,7 +397,16 @@ impl Runtime {
         for i in 0..TASKS {
             let thread = ThreadSlot(i);
             let t = self.scheduler.task(thread);
-            if t.process == process && t.state == State::Blocked && matches!(t.wait, Wait::Dma) {
+            if t.process == process
+                && t.state == State::Blocked
+                && matches!(
+                    t.wait,
+                    Wait::Device {
+                        domain: device_wait::DMA,
+                        ..
+                    }
+                )
+            {
                 let result = if success { 0 } else { Errno::Eio.to_abi() };
                 self.scheduler.wake_with(thread, result);
             }

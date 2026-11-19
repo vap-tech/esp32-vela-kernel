@@ -2,12 +2,12 @@ use vela_kernel::{
     errno::Errno,
     id::{Pid, ThreadSlot, Ticks},
     process::Processes,
-    sched::{Scheduler, TASKS},
+    sched::Scheduler,
     sentinel::{Heartbeat, WakePhase, WakeTicket},
     task::{State, Wait},
 };
 
-use crate::{arch, sentinel_wire, soc, usermem::copy_to_user};
+use crate::{arch, runtime::device_wait, sentinel_wire, soc, usermem::copy_to_user};
 
 pub struct SentinelClient {
     epoch: Option<u32>,
@@ -141,32 +141,6 @@ impl SentinelClient {
         }
     }
 
-    pub fn expire_waiters(&self, scheduler: &mut Scheduler<arch::TrapFrame>, uptime: Ticks) {
-        if self.pending {
-            for i in 0..TASKS {
-                let thread = ThreadSlot(i);
-                if matches!(
-                    scheduler.task(thread).wait,
-                    Wait::Sentinel { deadline, .. } if uptime >= deadline
-                ) {
-                    scheduler.wake_with(thread, Errno::Etimedout.to_abi());
-                }
-            }
-        }
-        for i in 0..TASKS {
-            let thread = ThreadSlot(i);
-            if scheduler.task(thread).state == State::Blocked
-                && matches!(
-                    scheduler.task(thread).wait,
-                    Wait::SentinelWake { deadline, .. } if uptime >= deadline
-                )
-            {
-                scheduler.wake_with2(thread, Errno::Etimedout.to_abi(), 0);
-                // Keep the LP token reserved: a late event cannot complete a new alarm.
-            }
-        }
-    }
-
     fn finish_wake_waiter(
         scheduler: &mut Scheduler<arch::TrapFrame>,
         processes: &Processes,
@@ -177,7 +151,14 @@ impl SentinelClient {
         if let Some(i) = scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked
                 && processes.slot(t.process).id == ticket.owner
-                && matches!(t.wait, Wait::SentinelWake { token, .. } if token == ticket.token)
+                && matches!(
+                    t.wait,
+                    Wait::Device {
+                        domain: device_wait::SENTINEL_WAKE,
+                        token,
+                        ..
+                    } if token == ticket.token
+                )
         }) {
             let thread = ThreadSlot(i);
             scheduler.wake_with2(thread, result, elapsed);
@@ -390,12 +371,19 @@ impl SentinelClient {
     ) {
         let Some(i) = scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked
-                && matches!(t.wait, Wait::Sentinel { sequence, .. } if sequence == reply.request)
+                && matches!(
+                    t.wait,
+                    Wait::Device {
+                        domain: device_wait::SENTINEL_REQ,
+                        token,
+                        ..
+                    } if token == reply.request
+                )
         }) else {
             return;
         };
         let thread = ThreadSlot(i);
-        let Wait::Sentinel { pointer, .. } = scheduler.task(thread).wait else {
+        let Wait::Device { pointer, .. } = scheduler.task(thread).wait else {
             unreachable!()
         };
         let result = if let Some(code) = error {

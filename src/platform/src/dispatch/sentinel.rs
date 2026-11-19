@@ -6,7 +6,11 @@ use vela_kernel::{
 };
 
 use super::Args;
-use crate::{arch, runtime::Runtime, sentinel_wire, soc, syscall};
+use crate::{
+    arch,
+    runtime::{Runtime, device_wait},
+    sentinel_wire, soc, syscall,
+};
 
 impl Runtime {
     pub(super) fn sys_sentinel_control(
@@ -61,11 +65,14 @@ impl Runtime {
             sleep,
             phase: WakePhase::Requested,
         }));
-        self.scheduler.block(Wait::Sentinel {
-            sequence,
-            deadline: now.saturating_add(100),
-            pointer: 0,
-        });
+        self.scheduler.block_until(
+            Wait::Device {
+                domain: device_wait::SENTINEL_REQ,
+                token: sequence,
+                pointer: 0,
+            },
+            now.saturating_add(100),
+        );
         *switch = true;
         Ok(0)
     }
@@ -91,7 +98,14 @@ impl Runtime {
         }
         if self.scheduler.tasks.iter().any(|t| {
             t.state == State::Blocked
-                && matches!(t.wait, Wait::SentinelWake { token, .. } if token == ticket.token)
+                && matches!(
+                    t.wait,
+                    Wait::Device {
+                        domain: device_wait::SENTINEL_WAKE,
+                        token,
+                        ..
+                    } if token == ticket.token
+                )
         }) {
             return Err(Errno::Ebusy);
         }
@@ -100,10 +114,15 @@ impl Runtime {
         if now >= ticket.expires {
             return Err(Errno::Etimedout);
         }
-        self.scheduler.block(Wait::SentinelWake {
-            token: ticket.token,
-            deadline: ticket.expires,
-        });
+        frame.set_return2(0);
+        self.scheduler.block_until(
+            Wait::Device {
+                domain: device_wait::SENTINEL_WAKE,
+                token: ticket.token,
+                pointer: 0,
+            },
+            ticket.expires,
+        );
         *switch = true;
         Ok(0)
     }
@@ -133,11 +152,14 @@ impl Runtime {
             ticket.token,
             0,
         )?;
-        self.scheduler.block(Wait::Sentinel {
-            sequence,
-            deadline: self.scheduler.uptime().saturating_add(100),
-            pointer: 0,
-        });
+        self.scheduler.block_until(
+            Wait::Device {
+                domain: device_wait::SENTINEL_REQ,
+                token: sequence,
+                pointer: 0,
+            },
+            self.scheduler.uptime().saturating_add(100),
+        );
         *switch = true;
         Ok(0)
     }
@@ -181,11 +203,14 @@ impl Runtime {
         }
         let sequence = self.sentinel.request(command, arg0, arg1)?;
         let deadline = self.scheduler.uptime().saturating_add(100);
-        self.scheduler.block(Wait::Sentinel {
-            sequence,
+        self.scheduler.block_until(
+            Wait::Device {
+                domain: device_wait::SENTINEL_REQ,
+                token: sequence,
+                pointer,
+            },
             deadline,
-            pointer,
-        });
+        );
         *switch = true;
         Ok(0)
     }

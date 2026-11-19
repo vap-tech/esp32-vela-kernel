@@ -114,6 +114,7 @@ impl Runtime {
             if thread.process == current {
                 thread.state = State::Terminated;
                 thread.wait = Wait::None;
+                thread.deadline = None;
             }
         }
         self.terminate();
@@ -159,7 +160,7 @@ impl Runtime {
             return Err(Errno::Einval);
         }
         let until = self.scheduler.uptime().saturating_add(u64::from(args.a0));
-        self.scheduler.block(Wait::Sleep { until });
+        self.scheduler.block_until(Wait::Sleep, until);
         *switch = true;
         Ok(0)
     }
