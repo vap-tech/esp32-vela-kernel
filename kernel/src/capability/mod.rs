@@ -1,6 +1,6 @@
 //! Process-local, generational capabilities. Grants are deliberately one-level:
 //! recipients cannot forward GRANT/CONTROL; owner revocation is object-wide.
-use crate::task::Region;
+use crate::{errno::Errno, task::Region};
 pub const READ: u16 = 1;
 pub const WRITE: u16 = 2;
 pub const EXECUTE: u16 = 4;
@@ -10,8 +10,6 @@ pub const GRANT: u16 = 32;
 pub const WAIT: u16 = 64;
 pub const ACK: u16 = 128;
 pub const CONTROL: u16 = 256;
-pub const EBADF: u32 = (-9i32) as u32;
-pub const EPERM: u32 = (-1i32) as u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     Endpoint { index: usize, generation: u32 },
@@ -49,35 +47,35 @@ impl Table {
             slots: [Slot::EMPTY; 16],
         }
     }
-    pub fn install(&mut self, cap: Capability) -> Result<u32, u32> {
+    pub fn install(&mut self, cap: Capability) -> Result<u32, Errno> {
         let (i, s) = self
             .slots
             .iter_mut()
             .enumerate()
             .find(|(_, s)| s.cap.is_none() && s.generation < 0x7f_ffff)
-            .ok_or((-28i32) as u32)?;
+            .ok_or(Errno::Enospc)?;
         s.generation += 1;
         s.cap = Some(cap);
         Ok((s.generation << 8) | (i as u32 + 1))
     }
-    fn slot(&self, handle: u32) -> Result<usize, u32> {
+    fn slot(&self, handle: u32) -> Result<usize, Errno> {
         let i = (handle & 255).wrapping_sub(1) as usize;
-        let s = self.slots.get(i).ok_or(EBADF)?;
+        let s = self.slots.get(i).ok_or(Errno::Ebadf)?;
         if s.generation != handle >> 8 || s.cap.is_none() {
-            return Err(EBADF);
+            return Err(Errno::Ebadf);
         }
         Ok(i)
     }
-    pub fn get(&self, handle: u32, rights: u16) -> Result<Capability, u32> {
-        let cap = self.slots[self.slot(handle)?].cap.ok_or(EBADF)?;
+    pub fn get(&self, handle: u32, rights: u16) -> Result<Capability, Errno> {
+        let cap = self.slots[self.slot(handle)?].cap.ok_or(Errno::Ebadf)?;
         if cap.rights & rights != rights {
-            return Err(EPERM);
+            return Err(Errno::Eperm);
         }
         Ok(cap)
     }
-    pub fn close(&mut self, handle: u32) -> Result<Capability, u32> {
+    pub fn close(&mut self, handle: u32) -> Result<Capability, Errno> {
         let i = self.slot(handle)?;
-        self.slots[i].cap.take().ok_or(EBADF)
+        self.slots[i].cap.take().ok_or(Errno::Ebadf)
     }
     pub fn revoke(&mut self, object: Object) {
         for s in &mut self.slots {
@@ -124,12 +122,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(table.get(handle, SEND).unwrap().object, ep);
-        assert_eq!(table.get(handle, CONTROL).err(), Some(EPERM));
+        assert_eq!(table.get(handle, CONTROL).err(), Some(Errno::Eperm));
         assert_eq!(table.find(ep, RECEIVE), Some(handle));
         assert_eq!(table.find(ep, CONTROL), None);
 
         table.close(handle).unwrap();
-        assert_eq!(table.get(handle, 0).err(), Some(EBADF));
+        assert_eq!(table.get(handle, 0).err(), Some(Errno::Ebadf));
 
         let reused = table
             .install(Capability {
@@ -138,7 +136,7 @@ mod tests {
             })
             .unwrap();
         assert_ne!(reused, handle);
-        assert_eq!(table.get(handle, 0).err(), Some(EBADF));
+        assert_eq!(table.get(handle, 0).err(), Some(Errno::Ebadf));
         assert_eq!(table.get(reused, SEND).unwrap().object, ep);
     }
 
@@ -173,8 +171,8 @@ mod tests {
             .unwrap();
 
         table.revoke(ep_a);
-        assert_eq!(table.get(h_a1, 0).err(), Some(EBADF));
-        assert_eq!(table.get(h_a2, 0).err(), Some(EBADF));
+        assert_eq!(table.get(h_a1, 0).err(), Some(Errno::Ebadf));
+        assert_eq!(table.get(h_a2, 0).err(), Some(Errno::Ebadf));
         assert_eq!(table.get(h_b, SEND).unwrap().object, ep_b);
 
         for _ in 0..15 {
@@ -192,7 +190,7 @@ mod tests {
                     rights: SEND,
                 })
                 .err(),
-            Some((-28i32) as u32)
+            Some(Errno::Enospc)
         );
 
         let mut exhausted = Table::new();
@@ -206,7 +204,7 @@ mod tests {
                     rights: SEND,
                 })
                 .err(),
-            Some((-28i32) as u32)
+            Some(Errno::Enospc)
         );
     }
 }

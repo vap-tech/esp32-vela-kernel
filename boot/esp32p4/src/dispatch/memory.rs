@@ -1,35 +1,33 @@
 use vela_kernel::{
     capability::{self as cap, Capability, Object},
-    ipc,
+    errno::Errno,
     process::{READ, WRITE},
     sched::TASKS,
     task::{Region, State, Wait},
 };
 
 use super::Args;
-use crate::{arch, runtime::Runtime, syscall};
+use crate::{arch, runtime::Runtime};
 
 impl Runtime {
-    pub(super) fn sys_mem_cap(&self, current: usize, args: Args) -> u32 {
+    pub(super) fn sys_mem_cap(&self, current: usize, args: Args) -> Result<u32, Errno> {
         let region = self
             .memory()
             .maps
             .iter()
             .find(|m| m.region.base == args.a0 as usize)
-            .map(|m| m.region);
-        match region {
-            Some(region) => self.processes.slots[current]
-                .capabilities
-                .find(
-                    Object::Memory {
-                        owner: self.processes.slots[current].id,
-                        region,
-                    },
-                    cap::CONTROL,
-                )
-                .unwrap_or(cap::EBADF),
-            None => cap::EBADF,
-        }
+            .map(|m| m.region)
+            .ok_or(Errno::Ebadf)?;
+        self.processes.slots[current]
+            .capabilities
+            .find(
+                Object::Memory {
+                    owner: self.processes.slots[current].id,
+                    region,
+                },
+                cap::CONTROL,
+            )
+            .ok_or(Errno::Ebadf)
     }
 
     pub(super) fn sys_mem_alloc(
@@ -37,18 +35,15 @@ impl Runtime {
         current: usize,
         args: Args,
         frame: &mut arch::TrapFrame,
-    ) -> u32 {
+    ) -> Result<u32, Errno> {
         let owner = self.processes.slots[current].id;
-        let region = match self.allocator.allocate(owner, args.a0 as usize) {
-            Ok(r) => r,
-            Err(e) => return (-(e as i32)) as u32,
-        };
+        let region = self.allocator.allocate(owner, args.a0 as usize)?;
         if let Err(e) = self.processes.slots[current]
             .memory
             .insert(region, READ | WRITE)
         {
             self.allocator.free(owner, region).unwrap();
-            return (-(e as i32)) as u32;
+            return Err(e);
         }
         if let Err(e) = self.processes.slots[current]
             .capabilities
@@ -59,17 +54,17 @@ impl Runtime {
         {
             self.processes.slots[current].memory.remove(region).unwrap();
             self.allocator.free(owner, region).unwrap();
-            return e;
+            return Err(e);
         }
         // SAFETY: newly reserved physical SRAM, no aliases or user execution.
         unsafe {
             core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
         }
         frame.registers[9] = region.size as u32;
-        region.base as u32
+        Ok(region.base as u32)
     }
 
-    pub(super) fn sys_mem_free(&mut self, current: usize, args: Args) -> u32 {
+    pub(super) fn sys_mem_free(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
         let region = Region {
             base: args.a0 as usize,
             size: args.a1 as usize,
@@ -81,14 +76,14 @@ impl Runtime {
                 .find(Object::Memory { owner, region }, cap::CONTROL)
                 .is_none()
         {
-            return ipc::EPERM;
+            return Err(Errno::Eperm);
         }
         if self.scheduler.tasks.iter().any(|t| {
             t.process == current
                 && t.state != State::Terminated
                 && region.contains(t.stack.base, t.stack.size)
         }) {
-            return (-16i32) as u32;
+            return Err(Errno::Ebusy);
         }
         self.invalidate_object(Object::Memory { owner, region }, None);
         self.allocator.free(owner, region).unwrap();
@@ -102,11 +97,11 @@ impl Runtime {
             } = self.scheduler.tasks[i].wait
             {
                 if region.contains(pointer, capacity) {
-                    self.scheduler.tasks[i].context.registers[8] = syscall::EFAULT;
+                    self.scheduler.tasks[i].context.registers[8] = Errno::Efault.to_abi();
                     self.scheduler.wake(i);
                 }
             }
         }
-        0
+        Ok(0)
     }
 }

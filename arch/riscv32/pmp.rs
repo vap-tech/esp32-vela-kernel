@@ -1,13 +1,13 @@
 //! P4 rev1.3: 16 entries, minimum 128B, no NA4. Never lock dynamic mappings.
 //! Full deny-all at entry15 protects holes, MMIO and uncached aliases.
-use vela_kernel::process::AddressSpace;
+use vela_kernel::{errno::Errno, process::AddressSpace};
 #[derive(Clone, Copy)]
 pub struct Prepared {
     address: [usize; 16],
     config: [usize; 4],
 }
 impl Prepared {
-    pub fn new(memory: &AddressSpace) -> Result<Self, u32> {
+    pub fn new(memory: &AddressSpace) -> Result<Self, Errno> {
         let mut result = Self {
             address: [0; 16],
             config: [0; 4],
@@ -18,7 +18,7 @@ impl Prepared {
                 continue;
             }
             if r.size < 128 || !r.size.is_power_of_two() || r.base % r.size != 0 {
-                return Err(22);
+                return Err(Errno::Einval);
             }
             result.address[index] = (r.base >> 2) | ((r.size >> 3) - 1);
             result.config[index / 4] |=

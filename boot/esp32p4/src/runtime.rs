@@ -1,6 +1,7 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     capability::{self as cap, Capability, Object},
+    errno::Errno,
     ipc::{self, Ipc, Message},
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
@@ -9,7 +10,7 @@ use vela_kernel::{
     task::{Region, State, Wait},
 };
 
-use crate::{arch, pmp, sentinel_wire, soc, syscall};
+use crate::{arch, pmp, sentinel_wire, soc};
 
 #[derive(Clone, Copy)]
 pub struct Call {
@@ -86,7 +87,11 @@ pub unsafe fn deliver(pointer: usize, message: &Message) {
     }
 }
 
-pub fn create_endpoint(ipc: &mut Ipc, processes: &mut Processes, owner: usize) -> Result<u32, u32> {
+pub fn create_endpoint(
+    ipc: &mut Ipc,
+    processes: &mut Processes,
+    owner: usize,
+) -> Result<u32, Errno> {
     let object = ipc.create(owner)?;
     match processes.slots[owner].capabilities.install(Capability {
         object,
@@ -107,12 +112,12 @@ pub fn grant(
     handle: u32,
     peer: usize,
     rights: u16,
-) -> Result<u32, u32> {
+) -> Result<u32, Errno> {
     let source = processes.slots[owner]
         .capabilities
         .get(handle, cap::GRANT)?;
     if rights == 0 || rights & !source.rights != 0 || rights & (cap::CONTROL | cap::GRANT) != 0 {
-        return Err(cap::EPERM);
+        return Err(Errno::Eperm);
     }
     processes.slots[peer].capabilities.install(Capability {
         object: source.object,
@@ -164,18 +169,18 @@ impl Runtime {
         // userspace WAIT must not turn into a lost wakeup.
     }
 
-    pub fn sentinel_request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, u32> {
+    pub fn sentinel_request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, Errno> {
         if !self.sentinel_ready {
-            return Err(syscall::EAGAIN);
+            return Err(Errno::Eagain);
         }
         if self.heartbeat_link.offline {
-            return Err((-110i32) as u32);
+            return Err(Errno::Etimedout);
         }
         if self.sentinel_pending {
-            return Err((-16i32) as u32);
+            return Err(Errno::Ebusy);
         }
         if self.sentinel_sequence == i32::MAX as u32 {
-            return Err((-75i32) as u32);
+            return Err(Errno::Eoverflow);
         }
         self.sentinel_sequence += 1;
         self.sentinel_pending = true;
@@ -240,11 +245,11 @@ impl Runtime {
             self.heartbeat_link.acknowledge(reply.request);
         }
         let error_code = match reply.result {
-            sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => (-75i32) as u32,
-            sentinel_wire::LOG_UNKNOWN => (-2i32) as u32,
-            sentinel_wire::LOG_BUSY => (-16i32) as u32,
-            sentinel_wire::WAKE_ALREADY => (-114i32) as u32,
-            _ => syscall::EINVAL,
+            sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => Errno::Eoverflow,
+            sentinel_wire::LOG_UNKNOWN => Errno::Enoent,
+            sentinel_wire::LOG_BUSY => Errno::Ebusy,
+            sentinel_wire::WAKE_ALREADY => Errno::Ealready,
+            _ => Errno::Einval,
         };
         if matches!(
             command,
@@ -253,7 +258,7 @@ impl Runtime {
             if let Some(mut ticket) = self.sentinel_wake {
                 if ticket.token == reply.request {
                     if error {
-                        self.finish_wake_waiter(ticket, error_code, 0);
+                        self.finish_wake_waiter(ticket, error_code.to_abi(), 0);
                         self.sentinel_wake = None;
                     } else if matches!(ticket.phase, WakePhase::Requested) {
                         ticket.phase = WakePhase::Armed;
@@ -268,7 +273,7 @@ impl Runtime {
         {
             if let Some(ticket) = self.sentinel_wake {
                 if ticket.token == self.sentinel_argument {
-                    self.finish_wake_waiter(ticket, (-125i32) as u32, 0);
+                    self.finish_wake_waiter(ticket, Errno::Ecanceled.to_abi(), 0);
                     self.sentinel_wake = None;
                 }
             }
@@ -283,7 +288,7 @@ impl Runtime {
             unreachable!()
         };
         let result = if error {
-            error_code
+            error_code.to_abi()
         } else if pointer == 0 {
             reply.request
         } else {
@@ -293,7 +298,7 @@ impl Runtime {
                 sentinel_wire::LOG_BYTES,
                 WRITE,
             ) {
-                syscall::EFAULT
+                Errno::Efault.to_abi()
             } else {
                 let values = match command {
                     sentinel_wire::GET_STATUS => {
@@ -326,7 +331,7 @@ impl Runtime {
                     _ => unreachable!(),
                 };
                 if command == sentinel_wire::LOG_READ && values[0] != self.sentinel_argument {
-                    self.scheduler.tasks[i].context.registers[8] = syscall::EINVAL;
+                    self.scheduler.tasks[i].context.registers[8] = Errno::Einval.to_abi();
                     self.scheduler.wake(i);
                     return;
                 }
@@ -402,10 +407,10 @@ impl Runtime {
         }
     }
 
-    pub fn fail_call(&mut self, client: usize, error: u32) {
+    pub fn fail_call(&mut self, client: usize, error: Errno) {
         self.calls[client].active = false;
         if matches!(self.scheduler.tasks[client].wait, Wait::Reply { .. }) {
-            self.scheduler.tasks[client].context.registers[8] = error;
+            self.scheduler.tasks[client].context.registers[8] = error.to_abi();
             self.scheduler.wake(client);
         }
     }
@@ -415,14 +420,14 @@ impl Runtime {
             if self.calls[i].active {
                 if let Wait::Reply { until, .. } = self.scheduler.tasks[i].wait {
                     if until != 0 && until <= uptime {
-                        self.fail_call(i, (-110i32) as u32);
+                        self.fail_call(i, Errno::Etimedout);
                     }
                 }
             }
         }
     }
 
-    pub fn endpoint(&self, process: usize, handle: u32, rights: u16) -> Result<usize, u32> {
+    pub fn endpoint(&self, process: usize, handle: u32, rights: u16) -> Result<usize, Errno> {
         let capability = self.processes.slots[process]
             .capabilities
             .get(handle, rights)?;
@@ -451,7 +456,7 @@ impl Runtime {
                             {
                                 if region.contains(pointer, capacity) {
                                     self.scheduler.tasks[thread].context.registers[8] =
-                                        syscall::EFAULT;
+                                        Errno::Efault.to_abi();
                                     self.scheduler.wake(thread);
                                 }
                             }
@@ -492,7 +497,7 @@ impl Runtime {
                 }
                 let result = if closed || self.endpoint(task.process, handle, ipc::RECEIVE).is_err()
                 {
-                    Err(ipc::EPIPE)
+                    Err(Errno::Epipe)
                 } else {
                     self.ipc.receive(endpoint, capacity)
                 };
@@ -505,7 +510,7 @@ impl Runtime {
                             .memory
                             .permits(pointer, capacity, WRITE)
                         {
-                            syscall::EFAULT
+                            Errno::Efault.to_abi()
                         } else {
                             // SAFETY: full writable range revalidated against receiver's mapping.
                             unsafe {
@@ -514,7 +519,7 @@ impl Runtime {
                             message.length as u32
                         }
                     }
-                    Err(error) => error,
+                    Err(error) => error.to_abi(),
                 };
                 // Blocked ecall already advanced mepc and was saved. Update its
                 // own return register before making the task runnable.
@@ -537,7 +542,7 @@ impl Runtime {
         self.calls[exiting].active = false;
         for i in 0..TASKS {
             if self.calls[i].active && self.calls[i].server == Some(exiting) {
-                self.fail_call(i, ipc::EPIPE);
+                self.fail_call(i, Errno::Epipe);
             }
         }
         self.scheduler.terminate();
@@ -561,7 +566,7 @@ impl Runtime {
         let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
         for i in 0..TASKS {
             if self.calls[i].active && self.ipc.owner(self.calls[i].endpoint) == Some(process) {
-                self.fail_call(i, ipc::EPIPE);
+                self.fail_call(i, Errno::Epipe);
             }
         }
         let closed = self.ipc.remove_task(process);
@@ -595,8 +600,8 @@ impl Runtime {
         }
     }
 
-    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<u32, u32> {
-        let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| 8u32)?;
+    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<u32, Errno> {
+        let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| Errno::Enoexec)?;
         let process = self.processes.create(AddressSpace::EMPTY)?;
         let owner = self.processes.slots[process].id;
         let result = (|| {
@@ -607,7 +612,7 @@ impl Runtime {
                     .iter()
                     .map(|s| s.region.base + s.region.size)
                     .max()
-                    .ok_or(8u32)?;
+                    .ok_or(Errno::Enoexec)?;
                 self.allocator.allocate(owner, end)?.base
             } else {
                 0
@@ -619,9 +624,9 @@ impl Runtime {
                         .size
                         .max(128)
                         .checked_next_power_of_two()
-                        .ok_or(8u32)?;
+                        .ok_or(Errno::Enoexec)?;
                     if segment.region.base % size != 0 {
-                        return Err(8);
+                        return Err(Errno::Enoexec);
                     }
                     Region {
                         base: bias + segment.region.base,
@@ -639,7 +644,7 @@ impl Runtime {
                     rights |= WRITE;
                 }
                 space.insert(region, rights)?;
-                let data = image.data(i).ok_or(8u32)?;
+                let data = image.data(i).ok_or(Errno::Enoexec)?;
                 // Reserved private SRAM. Clear BSS and all PMP-visible padding.
                 unsafe {
                     core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
@@ -657,13 +662,13 @@ impl Runtime {
                         ((bias + target) as *mut u32).write((bias + addend) as u32);
                     }
                 })
-                .map_err(|_| 8u32)?;
+                .map_err(|_| Errno::Enoexec)?;
             let entry = bias + image.entry;
             let stack = self.allocator.allocate(owner, 4096)?;
             space.insert(stack, READ | WRITE)?;
             let arg = if dma_driver {
                 if !self.dma.acquire(owner) {
-                    return Err(16);
+                    return Err(Errno::Ebusy);
                 }
                 let page = soc::dma::page();
                 space.insert(page, READ | WRITE)?;
@@ -715,7 +720,7 @@ impl Runtime {
         for i in 0..TASKS {
             let t = &mut self.scheduler.tasks[i];
             if t.process == process && t.state == State::Blocked && matches!(t.wait, Wait::Dma) {
-                t.context.registers[8] = if success { 0 } else { (-5i32) as u32 };
+                t.context.registers[8] = if success { 0 } else { Errno::Eio.to_abi() };
                 self.scheduler.wake(i);
             }
         }

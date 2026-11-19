@@ -1,5 +1,5 @@
 //! Process-owned address spaces. Slot indices never cross the user ABI.
-use crate::{capability::Table, task::Region};
+use crate::{capability::Table, errno::Errno, task::Region};
 pub const PROCESSES: usize = 8;
 pub const REGIONS: usize = 6;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ impl AddressSpace {
         }; REGIONS],
         revision: 0,
     };
-    pub fn insert(&mut self, region: Region, permissions: u8) -> Result<(), u32> {
+    pub fn insert(&mut self, region: Region, permissions: u8) -> Result<(), Errno> {
         if region.size < 128
             || !region.size.is_power_of_two()
             || region.base % region.size != 0
@@ -37,7 +37,7 @@ impl AddressSpace {
             || permissions & !7 != 0
             || permissions & WRITE != 0 && permissions & READ == 0
         {
-            return Err(22);
+            return Err(Errno::Einval);
         }
         if permissions == 0
             || permissions & (WRITE | EXECUTE) == WRITE | EXECUTE
@@ -47,41 +47,41 @@ impl AddressSpace {
                     && m.region.base < region.base + region.size
             })
         {
-            return Err(22);
+            return Err(Errno::Einval);
         }
         let index = self
             .maps
             .iter()
             .position(|m| m.region.size == 0)
-            .ok_or(28u32)?;
+            .ok_or(Errno::Enospc)?;
         self.maps[index] = Mapping {
             region,
             permissions,
         };
-        self.revision = self.revision.checked_add(1).ok_or(75u32)?;
+        self.revision = self.revision.checked_add(1).ok_or(Errno::Eoverflow)?;
         Ok(())
     }
-    pub fn remove(&mut self, region: Region) -> Result<(), u32> {
+    pub fn remove(&mut self, region: Region) -> Result<(), Errno> {
         let index = self
             .maps
             .iter()
             .position(|m| m.region == region && region.size != 0)
-            .ok_or(22u32)?;
+            .ok_or(Errno::Einval)?;
         self.maps[index] = Mapping::default();
-        self.revision = self.revision.checked_add(1).ok_or(75u32)?;
+        self.revision = self.revision.checked_add(1).ok_or(Errno::Eoverflow)?;
         Ok(())
     }
     /// Keep the mapping slot reserved while device ownership denies U-mode access.
-    pub fn dma_access(&mut self, region: Region, allow: bool) -> Result<(), u32> {
-        let revision = self.revision.checked_add(1).ok_or(75u32)?;
+    pub fn dma_access(&mut self, region: Region, allow: bool) -> Result<(), Errno> {
+        let revision = self.revision.checked_add(1).ok_or(Errno::Eoverflow)?;
         let m = self
             .maps
             .iter_mut()
             .find(|m| m.region == region && region.size != 0)
-            .ok_or(22u32)?;
+            .ok_or(Errno::Einval)?;
         let rw = READ | WRITE;
         if m.permissions != if allow { 0 } else { rw } {
-            return Err(22);
+            return Err(Errno::Einval);
         }
         m.permissions = if allow { rw } else { 0 };
         self.revision = revision;
@@ -128,14 +128,14 @@ impl Processes {
             next_id: 1,
         }
     }
-    pub fn create(&mut self, memory: AddressSpace) -> Result<usize, u32> {
+    pub fn create(&mut self, memory: AddressSpace) -> Result<usize, Errno> {
         let index = self
             .slots
             .iter()
             .position(|p| p.state == Lifecycle::Free)
-            .ok_or(28u32)?;
+            .ok_or(Errno::Enospc)?;
         let id = self.next_id;
-        self.next_id = id.checked_add(1).ok_or(75u32)?;
+        self.next_id = id.checked_add(1).ok_or(Errno::Eoverflow)?;
         self.slots[index] = Process {
             id,
             state: Lifecycle::Alive,
@@ -158,9 +158,12 @@ mod tests {
             base: 0x4ff4_0000,
             size: 8192,
         };
-        assert_eq!(space.insert(code, READ | WRITE | EXECUTE), Err(22));
-        assert_eq!(space.insert(code, WRITE), Err(22));
-        assert_eq!(space.insert(code, 0), Err(22));
+        assert_eq!(
+            space.insert(code, READ | WRITE | EXECUTE),
+            Err(Errno::Einval)
+        );
+        assert_eq!(space.insert(code, WRITE), Err(Errno::Einval));
+        assert_eq!(space.insert(code, 0), Err(Errno::Einval));
         assert_eq!(
             space.insert(
                 Region {
@@ -169,7 +172,7 @@ mod tests {
                 },
                 READ | EXECUTE,
             ),
-            Err(22)
+            Err(Errno::Einval)
         );
         assert_eq!(
             space.insert(
@@ -179,7 +182,7 @@ mod tests {
                 },
                 READ,
             ),
-            Err(22)
+            Err(Errno::Einval)
         );
 
         space.insert(code, READ | EXECUTE).unwrap();
@@ -198,7 +201,7 @@ mod tests {
                 },
                 READ | WRITE,
             ),
-            Err(22)
+            Err(Errno::Einval)
         );
 
         space.remove(code).unwrap();
@@ -228,7 +231,7 @@ mod tests {
                 },
                 READ | WRITE,
             ),
-            Err(28)
+            Err(Errno::Enospc)
         );
 
         let mut procs = Processes::new();
@@ -237,7 +240,7 @@ mod tests {
             assert_eq!(slot, i);
             assert_eq!(procs.slots[slot].id, i as u32 + 1);
         }
-        assert_eq!(procs.create(AddressSpace::EMPTY), Err(28));
+        assert_eq!(procs.create(AddressSpace::EMPTY), Err(Errno::Enospc));
 
         procs.slots[0] = Process::EMPTY;
         let reused = procs.create(AddressSpace::EMPTY).unwrap();

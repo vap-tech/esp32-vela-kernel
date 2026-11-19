@@ -1,6 +1,6 @@
 //! Fixed physical SRAM arena. All regions are NAPOT-compatible; no page tables.
 //! Owner is a monotonic process ID, never a recyclable process slot.
-use crate::task::Region;
+use crate::{errno::Errno, task::Region};
 pub const PAGE: usize = 4096;
 const PAGES: usize = 64;
 const ALLOCATIONS: usize = 24;
@@ -32,23 +32,23 @@ impl RegionAllocator {
             entries: [Allocation::EMPTY; ALLOCATIONS],
         }
     }
-    pub fn allocate(&mut self, owner: u32, requested: usize) -> Result<Region, u32> {
+    pub fn allocate(&mut self, owner: u32, requested: usize) -> Result<Region, Errno> {
         if owner == 0 || requested == 0 {
-            return Err(22);
+            return Err(Errno::Einval);
         }
         let size = requested
             .max(PAGE)
             .checked_next_power_of_two()
-            .ok_or(22u32)?;
+            .ok_or(Errno::Einval)?;
         let count = size / PAGE;
         if count > self.pages {
-            return Err(12);
+            return Err(Errno::Enomem);
         }
         let slot = self
             .entries
             .iter()
             .position(|e| e.owner == 0)
-            .ok_or(28u32)?;
+            .ok_or(Errno::Enospc)?;
         for first in 0..=self.pages - count {
             let base = self.base + first * PAGE;
             if base % size != 0 {
@@ -67,28 +67,31 @@ impl RegionAllocator {
             self.entries[slot] = Allocation { owner, region };
             return Ok(region);
         }
-        Err(12)
+        Err(Errno::Enomem)
     }
     /// Reserve a fixed-address, naturally aligned ELF segment in the SRAM pool.
-    pub fn reserve(&mut self, owner: u32, base: usize, bytes: usize) -> Result<Region, u32> {
-        let size = bytes.max(PAGE).checked_next_power_of_two().ok_or(22u32)?;
+    pub fn reserve(&mut self, owner: u32, base: usize, bytes: usize) -> Result<Region, Errno> {
+        let size = bytes
+            .max(PAGE)
+            .checked_next_power_of_two()
+            .ok_or(Errno::Einval)?;
         if owner == 0 || bytes == 0 || base % size != 0 {
-            return Err(22);
+            return Err(Errno::Einval);
         }
-        let first = base.checked_sub(self.base).ok_or(12u32)? / PAGE;
+        let first = base.checked_sub(self.base).ok_or(Errno::Enomem)? / PAGE;
         let pages = size / PAGE;
         if first >= self.pages || pages > self.pages - first {
-            return Err(12);
+            return Err(Errno::Enomem);
         }
         let mask = (u64::MAX >> (64 - pages)) << first;
         if self.occupied & mask != 0 {
-            return Err(16);
+            return Err(Errno::Ebusy);
         }
         let entry = self
             .entries
             .iter_mut()
             .find(|e| e.owner == 0)
-            .ok_or(28u32)?;
+            .ok_or(Errno::Enospc)?;
         let region = Region { base, size };
         *entry = Allocation { owner, region };
         self.occupied |= mask;
@@ -99,12 +102,12 @@ impl RegionAllocator {
             .iter()
             .any(|e| e.owner == owner && e.region == region)
     }
-    pub fn free(&mut self, owner: u32, region: Region) -> Result<(), u32> {
+    pub fn free(&mut self, owner: u32, region: Region) -> Result<(), Errno> {
         let slot = self
             .entries
             .iter()
             .position(|e| e.owner == owner && e.region == region)
-            .ok_or(1u32)?;
+            .ok_or(Errno::Eperm)?;
         let first = (region.base - self.base) / PAGE;
         let count = region.size / PAGE;
         let mask = if count == 64 {
@@ -134,8 +137,8 @@ mod tests {
     fn allocate_enforces_napot_alignment_and_owner_release() {
         // Start slightly unaligned to verify page rounding up to 0x4ff6_0000.
         let mut alloc = RegionAllocator::new(0x4ff5_f001, 0x4ff5_f001 + 32 * PAGE);
-        assert_eq!(alloc.allocate(0, PAGE), Err(22));
-        assert_eq!(alloc.allocate(1, 0), Err(22));
+        assert_eq!(alloc.allocate(0, PAGE), Err(Errno::Einval));
+        assert_eq!(alloc.allocate(1, 0), Err(Errno::Einval));
 
         let r1 = alloc.allocate(1, 100).unwrap();
         assert_eq!(r1.size, PAGE);
@@ -146,7 +149,7 @@ mod tests {
         let r2 = alloc.allocate(2, 5000).unwrap();
         assert_eq!(r2.size, 2 * PAGE);
         assert_eq!(r2.base % r2.size, 0);
-        assert_eq!(alloc.free(1, r2), Err(1));
+        assert_eq!(alloc.free(1, r2), Err(Errno::Eperm));
 
         alloc.release_owner(1);
         assert!(!alloc.owns(1, r1));
@@ -169,13 +172,13 @@ mod tests {
                 size: 2 * PAGE,
             }
         );
-        // Overlapping reservation is rejected with EBUSY (16).
-        assert_eq!(alloc.reserve(2, base + 3 * PAGE, PAGE), Err(16));
-        // Misaligned for 8 KiB NAPOT region -> EINVAL (22).
-        assert_eq!(alloc.reserve(2, base + PAGE, 2 * PAGE), Err(22));
-        // Below pool or beyond pool -> ENOMEM (12).
-        assert_eq!(alloc.reserve(2, base - PAGE, PAGE), Err(12));
-        assert_eq!(alloc.reserve(2, base + 8 * PAGE, PAGE), Err(12));
+        // Overlapping reservation is rejected with EBUSY.
+        assert_eq!(alloc.reserve(2, base + 3 * PAGE, PAGE), Err(Errno::Ebusy));
+        // Misaligned for 8 KiB NAPOT region -> EINVAL.
+        assert_eq!(alloc.reserve(2, base + PAGE, 2 * PAGE), Err(Errno::Einval));
+        // Below pool or beyond pool -> ENOMEM.
+        assert_eq!(alloc.reserve(2, base - PAGE, PAGE), Err(Errno::Enomem));
+        assert_eq!(alloc.reserve(2, base + 8 * PAGE, PAGE), Err(Errno::Enomem));
     }
 
     #[test]
@@ -185,12 +188,12 @@ mod tests {
         let whole = alloc.allocate(1, PAGES * PAGE).unwrap();
         assert_eq!(whole.base, base);
         assert_eq!(whole.size, PAGES * PAGE);
-        assert_eq!(alloc.allocate(1, PAGE), Err(12));
+        assert_eq!(alloc.allocate(1, PAGE), Err(Errno::Enomem));
         alloc.free(1, whole).unwrap();
 
         for _ in 0..ALLOCATIONS {
             alloc.allocate(1, PAGE).unwrap();
         }
-        assert_eq!(alloc.allocate(1, PAGE), Err(28));
+        assert_eq!(alloc.allocate(1, PAGE), Err(Errno::Enospc));
     }
 }

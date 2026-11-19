@@ -1,5 +1,5 @@
 use vela_kernel::{
-    capability as cap, ipc,
+    errno::Errno,
     process::EXECUTE,
     task::{Region, State, Wait},
 };
@@ -8,29 +8,28 @@ use super::Args;
 use crate::{arch, runtime::Runtime, syscall};
 
 impl Runtime {
-    pub(super) fn sys_spawn_hello(&mut self, current: usize, args: Args) -> u32 {
+    pub(super) fn sys_spawn_hello(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
         if self.processes.slots[current].id != 2 {
-            return cap::EPERM;
+            return Err(Errno::Eperm);
         }
         let bytes: &[u8] = match args.a0 {
             0 => include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
             2 => include_bytes!(concat!(env!("OUT_DIR"), "/dma.elf")),
             1 => include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
-            _ => return syscall::EINVAL,
+            _ => return Err(Errno::Einval),
         };
         self.spawn_elf(bytes, args.a0 == 2)
-            .unwrap_or_else(|e| (-(e as i32)) as u32)
     }
 
-    pub(super) fn sys_yield(&mut self, switch: &mut bool) -> u32 {
+    pub(super) fn sys_yield(&mut self, switch: &mut bool) -> Result<u32, Errno> {
         *switch = true;
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_exit(&mut self, switch: &mut bool) -> u32 {
+    pub(super) fn sys_exit(&mut self, switch: &mut bool) -> Result<u32, Errno> {
         self.terminate();
         *switch = true;
-        0
+        Ok(0)
     }
 
     pub(super) fn sys_thread_priority(
@@ -38,24 +37,23 @@ impl Runtime {
         current: usize,
         args: Args,
         switch: &mut bool,
-    ) -> u32 {
+    ) -> Result<u32, Errno> {
         if args.a1 > u32::from(self.processes.slots[current].priority_ceiling) {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
-        let Some(index) =
-            self.scheduler.tasks.iter().position(|t| {
-                t.id == args.a0 && t.process == current && t.state != State::Terminated
-            })
-        else {
-            return ipc::EPERM;
-        };
+        let index = self
+            .scheduler
+            .tasks
+            .iter()
+            .position(|t| t.id == args.a0 && t.process == current && t.state != State::Terminated)
+            .ok_or(Errno::Eperm)?;
         self.scheduler.tasks[index].priority = args.a1 as u8;
         self.scheduler.inherit();
         *switch = self.scheduler.should_preempt();
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_thread_create(&mut self, current: usize, args: Args) -> u32 {
+    pub(super) fn sys_thread_create(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
         let entry = args.a0 as usize;
         let stack = Region {
             base: args.a1 as usize,
@@ -73,7 +71,7 @@ impl Runtime {
             || affinity != 1
             || !self.allocator.owns(self.processes.slots[current].id, stack)
         {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         let end = stack.base + stack.size;
         if self.scheduler.tasks.iter().any(|t| {
@@ -82,22 +80,24 @@ impl Runtime {
                 && stack.base < t.stack.base + t.stack.size
                 && t.stack.base < end
         }) {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         let context = arch::TrapFrame::user(entry, end, args.a3);
-        self.scheduler
-            .create_thread(
-                current,
-                context,
-                stack,
-                entry,
-                priority as u8,
-                affinity as u8,
-            )
-            .unwrap_or_else(|e| (-(e as i32)) as u32)
+        self.scheduler.create_thread(
+            current,
+            context,
+            stack,
+            entry,
+            priority as u8,
+            affinity as u8,
+        )
     }
 
-    pub(super) fn sys_process_exit(&mut self, current: usize, switch: &mut bool) -> u32 {
+    pub(super) fn sys_process_exit(
+        &mut self,
+        current: usize,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
         for thread in &mut self.scheduler.tasks {
             if thread.process == current {
                 thread.state = State::Terminated;
@@ -106,20 +106,20 @@ impl Runtime {
         }
         self.terminate();
         *switch = true;
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_ticks(&self) -> u32 {
-        self.scheduler.snapshot().uptime_ticks as u32
+    pub(super) fn sys_ticks(&self) -> Result<u32, Errno> {
+        Ok(self.scheduler.snapshot().uptime_ticks as u32)
     }
 
-    pub(super) fn sys_stats(&self, args: Args) -> u32 {
+    pub(super) fn sys_stats(&self, args: Args) -> Result<u32, Errno> {
         let len = args.a1 as usize;
         if !matches!(len, syscall::STATS_BYTES | syscall::STATS_IRQ_BYTES) {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         if !self.writable(args.a0 as usize, len) {
-            return syscall::EFAULT;
+            return Err(Errno::Efault);
         }
         let s = self.scheduler.snapshot();
         let words = [
@@ -145,16 +145,16 @@ impl Runtime {
                 }
             }
         }
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_sleep(&mut self, args: Args, switch: &mut bool) -> u32 {
+    pub(super) fn sys_sleep(&mut self, args: Args, switch: &mut bool) -> Result<u32, Errno> {
         if args.a0 == 0 || args.a0 > 6000 {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         let until = self.scheduler.snapshot().uptime_ticks + u64::from(args.a0);
         self.scheduler.block(Wait::Sleep { until });
         *switch = true;
-        0
+        Ok(0)
     }
 }

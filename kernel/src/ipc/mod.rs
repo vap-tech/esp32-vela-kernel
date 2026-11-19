@@ -1,18 +1,12 @@
 //! Single-hart IPC. Serialize with scheduler under masked machine IRQs.
 //! No user pointers inside this module.
-use crate::capability::Object;
+use crate::{capability::Object, errno::Errno};
 pub const MAX_ENDPOINTS: usize = 8;
 pub const HANDLES: usize = 6;
 pub const MESSAGE_BYTES: usize = 96;
 pub const QUEUE_DEPTH: usize = 4;
 pub const SEND: u16 = crate::capability::SEND;
 pub const RECEIVE: u16 = crate::capability::RECEIVE;
-pub const EBADF: u32 = (-9i32) as u32;
-pub const EPERM: u32 = (-1i32) as u32;
-pub const EAGAIN: u32 = (-11i32) as u32;
-pub const ENOSPC: u32 = (-28i32) as u32;
-pub const EPIPE: u32 = (-32i32) as u32;
-pub const EMSGSIZE: u32 = (-90i32) as u32;
 #[derive(Clone, Copy)]
 pub struct Message {
     pub data: [u8; MESSAGE_BYTES],
@@ -59,23 +53,23 @@ impl Ipc {
             generation: 0,
         }
     }
-    pub fn resolve(&self, object: Object) -> Result<usize, u32> {
+    pub fn resolve(&self, object: Object) -> Result<usize, Errno> {
         let Object::Endpoint { index, generation } = object else {
-            return Err(EBADF);
+            return Err(Errno::Ebadf);
         };
-        let ep = self.endpoints.get(index).ok_or(EBADF)?;
+        let ep = self.endpoints.get(index).ok_or(Errno::Ebadf)?;
         if ep.owner.is_none() || ep.generation != generation {
-            return Err(EPIPE);
+            return Err(Errno::Epipe);
         }
         Ok(index)
     }
-    pub fn create(&mut self, owner: usize) -> Result<Object, u32> {
+    pub fn create(&mut self, owner: usize) -> Result<Object, Errno> {
         let index = self
             .endpoints
             .iter()
             .position(|e| e.owner.is_none())
-            .ok_or(ENOSPC)?;
-        self.generation = self.generation.checked_add(1).ok_or(ENOSPC)?;
+            .ok_or(Errno::Enospc)?;
+        self.generation = self.generation.checked_add(1).ok_or(Errno::Enospc)?;
         self.endpoints[index] = Endpoint {
             owner: Some(owner),
             generation: self.generation,
@@ -96,30 +90,30 @@ impl Ipc {
         }
     }
     /// Full queue => EAGAIN, no partial delivery and no sender blocking.
-    pub fn send(&mut self, ep: usize, message: Message) -> Result<usize, u32> {
+    pub fn send(&mut self, ep: usize, message: Message) -> Result<usize, Errno> {
         if message.length > MESSAGE_BYTES {
-            return Err(EMSGSIZE);
+            return Err(Errno::Emsgsize);
         }
 
         let endpoint = &mut self.endpoints[ep];
         if endpoint.count == QUEUE_DEPTH {
-            return Err(EAGAIN);
+            return Err(Errno::Eagain);
         }
         endpoint.queue[(endpoint.head + endpoint.count) % QUEUE_DEPTH] = message;
         endpoint.count += 1;
         Ok(ep)
     }
     /// EMSGSIZE leaves message queued. Receive rights are owner-only.
-    pub fn receive(&mut self, ep: usize, capacity: usize) -> Result<Option<Message>, u32> {
+    pub fn receive(&mut self, ep: usize, capacity: usize) -> Result<Option<Message>, Errno> {
         let endpoint = &mut self.endpoints[ep];
         if endpoint.owner.is_none() {
-            return Err(EPIPE);
+            return Err(Errno::Epipe);
         }
         if endpoint.count == 0 {
             return Ok(None);
         }
         if endpoint.queue[endpoint.head].length > capacity {
-            return Err(EMSGSIZE);
+            return Err(Errno::Emsgsize);
         }
         let result = endpoint.queue[endpoint.head];
         endpoint.head = (endpoint.head + 1) % QUEUE_DEPTH;
@@ -165,10 +159,10 @@ mod tests {
             ipc.send(ep, make_message(&[b'a' + i as u8; 8], i as u32 + 1))
                 .unwrap();
         }
-        assert_eq!(ipc.send(ep, make_message(b"extra", 99)), Err(EAGAIN));
+        assert_eq!(ipc.send(ep, make_message(b"extra", 99)), Err(Errno::Eagain));
 
         // Too-small buffer returns EMSGSIZE without dropping the head message.
-        assert_eq!(ipc.receive(ep, 4).err(), Some(EMSGSIZE));
+        assert_eq!(ipc.receive(ep, 4).err(), Some(Errno::Emsgsize));
         let first = ipc.receive(ep, 8).unwrap().unwrap();
         assert_eq!(&first.data[..first.length], &[b'a'; 8]);
         assert_eq!(first.reply_token, 1);
@@ -192,7 +186,7 @@ mod tests {
                 owner: 1,
                 region: Region::default(),
             }),
-            Err(EBADF)
+            Err(Errno::Ebadf)
         );
         let e0 = ipc.create(1).unwrap();
         let e1 = ipc.create(2).unwrap();
@@ -202,14 +196,14 @@ mod tests {
         let closed = ipc.remove_task(1);
         assert!(closed[idx0]);
         assert!(!closed[idx1]);
-        assert_eq!(ipc.resolve(e0), Err(EPIPE));
-        assert_eq!(ipc.receive(idx0, MESSAGE_BYTES).err(), Some(EPIPE));
+        assert_eq!(ipc.resolve(e0), Err(Errno::Epipe));
+        assert_eq!(ipc.receive(idx0, MESSAGE_BYTES).err(), Some(Errno::Epipe));
         assert_eq!(ipc.resolve(e1), Ok(idx1));
 
         // Slot reuse gets a new generation so stale objects stay invalid.
         let e0_new = ipc.create(3).unwrap();
         assert_eq!(ipc.resolve(e0_new), Ok(idx0));
-        assert_eq!(ipc.resolve(e0), Err(EPIPE));
+        assert_eq!(ipc.resolve(e0), Err(Errno::Epipe));
     }
 
     #[test]
@@ -218,6 +212,6 @@ mod tests {
         for _ in 0..MAX_ENDPOINTS {
             ipc.create(1).unwrap();
         }
-        assert_eq!(ipc.create(1), Err(ENOSPC));
+        assert_eq!(ipc.create(1), Err(Errno::Enospc));
     }
 }

@@ -1,4 +1,5 @@
 use crate::{
+    errno::Errno,
     stats::{HZ, LoadAverage, Snapshot},
     task::{Region, State, Thread, Wait},
 };
@@ -64,16 +65,16 @@ impl<C: Copy> Scheduler<C> {
         entry: usize,
         priority: u8,
         affinity: u8,
-    ) -> Result<u32, u32> {
+    ) -> Result<u32, Errno> {
         if priority > 3 || affinity == 0 || affinity & !3 != 0 {
-            return Err(22);
+            return Err(Errno::Einval);
         }
         let index = self
             .tasks
             .iter()
             .position(|t| t.state == State::Terminated)
-            .ok_or(28u32)?;
-        let id = self.last_id.checked_add(1).ok_or(75u32)?;
+            .ok_or(Errno::Enospc)?;
+        let id = self.last_id.checked_add(1).ok_or(Errno::Eoverflow)?;
         self.tasks[index] = Thread {
             id,
             process,
@@ -335,14 +336,26 @@ mod tests {
             base: 0x4000,
             size: 4096,
         };
-        assert_eq!(s.create_thread(0, 0, stack, 0x400, 4, 1), Err(22));
-        assert_eq!(s.create_thread(0, 0, stack, 0x400, 1, 0), Err(22));
-        assert_eq!(s.create_thread(0, 0, stack, 0x400, 1, 4), Err(22));
+        assert_eq!(
+            s.create_thread(0, 0, stack, 0x400, 4, 1),
+            Err(Errno::Einval)
+        );
+        assert_eq!(
+            s.create_thread(0, 0, stack, 0x400, 1, 0),
+            Err(Errno::Einval)
+        );
+        assert_eq!(
+            s.create_thread(0, 0, stack, 0x400, 1, 4),
+            Err(Errno::Einval)
+        );
 
         for i in 0..(TASKS - BOOT_THREADS) {
             let tid = s.create_thread(0, 0, stack, 0x400, 1, 1).unwrap();
             assert_eq!(tid, BOOT_THREADS as u32 + i as u32 + 1);
         }
-        assert_eq!(s.create_thread(0, 0, stack, 0x400, 1, 1), Err(28));
+        assert_eq!(
+            s.create_thread(0, 0, stack, 0x400, 1, 1),
+            Err(Errno::Enospc)
+        );
     }
 }

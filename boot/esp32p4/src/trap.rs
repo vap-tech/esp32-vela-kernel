@@ -1,5 +1,6 @@
 use core::fmt::Write;
 use vela_kernel::{
+    errno::Errno,
     sched::TASKS,
     task::{State, Wait},
 };
@@ -57,7 +58,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             for i in 0..TASKS {
                 if matches!(runtime.scheduler.tasks[i].wait, Wait::Sentinel { deadline, .. } if uptime >= deadline)
                 {
-                    runtime.scheduler.tasks[i].context.registers[8] = (-110i32) as u32;
+                    runtime.scheduler.tasks[i].context.registers[8] = Errno::Etimedout.to_abi();
                     runtime.scheduler.wake(i);
                 }
             }
@@ -66,7 +67,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             if runtime.scheduler.tasks[i].state == State::Blocked
                 && matches!(runtime.scheduler.tasks[i].wait, Wait::SentinelWake { deadline, .. } if uptime >= deadline)
             {
-                runtime.scheduler.tasks[i].context.registers[8] = (-110i32) as u32;
+                runtime.scheduler.tasks[i].context.registers[8] = Errno::Etimedout.to_abi();
                 runtime.scheduler.tasks[i].context.registers[9] = 0;
                 runtime.scheduler.wake(i);
                 // Keep the LP token reserved: a late event cannot complete a new alarm.

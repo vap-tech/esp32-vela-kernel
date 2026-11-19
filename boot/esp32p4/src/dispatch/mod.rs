@@ -4,6 +4,8 @@ mod memory;
 mod sentinel;
 mod thread;
 
+use vela_kernel::errno::Errno;
+
 use crate::{arch, runtime::Runtime, syscall};
 
 #[derive(Clone, Copy)]
@@ -35,7 +37,7 @@ impl Runtime {
     pub fn dispatch(&mut self, frame: &mut arch::TrapFrame, switch: &mut bool) -> u32 {
         let args = Args::from_frame(frame);
         let current = self.scheduler.current().process;
-        match args.number {
+        let result = match args.number {
             syscall::SPAWN_HELLO => self.sys_spawn_hello(current, args),
             syscall::WRITE => self.sys_write(args),
             syscall::YIELD => self.sys_yield(switch),
@@ -74,7 +76,11 @@ impl Runtime {
             syscall::EVENT_WAIT => self.sys_event_wait(current, args, switch),
             syscall::CONSOLE_READ => self.sys_console_read(current, args),
             syscall::SLEEP => self.sys_sleep(args, switch),
-            _ => syscall::ENOSYS,
+            _ => Err(Errno::Enosys),
+        };
+        match result {
+            Ok(value) => value,
+            Err(errno) => errno.to_abi(),
         }
     }
 }

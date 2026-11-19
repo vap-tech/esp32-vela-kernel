@@ -1,6 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{
     capability::{self as cap, Object},
+    errno::Errno,
     ipc::{self, Message},
     process::{Lifecycle, WRITE},
     sched::TASKS,
@@ -15,7 +16,12 @@ use crate::{
 };
 
 impl Runtime {
-    pub(super) fn sys_ipc_call(&mut self, current: usize, args: Args, switch: &mut bool) -> u32 {
+    pub(super) fn sys_ipc_call(
+        &mut self,
+        current: usize,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
         let length = args.a2 as usize;
         let capacity = args.a4 as usize;
         let timeout = args.a5;
@@ -25,32 +31,27 @@ impl Runtime {
             || capacity > ipc::MESSAGE_BYTES
             || timeout > 6000
         {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         if !self.readable(args.a1 as usize, length) || !self.writable(args.a3 as usize, capacity) {
-            return syscall::EFAULT;
+            return Err(Errno::Efault);
         }
-        let ep = match self.endpoint(current, args.a0, cap::SEND) {
-            Ok(e) => e,
-            Err(e) => return e,
-        };
+        let ep = self.endpoint(current, args.a0, cap::SEND)?;
         let server_process = self.ipc.owner(ep).unwrap();
         // No self-process RPC: avoid an unbounded dependency on caller-owned locks.
         if server_process == current {
-            return (-35i32) as u32;
+            return Err(Errno::Edeadlk);
         }
-        let Some(server) = self
+        let server = self
             .scheduler
             .tasks
             .iter()
             .position(|t| t.process == server_process && t.state != State::Terminated)
-        else {
-            return ipc::EPIPE;
-        };
+            .ok_or(Errno::Epipe)?;
         let mut dependency = server;
         for _ in 0..TASKS {
             if dependency == thread {
-                return (-35i32) as u32;
+                return Err(Errno::Edeadlk);
             }
             if let Wait::Reply { server, .. } = self.scheduler.tasks[dependency].wait {
                 dependency = server;
@@ -59,7 +60,7 @@ impl Runtime {
             }
         }
         if self.calls[thread].generation == 0x7f_ffff {
-            return ipc::ENOSPC;
+            return Err(Errno::Enospc);
         }
         let generation = self.calls[thread].generation + 1;
         let token = (generation << 8) | (thread as u32 + 1);
@@ -70,9 +71,7 @@ impl Runtime {
             // SAFETY: validated source; copy message before blocking caller.
             message.data[i] = unsafe { (args.a1 as *const u8).add(i).read() };
         }
-        if let Err(e) = self.ipc.send(ep, message) {
-            return e;
-        }
+        self.ipc.send(ep, message)?;
         self.calls[thread] = Call {
             generation,
             active: true,
@@ -94,22 +93,23 @@ impl Runtime {
         self.complete_receivers(ep, false);
         self.scheduler.inherit();
         *switch = true;
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_ipc_reply(&mut self, current: usize, args: Args, switch: &mut bool) -> u32 {
+    pub(super) fn sys_ipc_reply(
+        &mut self,
+        current: usize,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
         let client = (args.a0 & 255).wrapping_sub(1) as usize;
-        let Some(call) = self.calls.get(client).copied() else {
-            return ipc::EBADF;
-        };
+        let call = self.calls.get(client).copied().ok_or(Errno::Ebadf)?;
         if !call.active || call.generation != args.a0 >> 8 {
-            return ipc::EPIPE;
+            return Err(Errno::Epipe);
         }
-        let Some(server) = call.server else {
-            return ipc::EPERM;
-        };
+        let server = call.server.ok_or(Errno::Eperm)?;
         if self.scheduler.tasks[server].process != current {
-            return ipc::EPERM;
+            return Err(Errno::Eperm);
         }
         let Wait::Reply {
             token,
@@ -118,13 +118,13 @@ impl Runtime {
             ..
         } = self.scheduler.tasks[client].wait
         else {
-            return ipc::EPIPE;
+            return Err(Errno::Epipe);
         };
         if token != args.a0 {
-            return ipc::EPIPE;
+            return Err(Errno::Epipe);
         }
         if args.a2 as usize > capacity || args.a2 as usize > ipc::MESSAGE_BYTES {
-            return ipc::EMSGSIZE;
+            return Err(Errno::Emsgsize);
         }
         let target = self.scheduler.tasks[client].process;
         if !self.readable(args.a1 as usize, args.a2 as usize)
@@ -132,7 +132,7 @@ impl Runtime {
                 .memory
                 .permits(pointer, capacity, WRITE)
         {
-            return syscall::EFAULT;
+            return Err(Errno::Efault);
         }
         let mut message = Message::EMPTY;
         message.length = args.a2 as usize;
@@ -149,10 +149,14 @@ impl Runtime {
         self.scheduler.inherit();
         self.scheduler.prefer(client);
         *switch = self.scheduler.should_preempt();
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_cap_or_mem_grant(&mut self, current: usize, args: Args) -> u32 {
+    pub(super) fn sys_cap_or_mem_grant(
+        &mut self,
+        current: usize,
+        args: Args,
+    ) -> Result<u32, Errno> {
         let peer = match self
             .processes
             .slots
@@ -160,27 +164,20 @@ impl Runtime {
             .position(|p| p.state == Lifecycle::Alive && p.id == args.a1)
         {
             Some(p) if p != current => p,
-            _ => return syscall::EINVAL,
+            _ => return Err(Errno::Einval),
         };
         if args.a2 > u16::MAX as u32 {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         let rights = args.a2 as u16;
-        let source = match self.processes.slots[current]
+        let source = self.processes.slots[current]
             .capabilities
-            .get(args.a0, cap::GRANT)
-        {
-            Ok(c) => c,
-            Err(e) => return e,
-        };
+            .get(args.a0, cap::GRANT)?;
         if let Object::Memory { region, .. } = source.object {
             if rights & !(cap::READ | cap::WRITE) != 0 || rights & cap::READ == 0 {
-                return syscall::EINVAL;
+                return Err(Errno::Einval);
             }
-            let handle = match grant(&mut self.processes, current, args.a0, peer, rights) {
-                Ok(h) => h,
-                Err(e) => return e,
-            };
+            let handle = grant(&mut self.processes, current, args.a0, peer, rights)?;
             if let Err(e) = self.processes.slots[peer]
                 .memory
                 .insert(region, rights as u8)
@@ -189,24 +186,20 @@ impl Runtime {
                     .capabilities
                     .close(handle)
                     .unwrap();
-                return (-(e as i32)) as u32;
+                return Err(e);
             }
-            handle
+            Ok(handle)
         } else if args.number == syscall::MEM_GRANT {
-            syscall::EINVAL
+            Err(Errno::Einval)
         } else {
-            grant(&mut self.processes, current, args.a0, peer, rights).unwrap_or_else(|e| e)
+            grant(&mut self.processes, current, args.a0, peer, rights)
         }
     }
 
-    pub(super) fn sys_cap_revoke(&mut self, current: usize, args: Args) -> u32 {
-        let c = match self.processes.slots[current]
+    pub(super) fn sys_cap_revoke(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
+        let c = self.processes.slots[current]
             .capabilities
-            .get(args.a0, cap::CONTROL)
-        {
-            Ok(c) => c,
-            Err(e) => return e,
-        };
+            .get(args.a0, cap::CONTROL)?;
         self.invalidate_object(c.object, Some(current));
         if let Object::Endpoint { index, .. } = c.object {
             for i in 0..TASKS {
@@ -214,31 +207,25 @@ impl Runtime {
                     && self.calls[i].endpoint == index
                     && self.scheduler.tasks[i].process != current
                 {
-                    self.fail_call(i, ipc::EPIPE);
+                    self.fail_call(i, Errno::Epipe);
                 }
             }
             self.complete_receivers(index, false);
         }
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_endpoint_create(&mut self, current: usize) -> u32 {
-        create_endpoint(&mut self.ipc, &mut self.processes, current).unwrap_or_else(|e| e)
+    pub(super) fn sys_endpoint_create(&mut self, current: usize) -> Result<u32, Errno> {
+        create_endpoint(&mut self.ipc, &mut self.processes, current)
     }
 
-    pub(super) fn sys_endpoint_close(&mut self, current: usize, args: Args) -> u32 {
-        let capability = match self.processes.slots[current].capabilities.get(args.a0, 0) {
-            Ok(c) => c,
-            Err(e) => return e,
-        };
-        let ep = match self.ipc.resolve(capability.object) {
-            Ok(ep) => ep,
-            Err(e) => return e,
-        };
+    pub(super) fn sys_endpoint_close(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
+        let capability = self.processes.slots[current].capabilities.get(args.a0, 0)?;
+        let ep = self.ipc.resolve(capability.object)?;
         if capability.rights & cap::CONTROL != 0 {
             for i in 0..TASKS {
                 if self.calls[i].active && self.calls[i].endpoint == ep {
-                    self.fail_call(i, ipc::EPIPE);
+                    self.fail_call(i, Errno::Epipe);
                 }
             }
             self.ipc.close(ep);
@@ -251,39 +238,35 @@ impl Runtime {
                 .unwrap();
             self.complete_receivers(ep, false);
         }
-        0
+        Ok(0)
     }
 
-    pub(super) fn sys_send(&mut self, current: usize, args: Args, switch: &mut bool) -> u32 {
+    pub(super) fn sys_send(
+        &mut self,
+        current: usize,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
         let length = args.a2 as usize;
         if length > ipc::MESSAGE_BYTES {
-            return ipc::EMSGSIZE;
+            return Err(Errno::Emsgsize);
         }
         if !self.readable(args.a1 as usize, length) {
-            return syscall::EFAULT;
+            return Err(Errno::Efault);
         }
         // Validate namespace/rights before touching sender's data.
-        if let Err(e) = self.endpoint(current, args.a0, ipc::SEND) {
-            return e;
-        }
+        let ep = self.endpoint(current, args.a0, ipc::SEND)?;
         let mut message = Message::EMPTY;
         message.length = length;
         for i in 0..length {
             // SAFETY: checked sender mapping, copy into a kernel-owned message.
             message.data[i] = unsafe { (args.a1 as *const u8).add(i).read() };
         }
-        match self
-            .ipc
-            .send(self.endpoint(current, args.a0, ipc::SEND).unwrap(), message)
-        {
-            Ok(ep) => {
-                self.complete_receivers(ep, false);
-                self.scheduler.inherit();
-                *switch = self.scheduler.should_preempt();
-                0
-            }
-            Err(e) => e,
-        }
+        let ep = self.ipc.send(ep, message)?;
+        self.complete_receivers(ep, false);
+        self.scheduler.inherit();
+        *switch = self.scheduler.should_preempt();
+        Ok(0)
     }
 
     pub(super) fn sys_recv(
@@ -292,31 +275,27 @@ impl Runtime {
         args: Args,
         frame: &mut arch::TrapFrame,
         switch: &mut bool,
-    ) -> u32 {
+    ) -> Result<u32, Errno> {
         let capacity = args.a2 as usize;
         if capacity == 0 || capacity > ipc::MESSAGE_BYTES || args.a3 & !syscall::NONBLOCK != 0 {
-            return syscall::EINVAL;
+            return Err(Errno::Einval);
         }
         if !self.writable(args.a1 as usize, capacity) {
-            return syscall::EFAULT;
+            return Err(Errno::Efault);
         }
-        let ep = match self.endpoint(current, args.a0, ipc::RECEIVE) {
-            Ok(ep) => ep,
-            Err(e) => return e,
-        };
-        match self.ipc.receive(ep, capacity) {
-            Ok(Some(message)) => {
+        let ep = self.endpoint(current, args.a0, ipc::RECEIVE)?;
+        match self.ipc.receive(ep, capacity)? {
+            Some(message) => {
                 self.bind_reply(message.reply_token, self.scheduler.current);
                 frame.registers[9] = message.reply_token;
                 // SAFETY: checked writable receive buffer. No shared-memory pointers.
                 unsafe {
                     deliver(args.a1 as usize, &message);
                 }
-                message.length as u32
+                Ok(message.length as u32)
             }
-            Err(e) => e,
-            Ok(None) if args.a3 & syscall::NONBLOCK != 0 => ipc::EAGAIN,
-            Ok(None) => {
+            None if args.a3 & syscall::NONBLOCK != 0 => Err(Errno::Eagain),
+            None => {
                 // Check+wait registration+Blocked are one IRQ-masked
                 // transaction, so send cannot race and lose the wakeup.
                 self.scheduler.block(Wait::Receive {
@@ -330,7 +309,7 @@ impl Runtime {
                     self.logged_block = true;
                     let _ = writeln!(self.console, "[ipc] recv blocked task={}", current + 1);
                 }
-                0 // replaced with completed length/error before wakeup
+                Ok(0) // replaced with completed length/error before wakeup
             }
         }
     }
