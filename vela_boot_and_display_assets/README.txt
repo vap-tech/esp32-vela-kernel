@@ -21,8 +21,11 @@ the provided PNG files preserve the rasterized fonts.
 
 Vela integration
 ----------------
-The Cargo build runs tools/display_assets.py (Python 3 with Pillow).
-It generates counterclockwise-rotated RGB565 run streams inside Cargo OUT_DIR.
+The build runs tools/display_assets.py (Python 3 with Pillow).
+It generates counterclockwise-rotated RGB565 run streams in target/display-assets.
+The bundle is appended at Flash offset 0x100000 by tools/flash_assets.py.
+Cargo OUT_DIR contains only the small metadata included by the firmware.
+The renderer reads Flash in 4 KiB chunks and expands into PSRAM.
 The keyboard connector is along the bottom edge in this landscape orientation.
 The command display diag selects the diagnostic image, and display boot
 selects the boot artwork. Both use one kernel-owned PSRAM framebuffer.

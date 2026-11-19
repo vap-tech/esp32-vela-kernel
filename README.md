@@ -356,7 +356,9 @@ share the same zero source.
 rotates each 1280×720 PNG counterclockwise into the 720×1280 scanout layout,
 placing the keyboard connector along the bottom edge,
 quantizes it to RGB565 and encodes little-endian (u16 count, u16 pixel)
-runs. The converter checks its output by an exact round trip.
+runs. The converter checks its output by an exact round trip. The run streams
+are packaged into a Flash-only area at 0x100000. Cargo includes their addresses,
+lengths, CRCs and expected header as small metadata.
 
 The trusted driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
 mode registers and verifies the selected chip's 32 MiB density. The link
@@ -372,15 +374,25 @@ batches. The framebuffer is written only after the previous scanout stops.
 Both full-screen images and their orientation were visually confirmed on
 Tab5. Startup checks passed 40 frames without recurring underrun, followed
 by shell/procfs, AHB DMA copy and healthy Sentinel with missed=0.
-Logs are `target/display-full-smoke.log` and `target/display-boot-smoke.log`.
+Logs for Flash-backed rendering are `target/display-flash-diag.log` and
+`target/display-flash-boot.log`.
 
-The RLE assets occupy 87948 + 183908 bytes in the SRAM-loaded firmware
-payload. Current payload is 360448 bytes and BSS 24576 bytes, leaving
-48 KiB before the separate AHB DMA reservation. The ordinary SRAM Orbit
-buffer remains reserved for mode switching. The artwork is selected through
-the shell; startup still enters the USB shell.
+The RLE assets occupy 87948 + 183908 bytes in Flash, with a 64-byte
+versioned header. The build appends this area to the normal firmware image
+and checks Flash bounds, padding, stream pixel counts and CRCs. The runtime
+compares the header with the compiled metadata and checks the selected image's
+CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
+for expansion and framebuffer readback. A separate validation reader also
+uses 4 KiB during the first row batch.
+
+Current SRAM payload is 90112 bytes and BSS 24576 bytes, leaving 312 KiB
+before the separate AHB DMA reservation. This frees 264 KiB compared with
+embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
+reserved for mode switching. The artwork is selected through the shell;
+startup still enters the USB shell.
 
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
 13 an invalid image stream/range, 14 a framebuffer readback mismatch and
-15 a command timeout. PSRAM use is currently limited to the driver window.
+15 a PSRAM command timeout, 16 a Flash read/range error, 17 an asset
+header mismatch and 18 an image CRC mismatch. PSRAM use is currently limited to the driver window.
 General PSRAM allocation, cached mappings and XIP remain separate work.

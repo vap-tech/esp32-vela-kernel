@@ -19,6 +19,7 @@ pub mod timer;
 pub mod clock;
 pub mod display_io;
 pub mod dsi;
+pub mod flash;
 pub mod lp_counter;
 pub mod psram;
 pub mod scanout;

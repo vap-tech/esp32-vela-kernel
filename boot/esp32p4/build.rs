@@ -7,6 +7,7 @@ fn main() {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     for path in [
         "../../tools/display_assets.py",
+        "../../tools/flash_assets.py",
         "../../vela_boot_and_display_assets/vela_boot.png",
         "../../vela_boot_and_display_assets/vela_display_test.png",
     ] {
@@ -15,6 +16,7 @@ fn main() {
     let status = std::process::Command::new("python3")
         .arg("../../tools/display_assets.py")
         .arg(&out)
+        .arg("--metadata-only")
         .status()
         .expect("Python3 and Pillow required for display assets");
     assert!(status.success(), "convert display PNG assets");

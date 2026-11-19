@@ -24,9 +24,9 @@ pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
     let orbit = mode != 1;
     if mode >= 4 && (5..45).contains(&stage) {
         let image = if mode == 4 {
-            images::DIAGNOSTIC
+            &images::DIAGNOSTIC
         } else {
-            images::BOOT
+            &images::BOOT
         };
         images::draw_rows(image, usize::from(stage - 5) * 32, 32)?;
         return Ok(1);

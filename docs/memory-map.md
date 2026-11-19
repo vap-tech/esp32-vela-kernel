@@ -20,5 +20,7 @@ The packer independently checks segment ranges and Flash capacity (16 MiB).
 check_elf.py checks linked symbols, stack alignment and trap alignment.
 No guard page/PMP protection exists yet. Link bounds do not detect stack overflow.
 
-Flash offsets: 0x2000 ROM image, 0x40000 manifest, 0x40040 payload.
+Flash offsets are 0x2000 ROM image, 0x40000 manifest, 0x40040 SRAM payload,
+and 0x100000 display asset header followed by two RLE images. The asset
+area is read in chunks at runtime. It has no SRAM load segment.
 Build prints actual payload size and CRC; the large FF gap explains firmware file size.
