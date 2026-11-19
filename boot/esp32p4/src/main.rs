@@ -67,7 +67,7 @@ struct Runtime {
     sentinel_diagnostics: u32,
     sentinel_hz: u32,
     heartbeat_link: vela_kernel::sentinel::Heartbeat,
-    display_orbit: bool,
+    display_mode: u8,
     display_stage: u8,
     sentinel_heartbeat: bool,
     sentinel_next_beat: u64,
@@ -227,7 +227,7 @@ extern "C" fn rust_main() -> ! {
         sentinel_diagnostics: 0,
         sentinel_hz: 0,
         heartbeat_link: Default::default(),
-        display_orbit: false,
+        display_mode: 1,
         display_stage: u8::MAX,
         sentinel_heartbeat: true,
         sentinel_next_beat: 0,
@@ -1284,14 +1284,14 @@ impl Runtime {
                 if self.processes.slots[current].id != 2 {
                     return cap::EPERM;
                 }
-                if matches!(a0, 1 | 2) {
+                if matches!(a0, 1..=3) {
                     soc::scanout::stop();
-                    self.display_orbit = a0 == 2;
+                    self.display_mode = a0 as u8;
                     self.display_stage = 0;
                 } else if a0 != 0 {
                     return syscall::EINVAL;
                 }
-                match board::display_step(self.display_stage, self.display_orbit) {
+                match board::display_step(self.display_stage, self.display_mode) {
                     Ok(delay) => {
                         self.display_stage = if delay == 0 {
                             u8::MAX

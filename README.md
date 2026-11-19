@@ -29,6 +29,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
 | `cat /proc/interrupts` | Read 64-bit SYSTIMER and USB Serial/JTAG RX interrupt counts on hart0. |
+| `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
 | `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
 | `memtest` | Check aligned userspace allocation, bounds and release. |
 | `run hello`, `run pic` | Launch the bundled fixed-address ELF and static PIE, respectively. |
@@ -297,3 +298,27 @@ Regenerate the checked-in coverage asset using `/usr/bin/python3
 tools/orbit_asset.py` with PyGObject, Pycairo and librsvg installed.
 The lower SRAM display reservation occupies 148224 bytes within
 0x4ff00000..0x4ff26000, before the boot stack.
+
+
+### Minimal pixel scanout
+
+`display pixel` initializes ST7121 and enables one white RGB565 pixel at
+(360, 640) on a black 720×1280 image. The DMA source uses two 64-bit words
+and twelve 64-byte descriptors (784 bytes actively used). The existing
+148224-byte lower SRAM reservation also serves the experimental Orbit path.
+No additional pixel buffer is allocated.
+
+Display initialization selects the fixed rev1.x CPU/MEM/SYS 180 MHz, APB
+90 MHz operating point from a calibrated 360 MHz CPLL, following ESP-IDF
+v5.5.2. The boot configuration inherited from ROM used XTAL at 40 MHz.
+At that speed DPI 80 MHz repeatedly underruns. With the higher bus rate,
+the minimal source transmitted 40 frames during the startup check without
+a recurring underrun. The white point was visually confirmed during
+bring-up, and shell, procfs and Sentinel remained operational.
+
+DPI stays at the visually confirmed 80 MHz. Stream startup preloads the
+bridge FIFO. After startup settling, the command clears the underrun latch
+and checks another 500 ms of scanout. Error 9 indicates clock setup failure.
+The fixed clock point persists after the display command. Runtime DVFS and
+power-state transitions require separate integration.
+Hardware log is `target/display-pixel-smoke.log`.

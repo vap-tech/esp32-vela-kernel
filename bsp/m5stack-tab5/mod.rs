@@ -19,7 +19,8 @@ fn backlight(on: bool) {
 }
 /// Sequential trusted operations. Positive result is a minimum delay in 10ms
 /// ticks before the next stage. The shell sleeps between stages.
-pub fn display_step(stage: u8, orbit: bool) -> Result<u32, u32> {
+pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
+    let orbit = mode != 1;
     match stage {
         0 => {
             BUS.init();
@@ -42,6 +43,7 @@ pub fn display_step(stage: u8, orbit: bool) -> Result<u32, u32> {
             if version != 1 {
                 return Err(0x100 + u32::from(version));
             }
+            crate::soc::clock::display_speed().map_err(|_| 9u32)?;
             dsi::power_phy();
             Ok(2)
         }
@@ -68,12 +70,20 @@ pub fn display_step(stage: u8, orbit: bool) -> Result<u32, u32> {
                 return Err(7);
             }
             if orbit {
-                crate::soc::scanout::start(include_bytes!("orbit.a8"), [0x85, 0xbf, 0xff]);
+                crate::soc::scanout::start(
+                    include_bytes!("orbit.a8"),
+                    [0x85, 0xbf, 0xff],
+                    mode == 3,
+                );
                 return Ok(12);
             }
             Ok(0)
         }
         6 if orbit => {
+            crate::soc::scanout::clear_underrun();
+            Ok(50)
+        }
+        7 if orbit => {
             crate::soc::scanout::debug();
             use core::fmt::Write;
             let _ = writeln!(
@@ -83,7 +93,6 @@ pub fn display_step(stage: u8, orbit: bool) -> Result<u32, u32> {
                 crate::soc::scanout::underrun()
             );
             if crate::soc::scanout::frames() < 2 || crate::soc::scanout::underrun() {
-                crate::soc::scanout::stop();
                 return Err(8);
             }
             Ok(0)

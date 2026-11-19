@@ -156,7 +156,12 @@ pub fn video(bars: bool) -> bool {
     set(V_FRONT_PORCH, 200);
     set(V_ACTIVE, 1280);
     set(VIDEO_MODE, u32::from(bars) << 16 | 0x3f00 | 2); // vertical bars, burst video
+    set(MODE, u32::from(!bars));
+    set(LANE_CLOCK, if bars { 3 } else { 0 });
+    wait(PHY_STATUS, 1, 1)
+}
+
+pub fn start_stream() {
     set(MODE, 0);
     set(LANE_CLOCK, 3);
-    wait(PHY_STATUS, 1, 1)
 }

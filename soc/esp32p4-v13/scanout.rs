@@ -1,6 +1,8 @@
 //! RGB565 scanout on the dedicated DesignWare AXI DMA channel 0.
 //! HP0 is the sole owner. Four frames of LLIs reference 32-row black bands
-//! and the centered 64-row image band. All CPU accesses use the direct SRAM alias.
+//! and the centered 64-row image band. Pixel mode uses three spans per frame
+//! with a fixed black source word and one word containing a white pixel.
+//! All CPU accesses use the direct SRAM alias.
 use crate::pac::{read, write};
 use core::sync::atomic::{AtomicU32, Ordering};
 unsafe extern "C" {
@@ -24,6 +26,7 @@ const PER_FRAME: usize = BLACK_BANDS * 2 + 1;
 const NODES: usize = PER_FRAME * SLOTS;
 const BURSTS: u32 = (1 << 6) | (16 << 7) | (1 << 15) | (16 << 16);
 
+static ACTIVE_NODES: AtomicU32 = AtomicU32::new(0);
 static FRAMES: AtomicU32 = AtomicU32::new(0);
 static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn reg(addr: usize) -> u32 {
@@ -42,11 +45,14 @@ pub fn tick() {
     if !RUNNING.load(Ordering::Relaxed) {
         return;
     }
-    for i in 0..NODES {
+    let nodes = ACTIVE_NODES.load(Ordering::Relaxed) as usize;
+    for i in 0..nodes {
         let ctl = DIRECT + descriptors() + 64 * i + 36;
         if reg(ctl) & VALID == 0 {
             put(ctl, BURSTS | VALID);
-            if i % PER_FRAME == PER_FRAME - 1 && FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
+            if i % (nodes / SLOTS) == nodes / SLOTS - 1
+                && FRAMES.fetch_add(1, Ordering::Relaxed) == 0
+            {
                 put(BRIDGE + 0x54, 1);
             }
         }
@@ -71,38 +77,68 @@ pub fn debug() {
     ] {
         let _ = write!(console, "{:x}={:x} ", off, reg(DMA + off));
     }
-    let _ = writeln!(console, "fifo={:x}", reg(BRIDGE + 0x14));
+    let _ = writeln!(
+        console,
+        "fifo={:x} clk={:x}/{:x}/{:x} lp={:x}",
+        reg(BRIDGE + 0x14),
+        reg(0x500e6004),
+        reg(0x500e6008),
+        reg(0x500e600c),
+        reg(0x50111040)
+    );
 }
 pub fn frames() -> u32 {
     FRAMES.load(Ordering::Relaxed)
 }
+pub fn clear_underrun() {
+    put(BRIDGE + 0x54, 1);
+}
 pub fn underrun() -> bool {
     reg(BRIDGE + 0x58) & 1 != 0
 }
-pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3]) {
+pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
     let black = core::ptr::addr_of!(_orbit_black) as usize;
     let band = core::ptr::addr_of!(_orbit_band) as usize;
-    // Blank margins and the full source word for non-incrementing transfers.
-    for i in (0..WIDTH * BAND_ROWS * 2).step_by(4) {
-        put(DIRECT + black + i, 0);
+    let black_bytes = if pixel_only { 8 } else { WIDTH * BAND_ROWS * 2 };
+    let band_bytes = if pixel_only { 8 } else { WIDTH * ICON * 2 };
+    for off in (0..black_bytes).step_by(4) {
+        put(DIRECT + black + off, 0);
     }
-    for i in (0..WIDTH * ICON * 2).step_by(4) {
-        put(DIRECT + band + i, 0);
+    for off in (0..band_bytes).step_by(4) {
+        put(DIRECT + band + off, 0);
     }
-    for (i, &alpha) in coverage.iter().enumerate() {
-        let channel = |v: u8| (u16::from(v) * u16::from(alpha) + 127) / 255;
-        let rgb = (channel(color[0]) >> 3) << 11
-            | (channel(color[1]) >> 2) << 5
-            | (channel(color[2]) >> 3);
-        let pixel = (i / ICON) * WIDTH + (WIDTH - ICON) / 2 + i % ICON;
-        unsafe { ((DIRECT + band + 2 * pixel) as *mut u16).write_volatile(rgb) }
+    if !pixel_only {
+        for (i, &alpha) in coverage.iter().enumerate() {
+            let channel = |v: u8| (u16::from(v) * u16::from(alpha) + 127) / 255;
+            let rgb = (channel(color[0]) >> 3) << 11
+                | (channel(color[1]) >> 2) << 5
+                | (channel(color[2]) >> 3);
+            let pixel = (i / ICON) * WIDTH + (WIDTH - ICON) / 2 + i % ICON;
+            unsafe { ((DIRECT + band + 2 * pixel) as *mut u16).write_volatile(rgb) }
+        }
     }
-
-    for i in 0..NODES {
+    let nodes = if pixel_only { 3 * SLOTS } else { NODES };
+    ACTIVE_NODES.store(nodes as u32, Ordering::Relaxed);
+    if pixel_only {
+        unsafe {
+            ((DIRECT + band) as *mut u16).write_volatile(0xffff);
+        }
+    }
+    for i in 0..nodes {
         let (src, rows) = if i % PER_FRAME == BLACK_BANDS {
             (band, ICON)
         } else {
             (black, BAND_ROWS)
+        };
+        let (src, items, fixed) = if pixel_only {
+            let before = (WIDTH * (HEIGHT / 2) + WIDTH / 2) / 4;
+            match i % 3 {
+                0 => (black, before, true),
+                1 => (band, 1, false),
+                _ => (black, WIDTH * HEIGHT / 4 - before - 1, true),
+            }
+        } else {
+            (src, rows * WIDTH / 4, false)
         };
         let desc = descriptors() + i * 64;
         for off in (0..64).step_by(4) {
@@ -110,16 +146,16 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3]) {
         }
         put(DIRECT + desc, src as u32);
         put(DIRECT + desc + 8, 0x50105000); // DSI bridge FIFO, master 0
-        put(DIRECT + desc + 16, (rows * WIDTH / 4 - 1) as u32); // 64-bit items
+        put(DIRECT + desc + 16, (items - 1) as u32); // 64-bit items
         put(
             DIRECT + desc + 24,
-            (descriptors() + 64 * ((i + 1) % NODES)) as u32 | 1,
+            (descriptors() + 64 * ((i + 1) % nodes)) as u32 | 1,
         );
         put(DIRECT + desc + 36, BURSTS | VALID);
 
         put(
             DIRECT + desc + 32,
-            1 | (1 << 6) | (3 << 8) | (3 << 11) | (8 << 14) | (7 << 18),
+            1 | (u32::from(fixed) << 4) | (1 << 6) | (3 << 8) | (3 << 11) | (8 << 14) | (7 << 18),
         );
     }
     put(0x500e6014, reg(0x500e6014) | (1 << 13));
@@ -148,12 +184,22 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3]) {
     put(BRIDGE + 0x08, 256);
     put(BRIDGE + 0x8c, 768);
     put(BRIDGE + 0x0c, (1 << 31) | (WIDTH * HEIGHT / 4) as u32);
-    put(BRIDGE + 0x88, 1 << 4); // one DMA-controlled frame per request sequence
+    put(
+        BRIDGE + 0x6c,
+        reg(BRIDGE + 0x6c) | if pixel_only { 1 << 28 } else { 0 },
+    );
+    put(BRIDGE + 0x88, if pixel_only { 3 << 4 } else { 1 << 4 }); // Pixel mode has three DMA blocks per frame
     put(BRIDGE + 4, 1);
     put(BRIDGE + 0x54, 1);
     barrier();
     put(DMA + 0x128, descriptors() as u32 | 1);
     put(DMA + 0x18, 0x101);
+    for _ in 0..100_000 {
+        if reg(BRIDGE + 0x14) & 0x3fff >= 768 {
+            break;
+        }
+    }
+    crate::soc::dsi::start_stream();
     put(BRIDGE + 0x40, 720 << 4 | 1);
     put(BRIDGE + 0x44, 1);
 }
