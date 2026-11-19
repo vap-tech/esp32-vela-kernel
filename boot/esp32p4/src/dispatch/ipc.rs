@@ -4,7 +4,6 @@ use vela_kernel::{
     errno::Errno,
     id::{Handle, Pid, ProcSlot, ThreadSlot},
     ipc::{self, Message},
-    process::WRITE,
     sched::TASKS,
     task::{State, Wait},
 };
@@ -12,8 +11,9 @@ use vela_kernel::{
 use super::Args;
 use crate::{
     arch,
-    runtime::{Call, Runtime, create_endpoint, deliver, grant},
+    runtime::{Call, Runtime, create_endpoint, grant},
     syscall,
+    usermem::{copy_from_user, copy_to_user_within},
 };
 
 impl Runtime {
@@ -69,10 +69,7 @@ impl Runtime {
         let mut message = Message::EMPTY;
         message.length = length;
         message.reply_token = token;
-        for i in 0..length {
-            // SAFETY: validated source; copy message before blocking caller.
-            message.data[i] = unsafe { (args.a1 as *const u8).add(i).read() };
-        }
+        copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
         self.ipc.send(ep, message)?;
         self.calls[thread.index()] = Call {
             generation,
@@ -126,28 +123,20 @@ impl Runtime {
         if token != args.a0 {
             return Err(Errno::Epipe);
         }
-        if args.a2 as usize > capacity || args.a2 as usize > ipc::MESSAGE_BYTES {
+        let length = args.a2 as usize;
+        if length > capacity || length > ipc::MESSAGE_BYTES {
             return Err(Errno::Emsgsize);
         }
         let target = self.scheduler.task(client).process;
-        if !self.readable(args.a1 as usize, args.a2 as usize)
-            || !self
-                .processes
-                .slot(target)
-                .memory
-                .permits(pointer, capacity, WRITE)
-        {
-            return Err(Errno::Efault);
-        }
         let mut message = Message::EMPTY;
-        message.length = args.a2 as usize;
-        for i in 0..message.length {
-            // SAFETY: validated server source and caller destination, sole hart.
-            message.data[i] = unsafe { (args.a1 as *const u8).add(i).read() };
-        }
-        unsafe {
-            deliver(pointer, &message);
-        }
+        message.length = length;
+        copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
+        copy_to_user_within(
+            &self.processes.slot(target).memory,
+            pointer,
+            capacity,
+            &message.data[..length],
+        )?;
         self.scheduler.task_mut(client).context.registers[8] = args.a2;
         self.calls[client.index()].active = false;
         self.scheduler.wake(client);
@@ -273,10 +262,7 @@ impl Runtime {
         let ep = self.endpoint(current, Handle(args.a0), ipc::SEND)?;
         let mut message = Message::EMPTY;
         message.length = length;
-        for i in 0..length {
-            // SAFETY: checked sender mapping, copy into a kernel-owned message.
-            message.data[i] = unsafe { (args.a1 as *const u8).add(i).read() };
-        }
+        copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
         let ep = self.ipc.send(ep, message)?;
         self.complete_receivers(ep, false);
         self.scheduler.inherit();
@@ -304,10 +290,12 @@ impl Runtime {
             Some(message) => {
                 self.bind_reply(message.reply_token, self.scheduler.current);
                 frame.registers[9] = message.reply_token;
-                // SAFETY: checked writable receive buffer. No shared-memory pointers.
-                unsafe {
-                    deliver(args.a1 as usize, &message);
-                }
+                copy_to_user_within(
+                    self.memory(),
+                    args.a1 as usize,
+                    capacity,
+                    &message.data[..message.length],
+                )?;
                 Ok(message.length as u32)
             }
             None if args.a3 & syscall::NONBLOCK != 0 => Err(Errno::Eagain),

@@ -10,6 +10,7 @@ use crate::{
     board, pmp,
     runtime::{CONSOLE_RX, Runtime},
     soc,
+    usermem::{copy_from_user, copy_to_user_within},
 };
 
 impl Runtime {
@@ -18,12 +19,9 @@ impl Runtime {
         if length > 128 {
             return Err(Errno::Einval);
         }
-        if !self.readable(args.a0 as usize, length) {
-            return Err(Errno::Efault);
-        }
-        // SAFETY: validated entire readable range, single hart, IRQs masked.
-        let bytes = unsafe { core::slice::from_raw_parts(args.a0 as *const u8, length) };
-        Ok(self.console.write_bytes(bytes) as u32)
+        let mut buffer = [0u8; 128];
+        copy_from_user(self.memory(), args.a0 as usize, &mut buffer[..length])?;
+        Ok(self.console.write_bytes(&buffer[..length]) as u32)
     }
 
     pub(super) fn sys_display_test(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
@@ -130,17 +128,16 @@ impl Runtime {
         if !self.writable(args.a0 as usize, capacity) {
             return Err(Errno::Efault);
         }
+        let mut buffer = [0u8; 32];
         let mut count = 0;
         while count < capacity {
             let Some(byte) = self.console.read_byte() else {
                 break;
             };
-            // SAFETY: checked writable console task buffer.
-            unsafe {
-                (args.a0 as *mut u8).add(count).write(byte);
-            }
+            buffer[count] = byte;
             count += 1;
         }
+        copy_to_user_within(self.memory(), args.a0 as usize, capacity, &buffer[..count])?;
         Ok(count as u32)
     }
 }

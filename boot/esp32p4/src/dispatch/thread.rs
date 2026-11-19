@@ -6,7 +6,7 @@ use vela_kernel::{
 };
 
 use super::Args;
-use crate::{arch, runtime::Runtime, syscall};
+use crate::{arch, runtime::Runtime, syscall, usermem::copy_to_user};
 
 impl Runtime {
     pub(super) fn sys_spawn_hello(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
@@ -130,9 +130,6 @@ impl Runtime {
         if !matches!(len, syscall::STATS_BYTES | syscall::STATS_IRQ_BYTES) {
             return Err(Errno::Einval);
         }
-        if !self.writable(args.a0 as usize, len) {
-            return Err(Errno::Efault);
-        }
         let s = self.scheduler.snapshot();
         let words = [
             s.total_tasks,
@@ -149,14 +146,11 @@ impl Runtime {
             self.usb_rx_interrupts as u32,
             (self.usb_rx_interrupts >> 32) as u32,
         ];
+        let mut buffer = [0u8; syscall::STATS_IRQ_BYTES];
         for (i, word) in words[..len / 4].iter().enumerate() {
-            for (j, byte) in word.to_le_bytes().iter().enumerate() {
-                // SAFETY: checked writable private user stack, byte-aligned ABI.
-                unsafe {
-                    (args.a0 as *mut u8).add(i * 4 + j).write(*byte);
-                }
-            }
+            buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
+        copy_to_user(self.memory(), args.a0 as usize, &buffer[..len])?;
         Ok(0)
     }
 

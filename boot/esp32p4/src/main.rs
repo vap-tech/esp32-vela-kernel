@@ -23,5 +23,6 @@ mod boot;
 mod dispatch;
 mod runtime;
 mod trap;
+mod usermem;
 
 core::arch::global_asm!(include_str!("../entry.S"));

@@ -3,7 +3,7 @@ use vela_kernel::{
     capability::{self as cap, Capability, Object},
     errno::Errno,
     id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks},
-    ipc::{self, Ipc, Message},
+    ipc::{self, Ipc},
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
@@ -11,7 +11,10 @@ use vela_kernel::{
     task::{Region, State, Wait},
 };
 
-use crate::{arch, pmp, sentinel_wire, soc};
+use crate::{
+    arch, pmp, sentinel_wire, soc,
+    usermem::{copy_to_user, copy_to_user_within},
+};
 
 #[derive(Clone, Copy)]
 pub struct Call {
@@ -77,16 +80,6 @@ pub struct BootCell(pub UnsafeCell<MaybeUninit<Runtime>>);
 // precedes timer enable; outermost traps are the only later borrowers.
 unsafe impl Sync for BootCell {}
 pub static RUNTIME: BootCell = BootCell(UnsafeCell::new(MaybeUninit::uninit()));
-
-/// Kernel copy only, caller validated a writable task-local stack range. No user
-/// executes during this copy and no Rust reference aliases the user buffer.
-pub unsafe fn deliver(pointer: usize, message: &Message) {
-    for i in 0..message.length {
-        unsafe {
-            (pointer as *mut u8).add(i).write(message.data[i]);
-        }
-    }
-}
 
 pub fn create_endpoint(
     ipc: &mut Ipc,
@@ -289,58 +282,49 @@ impl Runtime {
         } else if pointer == 0 {
             reply.request
         } else {
-            let process = self.scheduler.task(thread).process;
-            if !self.processes.slot(process).memory.permits(
-                pointer,
-                sentinel_wire::LOG_BYTES,
-                WRITE,
-            ) {
-                Errno::Efault.to_abi()
-            } else {
-                let values = match command {
-                    sentinel_wire::GET_STATUS => {
-                        let age_ms = reply.age * 1000 / u64::from(self.sentinel_hz);
-                        [
-                            reply.monitor & 3,
-                            age_ms as u32,
-                            (age_ms >> 32) as u32,
-                            self.sentinel_hz,
-                            reply.beats,
-                            reply.monitor >> 2,
-                        ]
-                    }
-                    sentinel_wire::LOG_META => [
-                        self.sentinel_epoch.unwrap_or(0),
-                        reply.monitor,
-                        reply.age as u32,
-                        (reply.age >> 32) as u32,
-                        reply.beats,
+            let values = match command {
+                sentinel_wire::GET_STATUS => {
+                    let age_ms = reply.age * 1000 / u64::from(self.sentinel_hz);
+                    [
+                        reply.monitor & 3,
+                        age_ms as u32,
+                        (age_ms >> 32) as u32,
                         self.sentinel_hz,
-                    ],
-                    sentinel_wire::LOG_READ => [
-                        reply.result,
-                        (reply.age as u32) >> 16,
-                        reply.monitor,
-                        (reply.age as u32) & 0xffff,
-                        (reply.age >> 32) as u32,
                         reply.beats,
-                    ],
-                    _ => unreachable!(),
-                };
-                if command == sentinel_wire::LOG_READ && values[0] != self.sentinel_argument {
-                    self.scheduler.task_mut(thread).context.registers[8] = Errno::Einval.to_abi();
-                    self.scheduler.wake(thread);
-                    return;
+                        reply.monitor >> 2,
+                    ]
                 }
-                for (index, value) in values.into_iter().enumerate() {
-                    for (byte_index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                        // SAFETY: full buffer revalidated against receiver's current process mappings.
-                        unsafe {
-                            (pointer as *mut u8).add(index * 4 + byte_index).write(byte);
-                        }
-                    }
-                }
-                sentinel_wire::LOG_BYTES as u32
+                sentinel_wire::LOG_META => [
+                    self.sentinel_epoch.unwrap_or(0),
+                    reply.monitor,
+                    reply.age as u32,
+                    (reply.age >> 32) as u32,
+                    reply.beats,
+                    self.sentinel_hz,
+                ],
+                sentinel_wire::LOG_READ => [
+                    reply.result,
+                    (reply.age as u32) >> 16,
+                    reply.monitor,
+                    (reply.age as u32) & 0xffff,
+                    (reply.age >> 32) as u32,
+                    reply.beats,
+                ],
+                _ => unreachable!(),
+            };
+            let process = self.scheduler.task(thread).process;
+            if command == sentinel_wire::LOG_READ && values[0] != self.sentinel_argument {
+                self.scheduler.task_mut(thread).context.registers[8] = Errno::Einval.to_abi();
+                self.scheduler.wake(thread);
+                return;
+            }
+            let mut buffer = [0u8; sentinel_wire::LOG_BYTES];
+            for (index, value) in values.into_iter().enumerate() {
+                buffer[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            match copy_to_user(&self.processes.slot(process).memory, pointer, &buffer) {
+                Ok(()) => sentinel_wire::LOG_BYTES as u32,
+                Err(e) => e.to_abi(),
             }
         };
         self.scheduler.task_mut(thread).context.registers[8] = result;
@@ -521,19 +505,14 @@ impl Runtime {
                     Ok(Some(message)) => {
                         self.bind_reply(message.reply_token, thread);
                         self.scheduler.task_mut(thread).context.registers[9] = message.reply_token;
-                        if !self
-                            .processes
-                            .slot(task.process)
-                            .memory
-                            .permits(pointer, capacity, WRITE)
-                        {
-                            Errno::Efault.to_abi()
-                        } else {
-                            // SAFETY: full writable range revalidated against receiver's mapping.
-                            unsafe {
-                                deliver(pointer, &message);
-                            }
-                            message.length as u32
+                        match copy_to_user_within(
+                            &self.processes.slot(task.process).memory,
+                            pointer,
+                            capacity,
+                            &message.data[..message.length],
+                        ) {
+                            Ok(()) => message.length as u32,
+                            Err(e) => e.to_abi(),
                         }
                     }
                     Err(error) => error.to_abi(),
