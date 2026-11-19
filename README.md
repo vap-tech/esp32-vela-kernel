@@ -145,8 +145,8 @@ contribute even when the CPU spends most time in WFI.
 Processes own address spaces, cached PMP images and capability tables; threads
 own saved contexts, stacks and priority/affinity. MEM_ALLOC reserves zeroed,
 NAPOT-compatible owned SRAM; MEM_FREE revokes aliases before reuse. Endpoint
-and memory grants cannot forward authority. IPC call/reply uses single-use reply
-tokens, bounded priority donation, direct handoff and optional deadlines.
+and memory grants cannot forward authority. IPC call/reply (`IPC_CALL`, `IPC_REPLY`, `IPC_REPLY_RECV`) uses single-use reply
+tokens, bounded priority donation, direct client-to-server handoff when a receiver is already waiting, and optional deadlines.
 
 Userspace Arena explicitly suballocates aligned blocks inside one MEM_ALLOC
 region; metadata stays on the service stack, with checked arithmetic and explicit
@@ -169,7 +169,7 @@ On Tab5 v1.3, `run dma` launches an isolated driver that checks a 2048-byte
 SRAM copy byte by byte. GDMA-AHB channel 1 uses kernel-owned descriptors and
 a linker-reserved page split into source and destination halves. The syscall
 accepts only a word-aligned length of 4–2048 bytes from the owning PID.
-CPU accesses use the direct uncached SRAM alias exclusively. Before starting
+Data accesses keep `L1-DCache` bypassed for direct uncached DMA coherency, while HP0's 16 KiB `L1-ICache0` accelerates instruction fetch and is invalidated across newly loaded ELF segments. Before starting
 the transfer the kernel disables the user PMP mapping. The RX completion IRQ
 checks descriptor ownership and length before restoring access and waking
 the caller. Exit defers page reuse until completion. Failure or a one-second
@@ -392,8 +392,8 @@ CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
 for expansion and framebuffer readback. A separate validation reader also
 uses 4 KiB during the first row batch.
 
-Current SRAM payload is 97280 bytes (including bundled service and test ELFs)
-and kernel BSS is 10608 bytes, leaving 318 KiB before the separate AHB DMA
+Current SRAM payload is 111636 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 10448 bytes, leaving 304 KiB before the separate AHB DMA
 reservation. This frees 264 KiB compared with
 embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
 reserved for mode switching. The artwork is selected through the shell;

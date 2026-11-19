@@ -1,7 +1,9 @@
 /* Adapted from esp32-p4 src/boot.S; MIT, copyright 2026 vitalii petrenko.
  * See docs/provenance.md. Single boot hart, HP1 held in reset. */
 /* Stage 1 lives entirely in SPM. No runtime code/data is referenced before load.
- * Cache register sequence matches the previously validated P4 rev1.x sequence.
+ * Cache register sequence matches the previously validated P4 rev1.x sequence:
+ * L2 reclaimed as SRAM, L1-DCache bypassed for zero-flush DMA coherency, and
+ * HP0's 16 KiB L1-ICache0 enabled and invalidated after upper payload load.
  * ROM esp_rom_spiflash_read = 0x4fc00158 (ESP-IDF v6.1 ROM ld/header).
  */
 .section .text.entry,"ax"
@@ -45,6 +47,7 @@ _start:
     addi t0, t0, 4
     j 1b
 2:
+    call boot_enable_icache0
     la sp, _stack_top
     la t0, vela_trap_entry
     csrw mtvec, t0
@@ -144,6 +147,45 @@ boot_cache:
     sw t0, 0x278(t6)
     li t0, 8
     sw t0, 0x27c(t6)
+    fence rw, rw
+    fence.i
+    ret
+
+/* Enable HP0's 16 KiB L1-ICache0 after SRAM payload/BSS writes while keeping
+ * L1-ICache1 and L1-DCache bypassed (0x12). Invalidates all 768 KiB of internal
+ * L2MEM (0x4ff00000..0x4ffc0000) in 4 KiB windows before jumping to rust_main. */
+boot_enable_icache0:
+    fence rw, rw
+    li t6, 0x3ff10000
+    lw t0, 0(t6)
+    andi t0, t0, -2
+    ori t0, t0, 2
+    sw t0, 0(t6)
+    li t0, 0x12
+    sw t0, 8(t6)
+    fence rw, rw
+    li t0, 1
+    sw t0, 0x9c(t6)
+    li t1, 0x4ff00000
+    li t2, 0x4ffc0000
+    li t4, 0x1000
+.Licache_inv_chunk:
+    sw t1, 0xa0(t6)
+    sw t4, 0xa4(t6)
+    li t0, 1
+    sw t0, 0x98(t6)
+    li t3, 1000000
+.Licache_inv_wait:
+    lw t0, 0x98(t6)
+    andi t0, t0, 16
+    bnez t0, .Licache_inv_next
+    addi t3, t3, -1
+    bnez t3, .Licache_inv_wait
+    li a0, 73 /* I: icache invalidate timeout */
+    j boot_fail
+.Licache_inv_next:
+    add t1, t1, t4
+    bltu t1, t2, .Licache_inv_chunk
     fence rw, rw
     fence.i
     ret

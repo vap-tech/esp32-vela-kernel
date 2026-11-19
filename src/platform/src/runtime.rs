@@ -251,6 +251,14 @@ impl Runtime {
             let prepared = pmp::Prepared::new(&space)?;
             unsafe {
                 core::ptr::write_bytes(stack.base as *mut u8, 0, stack.size);
+                for mapping in &space.maps {
+                    if mapping.region.size != 0
+                        && mapping.permissions & EXECUTE != 0
+                        && !soc::invalidate_icache(mapping.region.base, mapping.region.size)
+                    {
+                        return Err(Errno::Eio);
+                    }
+                }
                 core::arch::asm!("fence.i", options(nostack));
             }
             self.processes.slot_mut(process).memory = space;

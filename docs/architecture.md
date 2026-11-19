@@ -10,7 +10,7 @@ The Cargo workspace contains five crates with a strict acyclic dependency graph 
 - `src/kernel` (`vela-kernel`) — Architecture- and SoC-independent microkernel core: typed IDs (`Pid`, `Tid`, `ProcSlot`, `ThreadSlot`, `Handle`, `Ticks`), `Errno`, `capability`, `ipc`, `call` (`CallTable`), `memory` (`RegionAllocator`), `process` (`AddressSpace`, `Processes`), `sched` (`Scheduler`), `elf` (`ET_EXEC` and static PIE validator/relocator), `dma` (`Lease`), `sentinel` (`RequestLink`, `WakeTicket`), `stats`, and cross-subsystem `lifecycle` orchestration. Pure `no_std` Rust; unit-tested on the host (`cargo test -p vela-kernel`).
 - `src/lp` (`vela-lp`) — LP Sentinel core logic (`watch`, `journal`, `wakeup`, host-tested via `cargo test -p vela-lp`), shared MMIO helpers (`hw::{lp_counter, mailbox}`), and the standalone `vela-sentinel` RV32IMAC binary linked at LP SRAM `0x50108000`.
 - `src/user` (`vela-user`) — Standalone U-mode runtime library (`sys`, `Buffer`, bump `Arena`) and isolated static PIE service binaries (`vela-procfs`, `vela-shell`, `vela-console`), plus assembly test programs (`apps/{hello,pic,dma}`).
-- `src/platform` (`vela-boot-esp32p4`) — Two-stage SPM/SRAM bootstrap (`entry.S`), minimal ESP32-P4 PAC, CLIC trap entry (`arch/trap.S`), 16-entry NAPOT PMP compiler (`arch/pmp.rs`), SoC drivers (USB Serial/JTAG console, SYSTIMER, GDMA-AHB, DW-GDMA/DSI/ST7121/PSRAM display, LP loader), boot policy (`boot.rs`), and thin syscall dispatchers (`dispatch/`).
+- `src/platform` (`vela-boot-esp32p4`) — Two-stage SPM/SRAM bootstrap (`entry.S`), minimal ESP32-P4 PAC, SPM-resident CLIC trap entry/exit (`arch/trap.S`), cached 16-entry NAPOT PMP compiler (`arch/pmp.rs`), SoC drivers (USB Serial/JTAG console, SYSTIMER, GDMA-AHB, DW-GDMA/DSI/ST7121/PSRAM display, LP loader), boot policy (`boot.rs`), and thin syscall dispatchers (`dispatch/`).
 
 Dependency direction:
 - `vela-boot-esp32p4 -> {vela-kernel, vela-lp, vela-abi}`
@@ -18,17 +18,18 @@ Dependency direction:
 - `vela-lp -> vela-abi`
 - `vela-kernel` has zero internal crate dependencies.
 
-## Memory Protection & Standalone ELF Services
+## Memory Protection, Cache Split & Standalone ELF Services
 
-- Two-stage boot loads `.entry` into 8 KiB SPM (`0x30100000`), disables watchdogs, holds HP1 in reset, initializes caches, verifies CRC32 of the upper SRAM payload (`0x4ff40000`), zeroes `.bss`, and enters `rust_main`.
+- Two-stage boot loads `.entry` (`entry.S` plus `arch/trap.S`: `vela_trap_entry`, `vela_resume`, `vela_idle_entry`) into 8 KiB zero-wait-state SPM (`0x30100000`), disables watchdogs, holds HP1 in reset, reclaims L2 cache as internal SRAM, verifies CRC32 of the upper SRAM payload (`0x4ff40000`), zeroes `.bss`, enables and invalidates HP0's 16 KiB `L1-ICache0` while keeping `L1-DCache` bypassed (`0x12`), and enters `rust_main`.
+- Keeping `L1-DCache` bypassed preserves direct zero-flush data coherency across SRAM, PSRAM, `GDMA-AHB`, and `DW-GDMA`, while `Runtime::load_elf` explicitly invalidates `L1-ICache0` + `fence.i` across newly written executable segments before user execution.
 - Userspace code is never linked into kernel `.text`/`.rodata`. `build.rs` compiles `vela-procfs`, `vela-shell`, and `vela-console` as stripped RV32IMAC static PIE ELFs and loads them at boot through the same `vela_kernel::elf::Image` validator, `R_RISCV_RELATIVE` relocator, and `RegionAllocator` used for runtime `ET_EXEC`/`ET_DYN` programs.
-- Every process owns an `AddressSpace` of up to 6 disjoint W^X NAPOT regions (`READ`, `READ | WRITE`, or `READ | EXECUTE`) compiled into a cached 16-entry hardware PMP configuration activated before `mret`.
+- Every process owns an `AddressSpace` of up to 6 disjoint W^X NAPOT regions (`READ`, `READ | WRITE`, or `READ | EXECUTE`) compiled into a slim cached PMP image (`pmpaddr0..5` + `pmpcfg0..1` over permanent `entry15` deny-all) activated before `mret`, with CSR readback on the first activation of each new `(ProcSlot, revision)`.
 
 ## Capabilities & Object Lifecycle
 
 - Every process holds a 16-slot generational capability table (`Handle = generation << 8 | slot`). Global table indices never cross the syscall ABI.
 - Kernel objects (`Object`) cover four classes:
-  - `Endpoint { index, generation }` — Bounded 4-message, 96-byte FIFO queues and synchronous `IPC_CALL`/`IPC_REPLY` endpoints.
+  - `Endpoint { index, generation }` — Bounded 4-message, 96-byte FIFO queues and synchronous `IPC_CALL` / `IPC_REPLY` / `IPC_REPLY_RECV` endpoints.
   - `Memory { owner, region }` — NAPOT SRAM regions supporting one-level `READ` / `READ | WRITE` shared mappings (`MEM_GRANT`).
   - `Event { index, generation }` — Interrupt-backed kernel event sources (`CONSOLE_RX`).
   - `Authority(ProcessSpawn | Display | Sentinel)` — Explicit capability-gated control over process spawning, display scanout, and LP Sentinel supervision. No syscall grants authority by checking a hardcoded `Pid`.
@@ -37,14 +38,14 @@ Dependency direction:
 ## Scheduling, Deadlines & Synchronous RPC
 
 - `Scheduler<C>` runs at 100 Hz (SYSTIMER target 0) with 4 priority levels (`0..=3`), round-robin rotation within equal effective priority, and bounded `O(TASKS²)` transitive priority inheritance across `Wait::Reply` chains.
-- `IPC_CALL` rejects self-RPC and walks `Wait::Reply` chains up to `TASKS` to reject transitive RPC cycles with `-EDEADLK` before blocking.
+- `IPC_CALL` rejects self-RPC and walks `Wait::Reply` chains up to `TASKS` to reject transitive RPC cycles with `-EDEADLK` before blocking. When the endpoint queue is empty and a server thread is already blocked in `Wait::Receive`, `try_direct_ipc_call` hands the payload and reply token directly to the server without staging through the endpoint queue, while `IPC_REPLY_RECV` replies and re-enters `Wait::Receive` in a single trap.
 - All time-bounded waits (`Wait::Sleep`, `Wait::Reply`, `Wait::Event`, and generic `Wait::Device { domain, token, pointer }`) store their wakeup limit in `Thread::deadline: Option<Ticks>`, expired in a single `O(TASKS)` pass inside `Scheduler::tick`.
 
 ## Safety & Concurrency Invariants
 
 - Single active HP core (`hart0`); `HP1` is held in reset before cache/SRAM setup.
 - Machine interrupts remain disabled (`mstatus.MIE = 0`) throughout every Rust kernel path. Interrupts are enabled only in U-mode (`MPIE = 1`, `MPP = U`) or inside the dedicated assembly idle loop (`vela_idle_entry`, `MPP = M`), which holds no Rust references to `RUNTIME`.
-- All user pointers are validated against the active `AddressSpace` permissions before `copy_from_user` / `copy_to_user_within`. During `DMA_COPY`, `AddressSpace::dma_access` temporarily zeroes U-mode PMP permissions on the DMA page until the completion interrupt verifies transfer status.
+- All user pointers are validated against the active `AddressSpace` permissions before `copy_from_user` / `copy_to_user_within` / `copy_between_users`. During `DMA_COPY`, `AddressSpace::dma_access` temporarily zeroes U-mode PMP permissions on the DMA page until the completion interrupt verifies transfer status.
 - `Runtime` is the sole runtime owner of `Console` (except non-returning `fatal`/`panic` takeover) and `DisplayControl` (`psram::Controller` + `scanout::Scanout`); all raw SoC MMIO/ROM operations are `unsafe fn`, and BSP/SoC diagnostics are returned by value rather than instantiating second `Console` handles.
 - HP↔LP Sentinel communication uses a single hardware mailbox request slot managed by `RequestLink`: at most one request owns `(ARG0, ARG1, REQUEST_SEQ, COMMAND)` until LP answers that exact `sequence`; deadline expiration transitions the link to `offline` (`-ETIMEDOUT`) with idempotent doorbell reassertion until recovery.
 - Hardware cycle accounting (`CycleAccounting`) tracks per-thread and per-hart `user_cycles`, `kernel_cycles`, and `idle_cycles` via 64-bit `mcycle`, integrates wall-clock CPU capacity across `40 MHz` XTAL -> `180 MHz` CPLL transitions against the 16 MHz SYSTIMER, and measures comparator-to-ISR latency on runtime timer ticks.

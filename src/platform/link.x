@@ -14,7 +14,13 @@ SECTIONS {
   . = ALIGN(64);
   _orbit_band = .; . += 720 * 64 * 2;
  } > DISPLAY
- .entry : ALIGN(16) { _entry_start = .; KEEP(*(.text.entry)); _entry_end = .; } > ENTRY
+ .entry : ALIGN(16) {
+  _entry_start = .;
+  KEEP(*(.text.entry));
+  . = ALIGN(64);
+  KEEP(*(.text.vela_trap));
+  _entry_end = .;
+ } > ENTRY
  .upper : ALIGN(64) {
   _upper_start = .;
   *(.text .text.*);
