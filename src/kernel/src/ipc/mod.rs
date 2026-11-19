@@ -83,6 +83,9 @@ impl Ipc {
     pub fn owner(&self, index: usize) -> Option<ProcSlot> {
         self.endpoints.get(index)?.owner
     }
+    pub fn is_empty(&self, ep: usize) -> bool {
+        self.endpoints[ep].count == 0
+    }
     pub fn object(&self, index: usize) -> Object {
         Object::Endpoint {
             index,

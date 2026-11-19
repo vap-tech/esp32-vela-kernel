@@ -45,6 +45,7 @@ impl Runtime {
             syscall::THREAD_PRIORITY => self.sys_thread_priority(current, args, switch),
             syscall::IPC_CALL => self.sys_ipc_call(current, args, switch),
             syscall::IPC_REPLY => self.sys_ipc_reply(current, args, switch),
+            syscall::IPC_REPLY_RECV => self.sys_ipc_reply_recv(current, args, frame, switch),
             syscall::CAP_GRANT | syscall::MEM_GRANT => self.sys_cap_or_mem_grant(current, args),
             syscall::CAP_REVOKE => self.sys_cap_revoke(current, args),
             syscall::MEM_CAP => self.sys_mem_cap(current, args),

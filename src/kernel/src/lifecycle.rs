@@ -216,16 +216,19 @@ pub fn complete_receivers<C: Context>(
     let mut first_woken = None;
     for i in 0..TASKS {
         let thread = ThreadSlot(i);
-        let task = *scheduler.task(thread);
-        if task.state != State::Blocked {
-            continue;
-        }
+        let (task_process, task_id, wait) = {
+            let t = scheduler.task(thread);
+            if t.state != State::Blocked {
+                continue;
+            }
+            (t.process, t.id, t.wait)
+        };
         let Wait::Receive {
             endpoint: waiting,
             handle,
             pointer,
             capacity,
-        } = task.wait
+        } = wait
         else {
             continue;
         };
@@ -233,7 +236,7 @@ pub fn complete_receivers<C: Context>(
             continue;
         }
         let result = if closed
-            || resolve_endpoint(processes, ipc, task.process, handle, ipc::RECEIVE).is_err()
+            || resolve_endpoint(processes, ipc, task_process, handle, ipc::RECEIVE).is_err()
         {
             Err(Errno::Epipe)
         } else {
@@ -248,7 +251,7 @@ pub fn complete_receivers<C: Context>(
                     .context
                     .set_return2(message.reply_token);
                 match deliver(
-                    &processes.slot(task.process).memory,
+                    &processes.slot(task_process).memory,
                     pointer,
                     capacity,
                     &message.data[..message.length],
@@ -262,7 +265,7 @@ pub fn complete_receivers<C: Context>(
         scheduler.wake_with(thread, value);
         scheduler.prefer(thread);
         if first_woken.is_none() {
-            first_woken = Some(task.id);
+            first_woken = Some(task_id);
         }
     }
     first_woken
@@ -305,6 +308,89 @@ pub fn find_rpc_server<C: Copy>(
         }
     }
     Ok((ep, server))
+}
+
+/// Fast-path synchronous RPC handoff when `ep`'s queue is empty and a server
+/// thread is already blocked in `Wait::Receive` with sufficient buffer capacity.
+/// Returns `Some(woken_tid)` when delivered directly without touching the queue,
+/// or `None` when the caller must fall back to [`commit_ipc_call`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_direct_ipc_call<C: Context>(
+    processes: &Processes,
+    ipc: &Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    ep: usize,
+    generation: u32,
+    token: u32,
+    req_pointer: usize,
+    req_length: usize,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    mut copy_direct: impl FnMut(
+        &AddressSpace,
+        usize,
+        &AddressSpace,
+        usize,
+        usize,
+        usize,
+    ) -> Result<(), Errno>,
+) -> Option<Tid> {
+    if !ipc.is_empty(ep) {
+        return None;
+    }
+    let mut target = None;
+    for i in 0..TASKS {
+        let slot = ThreadSlot(i);
+        let t = scheduler.task(slot);
+        if t.state != State::Blocked {
+            continue;
+        }
+        if let Wait::Receive {
+            endpoint: waiting,
+            handle,
+            pointer,
+            capacity,
+        } = t.wait
+            && waiting == ep
+        {
+            target = Some((slot, t.process, t.id, handle, pointer, capacity));
+            break;
+        }
+    }
+    let (receiver, recv_proc, recv_tid, handle, recv_ptr, recv_cap) = target?;
+    if req_length > recv_cap
+        || resolve_endpoint(processes, ipc, recv_proc, handle, ipc::RECEIVE).is_err()
+    {
+        return None;
+    }
+    copy_direct(
+        &processes.slot(current).memory,
+        req_pointer,
+        &processes.slot(recv_proc).memory,
+        recv_ptr,
+        recv_cap,
+        req_length,
+    )
+    .ok()?;
+    let client = scheduler.current;
+    calls.activate(client, generation, ep);
+    scheduler.block_opt(
+        Wait::Reply {
+            token,
+            pointer: reply_pointer,
+            capacity: reply_capacity,
+            server: receiver,
+        },
+        deadline,
+    );
+    calls.bind_reply(scheduler, token, receiver);
+    scheduler.wake_with2(receiver, req_length as u32, token);
+    scheduler.prefer(receiver);
+    scheduler.inherit();
+    Some(recv_tid)
 }
 
 /// Enqueue a prepared RPC request, activate its call-table entry, block the
@@ -1453,5 +1539,103 @@ mod tests {
         assert_eq!(h.scheduler.task(ThreadSlot(3)).state, State::Terminated);
         assert_eq!(h.calls.lookup_for_reply(tok_w), Err(Errno::Epipe));
         assert_eq!(h.processes.slot(p0).state, Lifecycle::Free);
+    }
+
+    #[test]
+    fn direct_ipc_call_handoff_bypasses_empty_queue_and_preserves_fifo_when_non_empty() {
+        let mut h = harness();
+        let server = ProcSlot(0);
+        let client = ProcSlot(1);
+
+        // Give server lower base priority than client to verify inheritance on direct handoff.
+        h.scheduler.task_mut(ThreadSlot(0)).priority = 0;
+        h.scheduler.task_mut(ThreadSlot(0)).effective_priority = 0;
+        h.scheduler.task_mut(ThreadSlot(1)).priority = 2;
+        h.scheduler.task_mut(ThreadSlot(1)).effective_priority = 2;
+
+        let ep_handle = create_endpoint(&mut h.ipc, &mut h.processes, server).unwrap();
+        let _send_handle = grant(&mut h.processes, server, ep_handle, client, cap::SEND).unwrap();
+        let ep_idx =
+            resolve_endpoint(&h.processes, &h.ipc, server, ep_handle, cap::RECEIVE).unwrap();
+
+        // Block server (ThreadSlot 0) in Wait::Receive on empty endpoint.
+        h.scheduler.current = ThreadSlot(0);
+        h.scheduler.block(Wait::Receive {
+            endpoint: ep_idx,
+            handle: ep_handle,
+            pointer: 0x4ff1_0100,
+            capacity: 32,
+        });
+
+        // Client (ThreadSlot 1) performs direct RPC call.
+        h.scheduler.current = ThreadSlot(1);
+        h.scheduler.task_mut(ThreadSlot(1)).state = State::Running;
+        let (gen1, tok1) = h.calls.next_token(ThreadSlot(1)).unwrap();
+        let mut copied = 0usize;
+        let woken = try_direct_ipc_call(
+            &h.processes,
+            &h.ipc,
+            &mut h.calls,
+            &mut h.scheduler,
+            client,
+            ep_idx,
+            gen1,
+            tok1,
+            0x4ff1_1100,
+            5,
+            0x4ff1_1200,
+            32,
+            None,
+            |src_sp, src_ptr, dst_sp, dst_ptr, dst_cap, len| {
+                assert!(src_sp.permits(src_ptr, len, crate::process::READ));
+                assert!(dst_sp.permits(dst_ptr, dst_cap, crate::process::WRITE));
+                copied = len;
+                Ok(())
+            },
+        );
+        assert_eq!(woken, Some(Tid(1)));
+        assert_eq!(copied, 5);
+        assert!(h.ipc.is_empty(ep_idx));
+        assert_eq!(h.scheduler.task(ThreadSlot(0)).state, State::Ready);
+        assert_eq!(h.scheduler.task(ThreadSlot(0)).effective_priority, 2);
+        assert_eq!(h.scheduler.task(ThreadSlot(0)).context.a0, 5);
+        assert_eq!(h.scheduler.task(ThreadSlot(0)).context.a1, tok1);
+        assert_eq!(
+            h.calls.lookup_for_reply(tok1),
+            Ok((ThreadSlot(1), ThreadSlot(0)))
+        );
+
+        // Finish reply, then verify non-empty queue refuses direct handoff to preserve FIFO.
+        finish_ipc_reply(&mut h.calls, &mut h.scheduler, ThreadSlot(1), 1);
+        h.ipc.send(ep_idx, make_msg(b"queued", 0)).unwrap();
+        h.scheduler.current = ThreadSlot(0);
+        h.scheduler.block(Wait::Receive {
+            endpoint: ep_idx,
+            handle: ep_handle,
+            pointer: 0x4ff1_0100,
+            capacity: 32,
+        });
+        h.scheduler.current = ThreadSlot(1);
+        h.scheduler.task_mut(ThreadSlot(1)).state = State::Running;
+        let (gen2, tok2) = h.calls.next_token(ThreadSlot(1)).unwrap();
+        assert!(
+            try_direct_ipc_call(
+                &h.processes,
+                &h.ipc,
+                &mut h.calls,
+                &mut h.scheduler,
+                client,
+                ep_idx,
+                gen2,
+                tok2,
+                0x4ff1_1100,
+                3,
+                0x4ff1_1200,
+                32,
+                None,
+                |_, _, _, _, _, _| Ok(()),
+            )
+            .is_none()
+        );
     }
 }

@@ -45,15 +45,35 @@ impl Runtime {
             Handle(args.a0),
         )?;
         let (generation, token) = self.calls.next_token(thread)?;
-        let mut message = Message::EMPTY;
-        message.length = length;
-        message.reply_token = token;
-        copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
         let until = if timeout == 0 {
             None
         } else {
             Some(self.scheduler.uptime().saturating_add(u64::from(timeout)))
         };
+        if let Some(woken_tid) = lifecycle::try_direct_ipc_call(
+            &self.processes,
+            &self.ipc,
+            &mut self.calls,
+            &mut self.scheduler,
+            current,
+            ep,
+            generation,
+            token,
+            args.a1 as usize,
+            length,
+            args.a3 as usize,
+            capacity,
+            until,
+            copy_between_users,
+        ) {
+            self.note_woken_receiver(Some(woken_tid));
+            *switch = true;
+            return Ok(0);
+        }
+        let mut message = Message::EMPTY;
+        message.length = length;
+        message.reply_token = token;
+        copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
         let woken = lifecycle::commit_ipc_call(
             &self.processes,
             &mut self.ipc,
@@ -93,6 +113,101 @@ impl Runtime {
         lifecycle::finish_ipc_reply(&mut self.calls, &mut self.scheduler, reply.client, length);
         *switch = self.scheduler.should_preempt();
         Ok(0)
+    }
+
+    pub(super) fn sys_ipc_reply_recv(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        frame: &mut arch::TrapFrame,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        let reply_token = args.a0;
+        let reply_ptr = args.a1 as usize;
+        let reply_len = args.a2 as usize;
+        let recv_handle = Handle(args.a3);
+        let recv_ptr = args.a4 as usize;
+        let recv_cap = args.a5 as usize;
+
+        if recv_cap == 0 || recv_cap > ipc::MESSAGE_BYTES {
+            return Err(Errno::Einval);
+        }
+        if !self.writable(recv_ptr, recv_cap) {
+            return Err(Errno::Efault);
+        }
+        let ep = self.endpoint(current, recv_handle, ipc::RECEIVE)?;
+
+        if reply_token != 0 {
+            if reply_len > ipc::MESSAGE_BYTES {
+                return Err(Errno::Emsgsize);
+            }
+            if !self.readable(reply_ptr, reply_len) {
+                return Err(Errno::Efault);
+            }
+            match lifecycle::prepare_ipc_reply(
+                &self.calls,
+                &self.scheduler,
+                current,
+                reply_token,
+                reply_len,
+            ) {
+                Ok(reply) => {
+                    if copy_between_users(
+                        &self.processes.slot(current).memory,
+                        reply_ptr,
+                        &self.processes.slot(reply.target).memory,
+                        reply.pointer,
+                        reply.capacity,
+                        reply_len,
+                    )
+                    .is_ok()
+                    {
+                        lifecycle::finish_ipc_reply(
+                            &mut self.calls,
+                            &mut self.scheduler,
+                            reply.client,
+                            reply_len,
+                        );
+                    } else {
+                        self.calls.deactivate(reply.client);
+                        self.scheduler
+                            .wake_with(reply.client, Errno::Efault.to_abi());
+                        self.scheduler.inherit();
+                        self.scheduler.prefer(reply.client);
+                    }
+                }
+                // Timed-out/exited client or undersized client buffer: keep the server loop alive.
+                Err(Errno::Epipe | Errno::Emsgsize) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        match self.ipc.receive(ep, recv_cap)? {
+            Some(message) => {
+                let server = self.scheduler.current;
+                self.calls
+                    .bind_reply(&mut self.scheduler, message.reply_token, server);
+                frame.set_return2(message.reply_token);
+                copy_to_user_within(
+                    self.memory(),
+                    recv_ptr,
+                    recv_cap,
+                    &message.data[..message.length],
+                )?;
+                *switch = self.scheduler.should_preempt();
+                Ok(message.length as u32)
+            }
+            None => {
+                self.scheduler.block(Wait::Receive {
+                    endpoint: ep,
+                    handle: recv_handle,
+                    pointer: recv_ptr,
+                    capacity: recv_cap,
+                });
+                *switch = true;
+                Ok(0)
+            }
+        }
     }
 
     pub(super) fn sys_cap_or_mem_grant(

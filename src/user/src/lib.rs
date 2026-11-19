@@ -180,6 +180,29 @@ impl Buffer {
         true
     }
 
+    pub fn reply_and_receive(
+        &mut self,
+        reply_token: u32,
+        response: &Buffer,
+        recv_handle: u32,
+    ) -> bool {
+        let (result, next_reply) = sys::call6(
+            abi::IPC_REPLY_RECV,
+            reply_token,
+            response.ptr() as u32,
+            response.len() as u32,
+            recv_handle,
+            self.mut_ptr() as u32,
+            abi::IPC_BYTES as u32,
+        );
+        self.reply = next_reply;
+        if result > abi::IPC_BYTES as u32 {
+            return false;
+        }
+        self.len = result as usize;
+        true
+    }
+
     pub fn send(&self, handle: u32) -> bool {
         loop {
             let result = sys::call(abi::SEND, handle, self.ptr() as u32, self.len as u32, 0);
