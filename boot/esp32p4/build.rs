@@ -5,6 +5,19 @@ fn main() {
     println!("cargo:rerun-if-changed=link.x");
     println!("cargo:rerun-if-changed=entry.S");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    for path in [
+        "../../tools/display_assets.py",
+        "../../vela_boot_and_display_assets/vela_boot.png",
+        "../../vela_boot_and_display_assets/vela_display_test.png",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let status = std::process::Command::new("python3")
+        .arg("../../tools/display_assets.py")
+        .arg(&out)
+        .status()
+        .expect("Python3 and Pillow required for display assets");
+    assert!(status.success(), "convert display PNG assets");
     build_sentinel(&out);
     let linker = user_linker();
     for (name, pie) in [("hello", false), ("pic", true), ("dma", true)] {

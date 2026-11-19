@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+<title>vela — microkernel boot splash</title>
+<desc>Dark boot image for ESP32-P4 / M5Stack Tab5; original orbital mark, wordmark and pixel crab.</desc>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#07131F"/>
+  <stop offset="1" stop-color="#0C1E30"/>
+ </linearGradient>
+ <linearGradient id="orbit" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#66DFFF"/>
+  <stop offset="1" stop-color="#85BFFF"/>
+ </linearGradient>
+</defs>
+<rect width="1280" height="720" fill="url(#bg)"/>
+<!-- faint framing; part of the boot style, not LCD test marks -->
+<path d="M60 115V58H117 M1163 58H1220V115 M60 605V662H117 M1163 662H1220V605" fill="none" stroke="#2D536D" stroke-width="2"/>
+<text x="76" y="90" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="16" letter-spacing="3" fill="#709EB9">VELA / EMBEDDED SYSTEMS</text>
+<text x="1197" y="90" text-anchor="end" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="16" letter-spacing="2" fill="#709EB9">ESP32-P4</text>
+<!-- Original orbit symbol, visually unmodified except weight/scale -->
+<g transform="translate(161 199) scale(13.1)">
+<g fill="none" stroke="url(#orbit)" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="3" />
+  <circle cx="19" cy="5" r="2" />
+  <circle cx="5" cy="19" r="2" />
+  <path d="M10.4 21.9a10 10 0 0 0 9.941-15.416"/>
+  <path d="M13.5 2.1a10 10 0 0 0-9.841 15.416"/>
+</g></g>
+<!-- Text lockup -->
+<text x="542" y="366" font-family="Inter Display, Inter, DejaVu Sans, sans-serif" font-size="166" font-weight="650" letter-spacing="-9" fill="#E9F7FF">vela</text>
+<rect x="551" y="393" width="414" height="3" rx="1.5" fill="#4EBADC"/>
+<rect x="971" y="393" width="17" height="3" fill="#F47A52"/>
+<text x="546" y="459" font-family="Inter Display, Inter, DejaVu Sans, sans-serif" font-size="44" font-weight="500" letter-spacing="0" fill="#85BFFF">microkernel</text>
+<text x="549" y="504" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="20" letter-spacing="1.2" fill="#86A9BF">RUST  /  NO_STD  /  BARE METAL</text>
+<!-- A little pixel-art crab perched above the title, rust-colored hardware wink -->
+<g transform="translate(946 222)" shape-rendering="crispEdges">
+<rect x="5" y="5" width="15" height="5" fill="#F47A52"/>
+<rect x="115" y="5" width="15" height="5" fill="#F47A52"/>
+<rect x="0" y="10" width="10" height="5" fill="#F47A52"/>
+<rect x="20" y="10" width="5" height="5" fill="#F47A52"/>
+<rect x="45" y="10" width="5" height="5" fill="#FFA879"/>
+<rect x="50" y="10" width="5" height="5" fill="#642E31"/>
+<rect x="55" y="10" width="5" height="5" fill="#FFA879"/>
+<rect x="75" y="10" width="5" height="5" fill="#FFA879"/>
+<rect x="80" y="10" width="5" height="5" fill="#642E31"/>
+<rect x="85" y="10" width="5" height="5" fill="#FFA879"/>
+<rect x="110" y="10" width="5" height="5" fill="#F47A52"/>
+<rect x="125" y="10" width="10" height="5" fill="#F47A52"/>
+<rect x="0" y="15" width="10" height="5" fill="#F47A52"/>
+<rect x="20" y="15" width="5" height="5" fill="#F47A52"/>
+<rect x="50" y="15" width="5" height="5" fill="#FFA879"/>
+<rect x="80" y="15" width="5" height="5" fill="#FFA879"/>
+<rect x="110" y="15" width="5" height="5" fill="#F47A52"/>
+<rect x="125" y="15" width="10" height="5" fill="#F47A52"/>
+<rect x="5" y="20" width="40" height="5" fill="#F47A52"/>
+<rect x="50" y="20" width="5" height="5" fill="#F47A52"/>
+<rect x="80" y="20" width="5" height="5" fill="#F47A52"/>
+<rect x="90" y="20" width="40" height="5" fill="#F47A52"/>
+<rect x="15" y="25" width="105" height="5" fill="#F47A52"/>
+<rect x="15" y="30" width="15" height="5" fill="#F47A52"/>
+<rect x="35" y="30" width="15" height="5" fill="#F47A52"/>
+<rect x="50" y="30" width="35" height="5" fill="#FFA879"/>
+<rect x="85" y="30" width="15" height="5" fill="#F47A52"/>
+<rect x="105" y="30" width="15" height="5" fill="#F47A52"/>
+<rect x="30" y="35" width="75" height="5" fill="#F47A52"/>
+<rect x="30" y="40" width="20" height="5" fill="#F47A52"/>
+<rect x="50" y="40" width="5" height="5" fill="#642E31"/>
+<rect x="55" y="40" width="25" height="5" fill="#F47A52"/>
+<rect x="80" y="40" width="5" height="5" fill="#642E31"/>
+<rect x="85" y="40" width="20" height="5" fill="#F47A52"/>
+<rect x="35" y="45" width="25" height="5" fill="#F47A52"/>
+<rect x="60" y="45" width="15" height="5" fill="#642E31"/>
+<rect x="75" y="45" width="25" height="5" fill="#F47A52"/>
+<rect x="25" y="50" width="15" height="5" fill="#F47A52"/>
+<rect x="45" y="50" width="45" height="5" fill="#F47A52"/>
+<rect x="95" y="50" width="15" height="5" fill="#F47A52"/>
+<rect x="20" y="55" width="10" height="5" fill="#F47A52"/>
+<rect x="35" y="55" width="5" height="5" fill="#F47A52"/>
+<rect x="95" y="55" width="5" height="5" fill="#F47A52"/>
+<rect x="105" y="55" width="10" height="5" fill="#F47A52"/>
+<rect x="15" y="60" width="10" height="5" fill="#F47A52"/>
+<rect x="35" y="60" width="5" height="5" fill="#F47A52"/>
+<rect x="95" y="60" width="5" height="5" fill="#F47A52"/>
+<rect x="110" y="60" width="10" height="5" fill="#F47A52"/>
+</g>
+<!-- The tiny calibration ticks double as detail on the boot screen -->
+<g fill="#4B9EBB">
+ <rect x="551" y="524" width="7" height="7"/>
+ <rect x="565" y="524" width="7" height="7" opacity="0.75"/>
+ <rect x="579" y="524" width="7" height="7" opacity="0.5"/>
+ <rect x="593" y="524" width="7" height="7" opacity="0.25"/>
+</g>
+<path d="M76 613H1204" stroke="#31526A" stroke-width="1" />
+<text x="76" y="643" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="14" letter-spacing="2.4" fill="#6F9AB2">BARE METAL. SMALL CORE.</text>
+<text x="1204" y="643" text-anchor="end" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="14" letter-spacing="1.3" fill="#6F9AB2">RISC-V   //   NO_STD</text>
+</svg>

@@ -1,4 +1,5 @@
 pub const NAME: &str = "M5Stack Tab5";
+mod images;
 mod st7121;
 use crate::soc::{
     display_io::{self as io, Bus},
@@ -21,6 +22,20 @@ fn backlight(on: bool) {
 /// ticks before the next stage. The shell sleeps between stages.
 pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
     let orbit = mode != 1;
+    if mode >= 4 && (5..45).contains(&stage) {
+        let image = if mode == 4 {
+            images::DIAGNOSTIC
+        } else {
+            images::BOOT
+        };
+        images::draw_rows(image, usize::from(stage - 5) * 32, 32)?;
+        return Ok(1);
+    }
+    let stage = if mode >= 4 && stage >= 45 {
+        stage - 40
+    } else {
+        stage
+    };
     match stage {
         0 => {
             BUS.init();
@@ -44,6 +59,9 @@ pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
                 return Err(0x100 + u32::from(version));
             }
             crate::soc::clock::display_speed().map_err(|_| 9u32)?;
+            if mode >= 4 {
+                crate::soc::psram::initialize()?;
+            }
             dsi::power_phy();
             Ok(2)
         }
@@ -70,11 +88,7 @@ pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
                 return Err(7);
             }
             if orbit {
-                crate::soc::scanout::start(
-                    include_bytes!("orbit.a8"),
-                    [0x85, 0xbf, 0xff],
-                    mode == 3,
-                );
+                crate::soc::scanout::start(include_bytes!("orbit.a8"), [0x85, 0xbf, 0xff], mode);
                 return Ok(12);
             }
             Ok(0)

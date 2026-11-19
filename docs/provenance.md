@@ -32,3 +32,18 @@ esp_hw_support/port/esp32p4/cpu_region_protect.c. The new trap and PMP code are 
 implementations; no SDK source text is copied. Rev1.x uses the legacy threshold
 MMIO register and 128-byte PMP granularity. Shared user RX/private stack RW entries
 are followed by explicit deny-all at PMP entry15; no locked entries are installed.
+
+
+Full-screen display addition (2026-11-19): PSRAM power, shared MSPI PHY
+supply and MSPI2/3 register sequences were checked against
+https://github.com/vap-tech/esp32-p4-v1.3-rast at the same b280851 commit
+identified above, src/hal/psram.rs. The MIT notice in reference-LICENSE applies.
+ESP-IDF v5.5.2 (30aaf64524299d3bde422ca9a2848090d1bc5d0f) AP HEX device
+driver, hw_ver1 registers, psram_ctrlr_ll, ROM command ABI and MMU definitions
+were also inspected. The driver implements bounded command completion polling.
+
+https://github.com/domgrimm/tab5-devos at
+2cec6ece6d2d43ec21a9b7329d3070e34d75b7ec supplied a cross-check of the
+ST7121 board variant and clockwise rotation of landscape RGB565 data.
+The existing Vela ST7121 initialization table remains from M5GFX, with its
+license in the BSP. Full-screen PNG/SVG assets were provided by the user.

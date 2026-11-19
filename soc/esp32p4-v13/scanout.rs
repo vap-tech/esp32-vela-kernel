@@ -2,7 +2,8 @@
 //! HP0 owns a four-frame ring. Each frame has a reusable black source block, an
 //! incrementing image span, and the fixed black source again.
 //! Orbit stores a 64-row RGB565 band. Pixel mode uses a single source word.
-//! All CPU accesses use the direct SRAM alias.
+//! Full-screen modes use one kernel-owned PSRAM framebuffer and four LLIs.
+//! CPU accesses use direct aliases, DMA uses bus addresses.
 use crate::pac::{read, write};
 use core::sync::atomic::{AtomicU32, Ordering};
 unsafe extern "C" {
@@ -21,9 +22,9 @@ const ERRORS: u32 = 0x3fe0;
 const VALID: u32 = 1 << 31;
 const SLOTS: usize = 4;
 const PER_FRAME: usize = 3;
-const NODES: usize = PER_FRAME * SLOTS;
 const BURSTS: u32 = (1 << 6) | (16 << 7) | (1 << 15) | (16 << 16);
 
+static BLOCKS: AtomicU32 = AtomicU32::new(3);
 static FRAMES: AtomicU32 = AtomicU32::new(0);
 static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn reg(addr: usize) -> u32 {
@@ -42,11 +43,12 @@ pub fn tick() {
     if !RUNNING.load(Ordering::Relaxed) {
         return;
     }
-    for i in 0..NODES {
+    let blocks = BLOCKS.load(Ordering::Relaxed) as usize;
+    for i in 0..blocks * SLOTS {
         let ctl = DIRECT + descriptors() + 64 * i + 36;
         if reg(ctl) & VALID == 0 {
             put(ctl, BURSTS | VALID);
-            if i % PER_FRAME == PER_FRAME - 1 && FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
+            if i % blocks == blocks - 1 && FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
                 put(BRIDGE + 0x54, 1);
             }
         }
@@ -90,19 +92,29 @@ pub fn clear_underrun() {
 pub fn underrun() -> bool {
     reg(BRIDGE + 0x58) & 1 != 0
 }
-pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
+pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], mode: u8) {
+    let pixel_only = mode == 3;
+    let full = mode >= 4;
+    let blocks = if full { 1 } else { PER_FRAME };
+    BLOCKS.store(blocks as u32, Ordering::Relaxed);
     let black = core::ptr::addr_of!(_orbit_black) as usize;
     let band = core::ptr::addr_of!(_orbit_band) as usize;
-    let band_bytes = if pixel_only { 8 } else { WIDTH * ICON * 2 };
+    let band_bytes = if full {
+        0
+    } else if pixel_only {
+        8
+    } else {
+        WIDTH * ICON * 2
+    };
     // Cover the source burst footprint. An eight-byte source exposed nearby
     // image data as vertical stripes on rev1.3 despite a clear underrun latch.
-    for off in (0..256).step_by(4) {
+    for off in (0..if full { 0 } else { 256 }).step_by(4) {
         put(DIRECT + black + off, 0);
     }
     for off in (0..band_bytes).step_by(4) {
         put(DIRECT + band + off, 0);
     }
-    if !pixel_only {
+    if !pixel_only && !full {
         for (i, &alpha) in coverage.iter().enumerate() {
             let channel = |v: u8| (u16::from(v) * u16::from(alpha) + 127) / 255;
             let rgb = (channel(color[0]) >> 3) << 11
@@ -123,11 +135,15 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
         WIDTH * ((HEIGHT - ICON) / 2) / 4
     };
     let middle = if pixel_only { 1 } else { WIDTH * ICON / 4 };
-    for i in 0..NODES {
-        let (src, items, fixed) = match i % PER_FRAME {
-            0 => (black, before, true),
-            1 => (band, middle, false),
-            _ => (black, WIDTH * HEIGHT / 4 - before - middle, true),
+    for i in 0..blocks * SLOTS {
+        let (src, items, fixed) = if full {
+            (crate::soc::psram::FRAME, WIDTH * HEIGHT / 4, false)
+        } else {
+            match i % PER_FRAME {
+                0 => (black, before, true),
+                1 => (band, middle, false),
+                _ => (black, WIDTH * HEIGHT / 4 - before - middle, true),
+            }
         };
         let desc = descriptors() + i * 64;
         for off in (0..64).step_by(4) {
@@ -138,7 +154,7 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
         put(DIRECT + desc + 16, (items - 1) as u32); // 64-bit items
         put(
             DIRECT + desc + 24,
-            (descriptors() + 64 * ((i + 1) % NODES)) as u32 | 1,
+            (descriptors() + 64 * ((i + 1) % (blocks * SLOTS))) as u32 | 1,
         );
         put(DIRECT + desc + 36, BURSTS | VALID);
 
@@ -178,8 +194,11 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
     put(BRIDGE + 0x08, 256);
     put(BRIDGE + 0x8c, 768);
     put(BRIDGE + 0x0c, (1 << 31) | (WIDTH * HEIGHT / 4) as u32);
-    put(BRIDGE + 0x6c, reg(BRIDGE + 0x6c) | (1 << 28));
-    put(BRIDGE + 0x88, (PER_FRAME as u32) << 4);
+    put(
+        BRIDGE + 0x6c,
+        (reg(BRIDGE + 0x6c) & !(1 << 28)) | if blocks > 1 { 1 << 28 } else { 0 },
+    );
+    put(BRIDGE + 0x88, (blocks as u32) << 4);
     put(BRIDGE + 4, 1);
     put(BRIDGE + 0x54, 1);
     barrier();

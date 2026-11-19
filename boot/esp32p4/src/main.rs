@@ -1284,7 +1284,7 @@ impl Runtime {
                 if self.processes.slots[current].id != 2 {
                     return cap::EPERM;
                 }
-                if matches!(a0, 1..=3) {
+                if matches!(a0, 1..=5) {
                     soc::scanout::stop();
                     self.display_mode = a0 as u8;
                     self.display_stage = 0;

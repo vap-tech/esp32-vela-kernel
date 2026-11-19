@@ -1,6 +1,7 @@
 # Memory map (cache bypass, L2=0)
 
-All ranges are half open. No allocation of PSRAM or lower free SRAM.
+All ranges are half open. The display driver owns a fixed PSRAM window.
+The process allocator uses upper SRAM.
 
 | Range | Role |
 |---|---|
@@ -11,6 +12,8 @@ All ranges are half open. No allocation of PSRAM or lower free SRAM.
 | 0x4ff28000..0x4ff40000 | ROM reservation, untouched |
 | 0x4ff40000..0x4ffac000 | .upper text/rodata/data then NOLOAD BSS, 432 KiB |
 | 0x4ffac000..0x4ffc0000 | 80 KiB runtime stack |
+| 0x48000000..0x48200000 | kernel display PSRAM window, bus address |
+| 0x88000000..0x88200000 | uncached CPU alias of that window |
 
 Linker asserts entry and payload bounds, BSS vs stack, and ROM reservation.
 The packer independently checks segment ranges and Flash capacity (16 MiB).

@@ -11,7 +11,7 @@ and delivers one-shot timer events through the hardware mailbox.
 ## Build and run
 
 The build requires Rustup, Clang with RISC-V support, `espflash`
-and Python 3. It uses system `ld.lld` or the Rust toolchain bundled linker.
+and Python 3 with Pillow. It uses system `ld.lld` or the Rust toolchain bundled linker.
 The pinned toolchain in `rust-toolchain.toml` includes the HP
 and LP targets. The build produces `target/firmware.bin` with the bundled
 userspace programs and the separate LP Sentinel image.
@@ -31,6 +31,8 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
 | `cat /proc/interrupts` | Read 64-bit SYSTIMER and USB Serial/JTAG RX interrupt counts on hart0. |
+| `display diag` | Show the full-screen diagnostic image from PSRAM, rotated clockwise into landscape. |
+| `display boot` | Show the Vela boot artwork from the same PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
 | `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
 | `memtest` | Check aligned userspace allocation, bounds and release. |
@@ -345,3 +347,39 @@ on Tab5. An initial single-word black source produced vertical artifacts
 outside the image band despite a clear underrun latch. A 256-byte zero
 source and 16-item source bursts removed those artifacts. Pixel and Orbit
 share the same zero source.
+
+
+### Full-screen graphics in PSRAM
+
+`display diag` and `display boot` use the PNG masters in
+`vela_boot_and_display_assets`. During the build, `tools/display_assets.py`
+rotates each 1280×720 PNG clockwise into the 720×1280 scanout layout,
+quantizes it to RGB565 and encodes little-endian (u16 count, u16 pixel)
+runs. The converter checks its output by an exact round trip.
+
+The trusted driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
+mode registers and verifies the selected chip's 32 MiB density. The link
+initializes at SPLL/12 = 40 MHz and uses SPLL/6 = 80 MHz for HEX x16 DDR.
+The first 2 MiB are identity-mapped through the PSRAM controller MMU.
+A single framebuffer occupies 1843200 bytes at physical 0x48000000.
+CPU rendering and verification use the uncached 0x88000000 alias.
+DW-GDMA reads the bus alias with one descriptor per frame and a four-frame
+ring. Only the driver owns this window; the process allocator stays in SRAM.
+
+The raster is expanded and read back in batches of 32 rows, yielding between
+batches. The framebuffer is written only after the previous scanout stops.
+Both full-screen images and their orientation were visually confirmed on
+Tab5. Startup checks passed 40 frames without recurring underrun, followed
+by shell/procfs, AHB DMA copy and healthy Sentinel with missed=0.
+Logs are `target/display-full-smoke.log` and `target/display-boot-smoke.log`.
+
+The RLE assets occupy 87948 + 183908 bytes in the SRAM-loaded firmware
+payload. Current payload is 360448 bytes and BSS 24576 bytes, leaving
+48 KiB before the separate AHB DMA reservation. The ordinary SRAM Orbit
+buffer remains reserved for mode switching. The artwork is selected through
+the shell; startup still enters the USB shell.
+
+Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
+13 an invalid image stream/range, 14 a framebuffer readback mismatch and
+15 a command timeout. PSRAM use is currently limited to the driver window.
+General PSRAM allocation, cached mappings and XIP remain separate work.

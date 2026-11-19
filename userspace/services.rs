@@ -16,6 +16,10 @@ text!(
     HELP,
     b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n"
 );
+text!(BOOT_DISPLAY, b"display boot");
+text!(BOOT_OK, b"Boot image scanout active\n");
+text!(DIAG, b"display diag");
+text!(DIAG_OK, b"Diagnostic scanout active\n");
 text!(PIXEL, b"display pixel");
 text!(PIXEL_OK, b"Pixel scanout active (360,640)\n");
 text!(ORBIT, b"display orbit");
@@ -39,7 +43,7 @@ text!(WAIT_CMD, b"sentinel wait");
 text!(CANCEL_CMD, b"sentinel cancel");
 text!(
     WAKE_HELP,
-    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel\n"
+    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot\n"
 );
 text!(WAKE_ARMED, b"Sentinel wake armed token=");
 text!(WAKE_FIRED, b"Sentinel WAKE_EVENT token=");
@@ -667,12 +671,16 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
     } else if line.matches(0, DISPLAY.as_ptr(), DISPLAY.len())
         || line.matches(0, ORBIT.as_ptr(), ORBIT.len())
         || line.matches(0, PIXEL.as_ptr(), PIXEL.len())
+        || line.matches(0, DIAG.as_ptr(), DIAG.len())
+        || line.matches(0, BOOT_DISPLAY.as_ptr(), BOOT_DISPLAY.len())
     {
         let orbit = line.matches(0, ORBIT.as_ptr(), ORBIT.len());
+        let boot = line.matches(0, BOOT_DISPLAY.as_ptr(), BOOT_DISPLAY.len());
+        let diag = line.matches(0, DIAG.as_ptr(), DIAG.len());
         let pixel = line.matches(0, PIXEL.as_ptr(), PIXEL.len());
         let mut rc = call(
             abi::DISPLAY_TEST,
-            1 + u32::from(orbit) + 2 * u32::from(pixel),
+            1 + u32::from(orbit) + 2 * u32::from(pixel) + 3 * u32::from(diag) + 4 * u32::from(boot),
             0,
             0,
             0,
@@ -682,7 +690,11 @@ fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
             rc = call(abi::DISPLAY_TEST, 0, 0, 0, 0);
         }
         if rc == 0 {
-            if pixel {
+            if boot {
+                write(BOOT_OK.as_ptr(), BOOT_OK.len());
+            } else if diag {
+                write(DIAG_OK.as_ptr(), DIAG_OK.len());
+            } else if pixel {
                 write(PIXEL_OK.as_ptr(), PIXEL_OK.len());
             } else if orbit {
                 write(ORBIT_OK.as_ptr(), ORBIT_OK.len());
