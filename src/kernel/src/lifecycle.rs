@@ -8,7 +8,7 @@
 
 use crate::{
     call::CallTable,
-    capability::{self as cap, Capability, Object},
+    capability::{self as cap, Authority, Capability, Object},
     errno::Errno,
     id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks, Tid},
     ipc::{self, Ipc, Message},
@@ -111,6 +111,42 @@ pub fn grant_or_map(
     } else {
         grant(processes, owner, handle, peer, rights)
     }
+}
+
+/// Verify that `process` holds `handle` naming `Object::Authority(expected)` with `rights`.
+pub fn require_authority(
+    processes: &Processes,
+    process: ProcSlot,
+    handle: Handle,
+    expected: Authority,
+    rights: u16,
+) -> Result<(), Errno> {
+    let capability = processes.slot(process).capabilities.get(handle, 0)?;
+    if capability.object != Object::Authority(expected) {
+        return Err(Errno::Ebadf);
+    }
+    if capability.rights & rights != rights {
+        return Err(Errno::Eperm);
+    }
+    Ok(())
+}
+
+/// Verify that `process` holds `handle` naming `expected` event object with `rights`.
+pub fn require_event(
+    processes: &Processes,
+    process: ProcSlot,
+    handle: Handle,
+    expected: Object,
+    rights: u16,
+) -> Result<(), Errno> {
+    let capability = processes.slot(process).capabilities.get(handle, 0)?;
+    if capability.object != expected {
+        return Err(Errno::Ebadf);
+    }
+    if capability.rights & rights != rights {
+        return Err(Errno::Eperm);
+    }
+    Ok(())
 }
 
 /// Validate `handle` and `rights` in `process` and resolve the live IPC endpoint.
@@ -1250,6 +1286,102 @@ mod tests {
         assert_eq!(
             h.scheduler.task(ThreadSlot(2)).context.a0,
             Errno::Epipe.to_abi()
+        );
+    }
+
+    #[test]
+    fn authority_capabilities_enforce_rights_delegation_and_revocation() {
+        let mut h = harness();
+        let shell = ProcSlot(1);
+        let peer = ProcSlot(2);
+        let peer_pid = h.processes.slot(peer).id;
+
+        let sentinel_root = h
+            .processes
+            .slot_mut(shell)
+            .capabilities
+            .install(Capability {
+                object: Object::Authority(Authority::Sentinel),
+                rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL | cap::GRANT,
+            })
+            .unwrap();
+        let ep = create_endpoint(&mut h.ipc, &mut h.processes, shell).unwrap();
+
+        // Unprivileged process and wrong object type are rejected.
+        assert_eq!(
+            require_authority(
+                &h.processes,
+                ProcSlot(0),
+                sentinel_root,
+                Authority::Sentinel,
+                cap::READ,
+            ),
+            Err(Errno::Ebadf)
+        );
+        assert_eq!(
+            require_authority(&h.processes, shell, ep, Authority::Sentinel, cap::READ),
+            Err(Errno::Ebadf)
+        );
+        assert_eq!(
+            require_authority(
+                &h.processes,
+                shell,
+                sentinel_root,
+                Authority::Display,
+                cap::CONTROL,
+            ),
+            Err(Errno::Ebadf)
+        );
+
+        // Delegate read-only Sentinel authority to peer; CONTROL/WRITE remain denied.
+        let peer_ro = grant_or_map(
+            &mut h.processes,
+            shell,
+            sentinel_root,
+            peer_pid,
+            cap::READ,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            require_authority(&h.processes, peer, peer_ro, Authority::Sentinel, cap::READ),
+            Ok(())
+        );
+        assert_eq!(
+            require_authority(
+                &h.processes,
+                peer,
+                peer_ro,
+                Authority::Sentinel,
+                cap::CONTROL,
+            ),
+            Err(Errno::Eperm)
+        );
+
+        // Revoking root invalidates peer handle while preserving shell root authority.
+        revoke_capability(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.scheduler,
+            shell,
+            sentinel_root,
+            deliver_checked,
+        )
+        .unwrap();
+        assert_eq!(
+            require_authority(&h.processes, peer, peer_ro, Authority::Sentinel, cap::READ),
+            Err(Errno::Ebadf)
+        );
+        assert_eq!(
+            require_authority(
+                &h.processes,
+                shell,
+                sentinel_root,
+                Authority::Sentinel,
+                cap::CONTROL,
+            ),
+            Ok(())
         );
     }
 

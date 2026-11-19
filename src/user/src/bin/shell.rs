@@ -8,6 +8,14 @@ vela_user::entry!(main);
 
 const FAILED: &[u8] = b"service unavailable\n";
 
+#[derive(Clone, Copy)]
+struct Caps {
+    request: u32,
+    spawn: u32,
+    display: u32,
+    sentinel: u32,
+}
+
 fn read_file(path: &[u8], request_handle: u32) {
     let mut request = Buffer::new();
     request.push(1);
@@ -56,15 +64,15 @@ fn arena_probe() -> bool {
     ok && released && arena.allocate(layout).is_none()
 }
 
-fn sentinel_data(sequence: u32, data: &mut Buffer) -> (u32, u32) {
+fn sentinel_data(sentinel_cap: u32, sequence: u32, data: &mut Buffer) -> (u32, u32) {
     let mut result = (0, 0);
     for _ in 0..8 {
         result = sys::call6(
             abi::SENTINEL_LOG,
+            sentinel_cap,
             sequence,
             data.mut_ptr() as u32,
             24,
-            0,
             0,
             0,
         );
@@ -79,9 +87,9 @@ fn sentinel_data(sequence: u32, data: &mut Buffer) -> (u32, u32) {
     result
 }
 
-fn sentinel_log() {
+fn sentinel_log(sentinel_cap: u32) {
     let mut data = Buffer::new();
-    let (result, notices) = sentinel_data(0, &mut data);
+    let (result, notices) = sentinel_data(sentinel_cap, 0, &mut data);
     if result != 24 {
         sys::write(FAILED);
         return;
@@ -120,7 +128,7 @@ fn sentinel_log() {
         if oldest == 0 || sequence == 0 || sequence > newest {
             break;
         }
-        let result = sentinel_data(sequence, &mut data).0;
+        let result = sentinel_data(sentinel_cap, sequence, &mut data).0;
         if result != 24 {
             if result == (-75i32) as u32 {
                 sys::write(b"record overwritten during read; retry log\n");
@@ -155,7 +163,7 @@ fn sentinel_log() {
     }
 }
 
-fn wake_command(line: &Buffer) -> bool {
+fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
     const PREPARE_PREFIX: &[u8] = b"sentinel prepare ";
     const ARM_PREFIX: &[u8] = b"sentinel arm ";
     const WAKE_PREFIX: &[u8] = b"sentinel wake ";
@@ -195,14 +203,14 @@ fn wake_command(line: &Buffer) -> bool {
     };
     let mut result = (0, 0);
     for _ in 0..8 {
-        result = sys::call6(number, argument, 0, 0, 0, 0, 0);
+        result = sys::call6(number, sentinel_cap, argument, 0, 0, 0, 0);
         if result.0 != (-16i32) as u32 {
             break;
         }
         sys::sleep();
     }
     if wake && (result.0 as i32) > 0 {
-        result = sys::call6(abi::SENTINEL_WAIT_WAKE, result.0, 0, 0, 0, 0, 0);
+        result = sys::call6(abi::SENTINEL_WAIT_WAKE, sentinel_cap, result.0, 0, 0, 0, 0);
     }
     if (result.0 as i32) <= 0 {
         let message: &[u8] = match result.0 as i32 {
@@ -235,12 +243,12 @@ fn wake_command(line: &Buffer) -> bool {
     true
 }
 
-fn command(line: &Buffer, request_handle: u32) {
+fn command(line: &Buffer, caps: Caps) {
     let text = line.as_slice();
     if text.is_empty() {
         return;
     }
-    if wake_command(line) {
+    if wake_command(line, caps.sentinel) {
         return;
     }
     match text {
@@ -261,10 +269,10 @@ fn command(line: &Buffer, request_handle: u32) {
                 b"display boot" => (5, b"Boot image scanout active\n"),
                 _ => (1, b"ST7121 DSI bars enabled\n"),
             };
-            let mut rc = sys::call(abi::DISPLAY_TEST, mode, 0, 0, 0);
+            let mut rc = sys::call(abi::DISPLAY_TEST, caps.display, mode, 0, 0);
             while (rc as i32) > 0 {
                 sys::sleep_ticks(rc);
-                rc = sys::call(abi::DISPLAY_TEST, 0, 0, 0, 0);
+                rc = sys::call(abi::DISPLAY_TEST, caps.display, 0, 0, 0);
             }
             if rc == 0 {
                 sys::write(ok_msg);
@@ -282,14 +290,14 @@ fn command(line: &Buffer, request_handle: u32) {
                 b"run dma" => 2,
                 _ => 0,
             };
-            if (sys::call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
+            if (sys::call(abi::SPAWN_HELLO, caps.spawn, selector, 0, 0) as i32) < 0 {
                 sys::write(FAILED);
             }
         }
-        b"sentinel log" => sentinel_log(),
+        b"sentinel log" => sentinel_log(caps.sentinel),
         b"sentinel mark" => {
             let ticks = sys::call(abi::TICKS, 0, 0, 0, 0);
-            let seq = sys::call(abi::SENTINEL_DIAG, 0x4d41_524b, ticks, 0, 0);
+            let seq = sys::call(abi::SENTINEL_DIAG, caps.sentinel, 0x4d41_524b, ticks, 0);
             if (seq as i32) > 0 {
                 let mut out = Buffer::new();
                 out.append(b"Sentinel ACK seq ");
@@ -302,7 +310,14 @@ fn command(line: &Buffer, request_handle: u32) {
         }
         b"sentinel pause" | b"sentinel resume" => {
             let resume = text == b"sentinel resume";
-            if sys::call(abi::SENTINEL_CONTROL, u32::from(resume), 0, 0, 0) == 0 {
+            if sys::call(
+                abi::SENTINEL_CONTROL,
+                caps.sentinel,
+                u32::from(resume),
+                0,
+                0,
+            ) == 0
+            {
                 if resume {
                     sys::write(b"Sentinel heartbeat resumed\n");
                 } else {
@@ -314,8 +329,15 @@ fn command(line: &Buffer, request_handle: u32) {
         }
         b"sentinel status" => {
             let mut data = Buffer::new();
-            let (result, notices) =
-                sys::call6(abi::SENTINEL_QUERY, data.mut_ptr() as u32, 24, 0, 0, 0, 0);
+            let (result, notices) = sys::call6(
+                abi::SENTINEL_QUERY,
+                caps.sentinel,
+                data.mut_ptr() as u32,
+                24,
+                0,
+                0,
+                0,
+            );
             if result == 24 {
                 data.set_len(24);
                 let mut out = Buffer::new();
@@ -343,7 +365,7 @@ fn command(line: &Buffer, request_handle: u32) {
             }
         }
         b"sentinel hello" => {
-            let seq = sys::call(abi::SENTINEL_HELLO, 0, 0, 0, 0);
+            let seq = sys::call(abi::SENTINEL_HELLO, caps.sentinel, 0, 0, 0);
             if (seq as i32) > 0 {
                 let mut out = Buffer::new();
                 out.append(b"Sentinel ACK seq ");
@@ -355,7 +377,7 @@ fn command(line: &Buffer, request_handle: u32) {
             }
         }
         b"sentinel" => {
-            let (version, epoch) = sys::call6(abi::SENTINEL_STATUS, 0, 0, 0, 0, 0, 0);
+            let (version, epoch) = sys::call6(abi::SENTINEL_STATUS, caps.sentinel, 0, 0, 0, 0, 0);
             let mut out = Buffer::new();
             if version == (-110i32) as u32 {
                 out.append(b"Sentinel heartbeat timeout, epoch ");
@@ -377,15 +399,28 @@ fn command(line: &Buffer, request_handle: u32) {
                 sys::write(b"arena: FAIL\n");
             }
         }
-        b"uptime" => read_file(b"/proc/uptime", request_handle),
+        b"uptime" => read_file(b"/proc/uptime", caps.request),
         _ if text.len() > 4 && text.starts_with(b"cat ") => {
-            read_file(&text[4..], request_handle);
+            read_file(&text[4..], caps.request);
         }
         _ => sys::write(b"unknown command (try help)\n"),
     }
 }
 
-fn main(_reply_handle: u32, request_handle: u32, input_handle: u32, _a3: u32) -> ! {
+fn main(
+    _reply_handle: u32,
+    request_handle: u32,
+    input_handle: u32,
+    spawn_cap: u32,
+    display_cap: u32,
+    sentinel_cap: u32,
+) -> ! {
+    let caps = Caps {
+        request: request_handle,
+        spawn: spawn_cap,
+        display: display_cap,
+        sentinel: sentinel_cap,
+    };
     let mut line = Buffer::new();
     let mut skip_lf = false;
     let mut overflow = false;
@@ -407,7 +442,7 @@ fn main(_reply_handle: u32, request_handle: u32, input_handle: u32, _a3: u32) ->
                 if overflow {
                     sys::write(b"line too long\n");
                 } else {
-                    command(&line, request_handle);
+                    command(&line, caps);
                 }
                 line.clear();
                 overflow = false;

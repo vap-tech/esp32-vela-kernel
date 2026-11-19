@@ -1,7 +1,8 @@
 use vela_kernel::{
-    capability as cap,
+    capability::{self as cap, Authority},
     errno::Errno,
-    id::{Handle, Pid, ProcSlot},
+    id::{Handle, ProcSlot},
+    lifecycle,
     task::Wait,
 };
 
@@ -25,10 +26,14 @@ impl Runtime {
     }
 
     pub(super) fn sys_display_test(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        if self.processes.slot(current).id != Pid(2) {
-            return Err(Errno::Eperm);
-        }
-        self.display.step(args.a0)
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Display,
+            cap::CONTROL,
+        )?;
+        self.display.step(args.a1)
     }
 
     pub(super) fn sys_dma_copy(
@@ -71,11 +76,13 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        let caps = &self.processes.slot(current).capabilities;
-        let capability = caps.get(Handle(args.a0), cap::WAIT | cap::ACK)?;
-        if capability.object != CONSOLE_RX {
-            return Err(Errno::Ebadf);
-        }
+        lifecycle::require_event(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            CONSOLE_RX,
+            cap::WAIT | cap::ACK,
+        )?;
         if self
             .scheduler
             .tasks
@@ -92,21 +99,19 @@ impl Runtime {
     }
 
     pub(super) fn sys_console_read(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        // Boot-assigned input authority: only console task owns RX.
-        if self
-            .processes
-            .slot(current)
-            .capabilities
-            .find(CONSOLE_RX, cap::READ)
-            .is_none()
-        {
-            return Err(Errno::Eperm);
-        }
-        let capacity = args.a1 as usize;
+        lifecycle::require_event(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            CONSOLE_RX,
+            cap::READ,
+        )?;
+        let pointer = args.a1 as usize;
+        let capacity = args.a2 as usize;
         if capacity == 0 || capacity > 32 {
             return Err(Errno::Einval);
         }
-        if !self.writable(args.a0 as usize, capacity) {
+        if !self.writable(pointer, capacity) {
             return Err(Errno::Efault);
         }
         let mut buffer = [0u8; 32];
@@ -118,7 +123,7 @@ impl Runtime {
             buffer[count] = byte;
             count += 1;
         }
-        copy_to_user_within(self.memory(), args.a0 as usize, capacity, &buffer[..count])?;
+        copy_to_user_within(self.memory(), pointer, capacity, &buffer[..count])?;
         Ok(count as u32)
     }
 }

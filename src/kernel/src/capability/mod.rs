@@ -15,10 +15,18 @@ pub const WAIT: u16 = 64;
 pub const ACK: u16 = 128;
 pub const CONTROL: u16 = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authority {
+    ProcessSpawn,
+    Display,
+    Sentinel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     Endpoint { index: usize, generation: u32 },
     Memory { owner: Pid, region: Region },
     Event { index: usize, generation: u32 },
+    Authority(Authority),
 }
 #[derive(Clone, Copy)]
 pub struct Capability {

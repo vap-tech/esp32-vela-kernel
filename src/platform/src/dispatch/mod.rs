@@ -65,7 +65,7 @@ impl Runtime {
             | syscall::SENTINEL_QUERY
             | syscall::SENTINEL_DIAG
             | syscall::SENTINEL_LOG => self.sys_sentinel_command(current, args, switch),
-            syscall::SENTINEL_STATUS => self.sys_sentinel_status(frame),
+            syscall::SENTINEL_STATUS => self.sys_sentinel_status(current, args, frame),
             syscall::TICKS => self.sys_ticks(),
             syscall::STATS => self.sys_stats(args),
             syscall::ENDPOINT_CREATE => self.sys_endpoint_create(current),

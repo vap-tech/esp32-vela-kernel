@@ -65,7 +65,7 @@ fn read_node(request: &Buffer, response: &mut Buffer) {
     }
 }
 
-fn main(request_handle: u32, reply_handle: u32, _a2: u32, _a3: u32) -> ! {
+fn main(request_handle: u32, reply_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     loop {
         let mut request = Buffer::new();
         if !request.receive(request_handle) {

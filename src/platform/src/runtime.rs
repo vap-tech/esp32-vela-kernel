@@ -242,7 +242,7 @@ impl Runtime {
     pub fn start_loaded(
         &mut self,
         loaded: LoadedElf,
-        args: [u32; 4],
+        args: [u32; 6],
         priority: u8,
         priority_ceiling: u8,
     ) -> Result<Tid, Errno> {
@@ -262,7 +262,7 @@ impl Runtime {
 
     pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<Pid, Errno> {
         let (loaded, arg0) = self.load_elf(bytes, dma_driver)?;
-        if let Err(e) = self.start_loaded(loaded, [arg0, 0, 0, 0], 1, 1) {
+        if let Err(e) = self.start_loaded(loaded, [arg0, 0, 0, 0, 0, 0], 1, 1) {
             self.abort_loaded(loaded);
             return Err(e);
         }

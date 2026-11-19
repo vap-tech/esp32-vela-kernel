@@ -66,8 +66,8 @@ macro_rules! entry {
     ($main:path) => {
         #[unsafe(link_section = ".text.entry")]
         #[unsafe(no_mangle)]
-        pub extern "C" fn _start(a0: u32, a1: u32, a2: u32, a3: u32) -> ! {
-            $main(a0, a1, a2, a3)
+        pub extern "C" fn _start(a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) -> ! {
+            $main(a0, a1, a2, a3, a4, a5)
         }
 
         #[panic_handler]

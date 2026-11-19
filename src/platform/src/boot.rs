@@ -1,7 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{
     call::CallTable,
-    capability::{self as cap, Capability},
+    capability::{self as cap, Authority, Capability, Object},
     id::ThreadSlot,
     ipc::Ipc,
     lifecycle::{create_endpoint, grant},
@@ -81,7 +81,7 @@ extern "C" fn rust_main() -> ! {
     let (shell, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
     let (console_proc, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
 
-    // Explicit boot policy. Kernel IPC module has no service names/protocols.
+    // Explicit boot policy: IPC endpoints, hardware RX event, and service authorities.
     let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();
     let reply = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
     let input = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
@@ -118,14 +118,40 @@ extern "C" fn rust_main() -> ! {
             rights: cap::READ | cap::WAIT | cap::ACK,
         })
         .unwrap();
+    let shell_caps = &mut runtime.processes.slot_mut(shell.slot).capabilities;
+    let spawn_cap = shell_caps
+        .install(Capability {
+            object: Object::Authority(Authority::ProcessSpawn),
+            rights: cap::EXECUTE | cap::GRANT | cap::CONTROL,
+        })
+        .unwrap();
+    let display_cap = shell_caps
+        .install(Capability {
+            object: Object::Authority(Authority::Display),
+            rights: cap::CONTROL | cap::GRANT,
+        })
+        .unwrap();
+    let sentinel_cap = shell_caps
+        .install(Capability {
+            object: Object::Authority(Authority::Sentinel),
+            rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL | cap::GRANT,
+        })
+        .unwrap();
 
     runtime
-        .start_loaded(procfs, [request.raw(), proc_reply.raw(), 0, 0], 0, 1)
+        .start_loaded(procfs, [request.raw(), proc_reply.raw(), 0, 0, 0, 0], 0, 1)
         .unwrap();
     runtime
         .start_loaded(
             shell,
-            [reply.raw(), shell_request.raw(), input.raw(), 0],
+            [
+                reply.raw(),
+                shell_request.raw(),
+                input.raw(),
+                spawn_cap.raw(),
+                display_cap.raw(),
+                sentinel_cap.raw(),
+            ],
             1,
             1,
         )
@@ -133,7 +159,7 @@ extern "C" fn rust_main() -> ! {
     runtime
         .start_loaded(
             console_proc,
-            [console_input.raw(), rx_event.raw(), 0, 0],
+            [console_input.raw(), rx_event.raw(), 0, 0, 0, 0],
             2,
             2,
         )

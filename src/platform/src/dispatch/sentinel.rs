@@ -1,6 +1,8 @@
 use vela_kernel::{
+    capability::{self as cap, Authority},
     errno::Errno,
-    id::{Pid, ProcSlot, Ticks},
+    id::{Handle, ProcSlot, Ticks},
+    lifecycle,
     sentinel::{WakePhase, WakeTicket},
     task::{Context, State, Wait},
 };
@@ -18,13 +20,17 @@ impl Runtime {
         current: ProcSlot,
         args: Args,
     ) -> Result<u32, Errno> {
-        if self.processes.slot(current).id != Pid(2) {
-            return Err(Errno::Eperm);
-        }
-        if args.a0 > 1 {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            cap::CONTROL,
+        )?;
+        if args.a1 > 1 {
             return Err(Errno::Einval);
         }
-        self.sentinel.set_heartbeat(args.a0 != 0);
+        self.sentinel.set_heartbeat(args.a1 != 0);
         Ok(0)
     }
 
@@ -35,16 +41,26 @@ impl Runtime {
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let sleep = args.number == syscall::SENTINEL_PREPARE_SLEEP;
-        let owner = self.processes.slot(current).id;
-        if owner != Pid(2) {
-            return Err(Errno::Eperm);
-        }
-        if !(1..=60_000).contains(&args.a0) {
+        let rights = if sleep {
+            cap::WAIT | cap::CONTROL
+        } else {
+            cap::WAIT
+        };
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            rights,
+        )?;
+        let delay_ms = args.a1;
+        if !(1..=60_000).contains(&delay_ms) {
             return Err(Errno::Einval);
         }
         if self.sentinel.wake_ticket().is_some() {
             return Err(Errno::Ebusy);
         }
+        let owner = self.processes.slot(current).id;
         // SAFETY: sole hart snapshot owner under masked IRQs.
         let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER arm snapshot"));
         let sequence = self.sentinel.request(
@@ -53,15 +69,15 @@ impl Runtime {
             } else {
                 sentinel_wire::SET_WAKEUP
             },
-            args.a0,
+            delay_ms,
             0,
         )?;
         self.sentinel.set_wake_ticket(Some(WakeTicket {
             token: sequence,
             owner,
             started: now,
-            expires: now.saturating_add((u64::from(args.a0) + 9) / 10 + 100),
-            delay_ms: args.a0,
+            expires: now.saturating_add((u64::from(delay_ms) + 9) / 10 + 100),
+            delay_ms,
             sleep,
             phase: WakePhase::Requested,
         }));
@@ -84,11 +100,18 @@ impl Runtime {
         frame: &mut arch::TrapFrame,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            cap::WAIT,
+        )?;
         let ticket = self.sentinel.wake_ticket().ok_or(Errno::Enoent)?;
         if ticket.owner != self.processes.slot(current).id {
             return Err(Errno::Eperm);
         }
-        if args.a0 != 0 && args.a0 != ticket.token {
+        if args.a1 != 0 && args.a1 != ticket.token {
             return Err(Errno::Enoent);
         }
         if let WakePhase::Fired(elapsed) = ticket.phase {
@@ -133,11 +156,18 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            cap::WAIT,
+        )?;
         let ticket = self.sentinel.wake_ticket().ok_or(Errno::Enoent)?;
         if ticket.owner != self.processes.slot(current).id {
             return Err(Errno::Eperm);
         }
-        if args.a0 != 0 && args.a0 != ticket.token {
+        if args.a1 != 0 && args.a1 != ticket.token {
             return Err(Errno::Enoent);
         }
         if matches!(ticket.phase, WakePhase::Fired(_)) {
@@ -170,28 +200,37 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        if self.processes.slot(current).id != Pid(2) {
-            return Err(Errno::Eperm);
-        }
+        let rights = if args.number == syscall::SENTINEL_DIAG {
+            cap::WRITE
+        } else {
+            cap::READ
+        };
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            rights,
+        )?;
         let (command, arg0, arg1, pointer, size) = match args.number {
             syscall::SENTINEL_QUERY => (
                 sentinel_wire::GET_STATUS,
                 0,
                 0,
-                args.a0 as usize,
                 args.a1 as usize,
+                args.a2 as usize,
             ),
-            syscall::SENTINEL_DIAG => (sentinel_wire::DIAGNOSTIC, args.a0, args.a1, 0, 0),
+            syscall::SENTINEL_DIAG => (sentinel_wire::DIAGNOSTIC, args.a1, args.a2, 0, 0),
             syscall::SENTINEL_LOG => (
-                if args.a0 == 0 {
+                if args.a1 == 0 {
                     sentinel_wire::LOG_META
                 } else {
                     sentinel_wire::LOG_READ
                 },
-                args.a0,
+                args.a1,
                 0,
-                args.a1 as usize,
                 args.a2 as usize,
+                args.a3 as usize,
             ),
             _ => (sentinel_wire::HELLO, 0, 0, 0, 0),
         };
@@ -215,7 +254,19 @@ impl Runtime {
         Ok(0)
     }
 
-    pub(super) fn sys_sentinel_status(&self, frame: &mut arch::TrapFrame) -> Result<u32, Errno> {
+    pub(super) fn sys_sentinel_status(
+        &self,
+        current: ProcSlot,
+        args: Args,
+        frame: &mut arch::TrapFrame,
+    ) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            cap::READ,
+        )?;
         frame.set_return2(self.sentinel.epoch_or_zero());
         self.sentinel.link_status()
     }

@@ -1,6 +1,7 @@
 use vela_kernel::{
+    capability::{self as cap, Authority},
     errno::Errno,
-    id::{Pid, ProcSlot, Tid},
+    id::{Handle, Pid, ProcSlot, Tid},
     lifecycle,
     task::{Region, Wait},
 };
@@ -15,16 +16,20 @@ use crate::{
 
 impl Runtime {
     pub(super) fn sys_spawn_hello(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        if self.processes.slot(current).id != Pid(2) {
-            return Err(Errno::Eperm);
-        }
-        let bytes: &[u8] = match args.a0 {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::ProcessSpawn,
+            cap::EXECUTE,
+        )?;
+        let bytes: &[u8] = match args.a1 {
             0 => include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
             2 => include_bytes!(concat!(env!("OUT_DIR"), "/dma.elf")),
             1 => include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
             _ => return Err(Errno::Einval),
         };
-        self.spawn_elf(bytes, args.a0 == 2).map(Pid::raw)
+        self.spawn_elf(bytes, args.a1 == 2).map(Pid::raw)
     }
 
     pub(super) fn sys_yield(&mut self, switch: &mut bool) -> Result<u32, Errno> {

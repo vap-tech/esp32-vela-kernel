@@ -15,10 +15,10 @@ pub struct TrapFrame {
 }
 impl TrapFrame {
     pub fn user(entry: usize, sp: usize, argument: u32) -> Self {
-        Self::user_args(entry, sp, [argument, 0, 0, 0])
+        Self::user_args(entry, sp, [argument, 0, 0, 0, 0, 0])
     }
 
-    pub fn user_args(entry: usize, sp: usize, args: [u32; 4]) -> Self {
+    pub fn user_args(entry: usize, sp: usize, args: [u32; 6]) -> Self {
         let mut frame = Self {
             registers: [0; 30],
             sp: sp as u32,
@@ -28,7 +28,7 @@ impl TrapFrame {
             mstatus: 1 << 7,
             padding: 0,
         };
-        frame.registers[8..12].copy_from_slice(&args);
+        frame.registers[8..14].copy_from_slice(&args);
         frame
     }
 }

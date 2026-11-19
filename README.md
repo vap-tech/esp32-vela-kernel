@@ -89,9 +89,10 @@ Neither command enters PMU light/deep sleep.
 | Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
 
-The shared service RX image is limited to 8 KiB and is close to that budget;
-linker assertions reject overflow. Existing files in docs describe earlier
-bring-up stages; this README records the current supported commands and limits.
+Boot services (`procfs`, `shell` and `console`) are built as standalone static PIE
+ELF binaries in `src/user` and loaded into private PMP-isolated SRAM allocations at
+startup. `docs/architecture.md` documents the workspace layout and kernel invariants;
+this README records the supported commands and hardware checkpoints.
 
 ## Kernel and userspace
 
@@ -100,6 +101,9 @@ messages each, max 96 bytes, sixteen generational capabilities per process. Crea
 gives owner send+receive rights. Boot assignments and explicit capability grants give SEND to
 peers; global endpoint IDs are not user handles. Receiving requires an explicit
 process-local RECEIVE capability; handle values alone confer no authority.
+Privileged operations (process spawning, display scanout control, Sentinel
+supervision and console RX) likewise require explicit process-local capability
+handles granted by boot policy rather than ambient PID checks.
 Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
 retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
 message queued. Closing an owner handle destroys endpoint/queue and invalidates
@@ -122,9 +126,8 @@ The console service drains USB Serial/JTAG RX in batches of up to 32 bytes.
 Boot binds the RX event capability to the console process. EVENT_WAIT rearms
 the packet interrupt and checks FIFO availability under masked hart interrupts
 before blocking. CLIC line 18 wakes the driver on hart0. The handler masks and
-acknowledges the packet source until the driver rearms it. The shared static
-service image has an aligned 8 KiB RX mapping. On Tab5 v1.3 the shell accepted
-help and both procfs reads with one serial write per command.
+acknowledges the packet source until the driver rearms it. On Tab5 v1.3 the shell accepted
+help and procfs reads with one serial write per command.
 
 STATS accepts the original 44-byte little-endian snapshot and a 52-byte
 version with a trailing USB RX interrupt count. Total counts live
@@ -385,8 +388,9 @@ CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
 for expansion and framebuffer readback. A separate validation reader also
 uses 4 KiB during the first row batch.
 
-Current SRAM payload is 90112 bytes and BSS 24576 bytes, leaving 312 KiB
-before the separate AHB DMA reservation. This frees 264 KiB compared with
+Current SRAM payload is 97280 bytes (including bundled service and test ELFs)
+and kernel BSS is 10608 bytes, leaving 318 KiB before the separate AHB DMA
+reservation. This frees 264 KiB compared with
 embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
 reserved for mode switching. The artwork is selected through the shell;
 startup still enters the USB shell.
