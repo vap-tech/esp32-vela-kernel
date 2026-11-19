@@ -22,4 +22,5 @@ assert s['vela_trap_entry'] % 64 == 0
 for name in ['_bss_start', '_bss_end', '_stack_top', '_boot_stack_top']:
     assert s[name] % 16 == 0
 assert not any(len(f := line.split()) == 8 and f[6] == 'UND' for line in out.splitlines())
+assert not any(k.startswith('_user_') for k in s), 'kernel ELF still embeds static .user symbols'
 print(f"ELF verified: entry={s['_entry_end']-s['_entry_start']} B; payload={s['_upper_load_end']-s['_upper_start']} B; BSS={s['_bss_end']-s['_bss_start']} B")

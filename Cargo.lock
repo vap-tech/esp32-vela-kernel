@@ -13,7 +13,6 @@ dependencies = [
  "vela-abi",
  "vela-kernel",
  "vela-lp",
- "vela-user",
 ]
 
 [[package]]

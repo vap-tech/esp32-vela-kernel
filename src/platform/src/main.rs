@@ -3,7 +3,6 @@
 
 pub(crate) use arch::pmp;
 pub(crate) use vela_abi::{sentinel as sentinel_wire, syscall};
-pub(crate) use vela_user as users;
 
 mod arch;
 mod board;

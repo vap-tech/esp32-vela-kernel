@@ -7,7 +7,7 @@ use vela_kernel::{
     ipc::Ipc,
     lifecycle::{self, ReapedProcess},
     memory::RegionAllocator,
-    process::{AddressSpace, EXECUTE, Processes, READ, WRITE},
+    process::{AddressSpace, EXECUTE, Process, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
     task::{Region, State, Wait},
 };
@@ -16,6 +16,14 @@ use crate::{
     arch, display::DisplayControl, dma::DmaChannel, pmp, sentinel::SentinelClient, soc,
     usermem::copy_to_user_within,
 };
+
+#[derive(Clone, Copy)]
+pub struct LoadedElf {
+    pub slot: ProcSlot,
+    pub pid: Pid,
+    pub entry: usize,
+    pub stack: Region,
+}
 
 pub struct BootLogs {
     pub block: bool,
@@ -126,7 +134,7 @@ impl Runtime {
         }
     }
 
-    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<Pid, Errno> {
+    pub fn load_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<(LoadedElf, u32), Errno> {
         let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| Errno::Enoexec)?;
         let process = self.processes.create(AddressSpace::EMPTY)?;
         let owner = self.processes.slot(process).id;
@@ -210,19 +218,55 @@ impl Runtime {
                 core::ptr::write_bytes(stack.base as *mut u8, 0, stack.size);
                 core::arch::asm!("fence.i", options(nostack));
             }
-            let frame = arch::TrapFrame::user(entry, stack.base + stack.size, arg);
-            self.scheduler
-                .create_thread(process, frame, stack, entry, 1, 1)?;
             self.processes.slot_mut(process).memory = space;
             self.pmp_images[process.index()] = Some((space.revision, prepared));
-            Ok(owner)
+            Ok((
+                LoadedElf {
+                    slot: process,
+                    pid: owner,
+                    entry,
+                    stack,
+                },
+                arg,
+            ))
         })();
         if result.is_err() {
             self.dma.release_process(owner);
             self.allocator.release_owner(owner);
-            *self.processes.slot_mut(process) = vela_kernel::process::Process::EMPTY;
+            self.pmp_images[process.index()] = None;
+            *self.processes.slot_mut(process) = Process::EMPTY;
         }
         result
+    }
+
+    pub fn start_loaded(
+        &mut self,
+        loaded: LoadedElf,
+        args: [u32; 4],
+        priority: u8,
+        priority_ceiling: u8,
+    ) -> Result<Tid, Errno> {
+        self.processes.slot_mut(loaded.slot).priority_ceiling = priority_ceiling;
+        let frame =
+            arch::TrapFrame::user_args(loaded.entry, loaded.stack.base + loaded.stack.size, args);
+        self.scheduler
+            .create_thread(loaded.slot, frame, loaded.stack, loaded.entry, priority, 1)
+    }
+
+    pub fn abort_loaded(&mut self, loaded: LoadedElf) {
+        self.dma.release_process(loaded.pid);
+        self.allocator.release_owner(loaded.pid);
+        self.pmp_images[loaded.slot.index()] = None;
+        *self.processes.slot_mut(loaded.slot) = Process::EMPTY;
+    }
+
+    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<Pid, Errno> {
+        let (loaded, arg0) = self.load_elf(bytes, dma_driver)?;
+        if let Err(e) = self.start_loaded(loaded, [arg0, 0, 0, 0], 1, 1) {
+            self.abort_loaded(loaded);
+            return Err(e);
+        }
+        Ok(loaded.pid)
     }
 
     pub fn complete_dma(&mut self, success: bool) {

@@ -2,33 +2,29 @@ use core::fmt::Write;
 use vela_kernel::{
     call::CallTable,
     capability::{self as cap, Capability},
-    id::ProcSlot,
+    id::ThreadSlot,
     ipc::Ipc,
     lifecycle::{create_endpoint, grant},
     memory::RegionAllocator,
-    process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
+    process::{PROCESSES, Processes},
     sched::Scheduler,
-    task::Region,
 };
 
 use crate::{
     arch, board,
     display::DisplayControl,
     dma::DmaChannel,
-    pmp,
     runtime::{BootLogs, CONSOLE_RX, RUNTIME, Runtime},
     sentinel::SentinelClient,
-    soc, users,
+    soc,
 };
 
+const PROCFS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/procfs.elf"));
+const SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
+const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
+
 unsafe extern "C" {
-    static _user_code_start: u8;
-    static _user_code_end: u8;
-    static _user_stack0: u8;
-    static _user_stack1: u8;
-    static _user_stack2: u8;
     static _stack_top: u8;
-    static _stack_bottom: u8;
     static _dma_page: u8;
     static _bss_end: u8;
     fn vela_trap_entry();
@@ -48,126 +44,120 @@ extern "C" fn rust_main() -> ! {
         "VELA microkernel\nSpace Flow Project\n[board] {}",
         board::NAME
     );
-    let code = Region {
-        base: core::ptr::addr_of!(_user_code_start) as usize,
-        size: core::ptr::addr_of!(_user_code_end) as usize
-            - core::ptr::addr_of!(_user_code_start) as usize,
-    };
-    let stacks = [
-        Region {
-            base: core::ptr::addr_of!(_user_stack0) as usize,
-            size: 4096,
-        },
-        Region {
-            base: core::ptr::addr_of!(_user_stack1) as usize,
-            size: 4096,
-        },
-        Region {
-            base: core::ptr::addr_of!(_user_stack2) as usize,
-            size: 4096,
-        },
-    ];
-    let mut processes = Processes::new();
-    for stack in stacks {
-        let mut memory = AddressSpace::EMPTY;
-        memory.insert(code, READ | EXECUTE).unwrap();
-        memory.insert(stack, READ | WRITE).unwrap();
-        processes.create(memory).unwrap();
-    }
-    // Explicit boot policy. Kernel IPC module has no service names/protocols.
-    let procfs = ProcSlot(0);
-    let shell = ProcSlot(1);
-    let console_proc = ProcSlot(2);
-    let mut ipc = Ipc::new();
-    let request = create_endpoint(&mut ipc, &mut processes, procfs).unwrap();
-    let reply = create_endpoint(&mut ipc, &mut processes, shell).unwrap();
-    let input = create_endpoint(&mut ipc, &mut processes, shell).unwrap();
-    let shell_request = grant(&mut processes, procfs, request, shell, cap::SEND).unwrap();
-    let proc_reply = grant(&mut processes, shell, reply, procfs, cap::SEND).unwrap();
-    let console_input = grant(&mut processes, shell, input, console_proc, cap::SEND).unwrap();
-    let rx_event = processes
-        .slot_mut(console_proc)
-        .capabilities
-        .install(Capability {
-            object: CONSOLE_RX,
-            rights: cap::READ | cap::WAIT | cap::ACK,
-        })
-        .unwrap();
-    let entries = [
-        users::procfs_main as *const () as usize,
-        users::shell_main as *const () as usize,
-        users::console_main as *const () as usize,
-    ];
-    let args = [
-        [request.raw(), proc_reply.raw(), 0],
-        [reply.raw(), shell_request.raw(), input.raw()],
-        [console_input.raw(), rx_event.raw(), 0],
-    ];
-    let contexts = core::array::from_fn(|i| {
-        let mut frame =
-            arch::TrapFrame::user(entries[i], stacks[i].base + stacks[i].size, args[i][0]);
-        frame.registers[9] = args[i][1];
-        frame.registers[10] = args[i][2];
-        frame
-    });
-    // SAFETY: isolated physical regions, no users executing.
-    let initial_pmp = pmp::Prepared::new(&processes.slot(procfs).memory).unwrap();
-    assert!(unsafe { initial_pmp.activate() }, "PMP readback");
-    let _ = writeln!(
-        console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)"
-    );
+
     let mut idle = arch::TrapFrame::user(
         arch::vela_idle_entry as *const () as usize,
         core::ptr::addr_of!(_stack_top) as usize,
         0,
     );
     idle.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
-    let mut scheduler = Scheduler::new(contexts, entries, stacks);
-    scheduler.tasks[0].priority = 0;
-    scheduler.tasks[0].effective_priority = 0;
-    scheduler.tasks[2].priority = 2;
-    scheduler.tasks[2].effective_priority = 2;
-    processes.slot_mut(console_proc).priority_ceiling = 2;
-    let runtime = Runtime {
-        scheduler,
-        console,
-        active_space: Some((procfs, 2)),
-        pmp_images: core::array::from_fn(|i| {
-            let slot = ProcSlot(i);
-            if processes.slot(slot).state == Lifecycle::Alive {
-                Some((
-                    processes.slot(slot).memory.revision,
-                    pmp::Prepared::new(&processes.slot(slot).memory).unwrap(),
-                ))
-            } else {
-                None
-            }
-        }),
-        processes,
-        allocator: RegionAllocator::new(
-            core::ptr::addr_of!(_bss_end) as usize,
-            core::ptr::addr_of!(_dma_page) as usize,
-        ),
-        ipc,
-        calls: CallTable::new(),
-        idle_frame: idle,
-        in_idle: false,
-        dma: DmaChannel::new(),
-        sentinel: SentinelClient::new(),
-        display: DisplayControl::new(),
-        usb_rx_interrupts: 0,
-        logs: BootLogs::EMPTY,
+
+    // SAFETY: once-only initialization on hart0 with IRQs masked.
+    let runtime = unsafe {
+        (*RUNTIME.0.get()).write(Runtime {
+            scheduler: Scheduler::empty(idle),
+            processes: Processes::new(),
+            active_space: None,
+            pmp_images: [None; PROCESSES],
+            allocator: RegionAllocator::new(
+                core::ptr::addr_of!(_bss_end) as usize,
+                core::ptr::addr_of!(_dma_page) as usize,
+            ),
+            console,
+            ipc: Ipc::new(),
+            calls: CallTable::new(),
+            idle_frame: idle,
+            in_idle: false,
+            dma: DmaChannel::new(),
+            sentinel: SentinelClient::new(),
+            display: DisplayControl::new(),
+            usb_rx_interrupts: 0,
+            logs: BootLogs::EMPTY,
+        })
     };
+
+    // Load isolated standalone user ELF services into private SRAM allocations.
+    let (procfs, _) = runtime.load_elf(PROCFS_ELF, false).expect("procfs ELF");
+    let (shell, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
+    let (console_proc, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
+
+    // Explicit boot policy. Kernel IPC module has no service names/protocols.
+    let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();
+    let reply = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
+    let input = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
+    let shell_request = grant(
+        &mut runtime.processes,
+        procfs.slot,
+        request,
+        shell.slot,
+        cap::SEND,
+    )
+    .unwrap();
+    let proc_reply = grant(
+        &mut runtime.processes,
+        shell.slot,
+        reply,
+        procfs.slot,
+        cap::SEND,
+    )
+    .unwrap();
+    let console_input = grant(
+        &mut runtime.processes,
+        shell.slot,
+        input,
+        console_proc.slot,
+        cap::SEND,
+    )
+    .unwrap();
+    let rx_event = runtime
+        .processes
+        .slot_mut(console_proc.slot)
+        .capabilities
+        .install(Capability {
+            object: CONSOLE_RX,
+            rights: cap::READ | cap::WAIT | cap::ACK,
+        })
+        .unwrap();
+
+    runtime
+        .start_loaded(procfs, [request.raw(), proc_reply.raw(), 0, 0], 0, 1)
+        .unwrap();
+    runtime
+        .start_loaded(
+            shell,
+            [reply.raw(), shell_request.raw(), input.raw(), 0],
+            1,
+            1,
+        )
+        .unwrap();
+    runtime
+        .start_loaded(
+            console_proc,
+            [console_input.raw(), rx_event.raw(), 0, 0],
+            2,
+            2,
+        )
+        .unwrap();
+
+    // SAFETY: isolated physical regions, no users executing yet.
+    let (revision, initial_pmp) = runtime.pmp_images[procfs.slot.index()].unwrap();
+    assert!(unsafe { initial_pmp.activate() }, "PMP readback");
+    runtime.active_space = Some((procfs.slot, revision));
+    runtime.scheduler.activate_initial(ThreadSlot(0));
+
+    let _ = writeln!(
+        runtime.console,
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)\n[sched] preemptive scheduler online"
+    );
+
     unsafe {
-        // SAFETY: once-only initialization. No reference survives assembly entry.
-        let runtime = (*RUNTIME.0.get()).write(runtime);
-        let _ = writeln!(runtime.console, "[sched] preemptive scheduler online");
+        // SAFETY: no Rust reference survives assembly entry into U-mode.
         soc::timer::start(vela_trap_entry as *const () as usize);
         runtime.console.route_rx_irq();
         if let Some(boot) = soc::sentinel::start() {
             runtime.sentinel.set_boot_info(boot.epoch, boot.hz);
         }
-        arch::enter(&runtime.scheduler.current().context);
+        let initial_ctx = &raw const runtime.scheduler.tasks[0].context;
+        arch::enter(initial_ctx);
     }
 }

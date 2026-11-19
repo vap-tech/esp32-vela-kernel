@@ -64,6 +64,38 @@ impl<C: Copy> Scheduler<C> {
             preferred: None,
         }
     }
+    pub fn empty(empty_context: C) -> Self {
+        let tasks = [Thread {
+            id: Tid::NONE,
+            wait: Wait::None,
+            deadline: None,
+            state: State::Terminated,
+            context: empty_context,
+            entry: 0,
+            process: ProcSlot(0),
+            priority: 1,
+            effective_priority: 1,
+            affinity: 1,
+            stack: Region { base: 0, size: 0 },
+            runtime_ticks: 0,
+            preemptions: 0,
+        }; TASKS];
+        Self {
+            tasks,
+            current: ThreadSlot(0),
+            ticks: 0,
+            uptime: Ticks::ZERO,
+            sampled_at: Ticks::ZERO,
+            last_id: Tid::NONE,
+            load: LoadAverage::default(),
+            preferred: None,
+        }
+    }
+    pub fn activate_initial(&mut self, slot: ThreadSlot) {
+        assert_eq!(self.tasks[slot.index()].state, State::Ready);
+        self.tasks[slot.index()].state = State::Running;
+        self.current = slot;
+    }
     pub fn task(&self, slot: ThreadSlot) -> &Thread<C> {
         &self.tasks[slot.index()]
     }
@@ -449,6 +481,27 @@ mod tests {
         assert_eq!(snap.uptime_ticks, 5 * HZ);
         assert!(snap.load_q16[0] > 0);
         assert_eq!(snap.runnable_tasks, 3);
+    }
+
+    #[test]
+    fn empty_scheduler_populates_and_activates_initial_boot_thread() {
+        let mut s = Scheduler::empty(TestCtx::default());
+        assert_eq!(s.snapshot().total_tasks, 0);
+        let stack = Region {
+            base: 0x1000,
+            size: 4096,
+        };
+        let t1 = s
+            .create_thread(ProcSlot(0), TestCtx::default(), stack, 0x100, 0, 1)
+            .unwrap();
+        let t2 = s
+            .create_thread(ProcSlot(1), TestCtx::default(), stack, 0x200, 1, 1)
+            .unwrap();
+        assert_eq!((t1, t2), (Tid(1), Tid(2)));
+        s.activate_initial(ThreadSlot(0));
+        assert_eq!(s.current, ThreadSlot(0));
+        assert_eq!(s.snapshot().running_tasks, 1);
+        assert_eq!(s.select(false), Some(ThreadSlot(1)));
     }
 
     #[test]

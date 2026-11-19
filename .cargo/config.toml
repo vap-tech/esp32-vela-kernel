@@ -1,7 +1,2 @@
 [build]
 target = "riscv32imafc-unknown-none-elf"
-
-[target.riscv32imafc-unknown-none-elf]
-# User services execute in a separate PMP region. Compiler-generated switch
-# tables otherwise land in kernel rodata outside the user image.
-rustflags = ["-Cjump-tables=no"]

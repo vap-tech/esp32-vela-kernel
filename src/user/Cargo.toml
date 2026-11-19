@@ -7,5 +7,25 @@ edition = "2024"
 vela-abi = { path = "../abi" }
 
 [lib]
+name = "vela_user"
+path = "src/lib.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vela-procfs"
+path = "src/bin/procfs.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vela-shell"
+path = "src/bin/shell.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vela-console"
+path = "src/bin/console.rs"
 test = false
 bench = false

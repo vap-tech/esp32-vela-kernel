@@ -1,217 +1,106 @@
 #![no_std]
-//! Fixed-address U-mode services. Shared RX image, private stacks. Every helper
-//! is inlined or placed in .user.text; literals live only in .user.rodata.
-//! No allocation, kernel references, shared writable memory, or core formatting.
-use vela_abi::syscall as abi;
-mod arena;
-use core::mem::MaybeUninit;
-macro_rules! text {
-    ($name:ident, $bytes:literal) => {
-        #[unsafe(link_section = ".user.rodata")]
-        static $name: [u8; $bytes.len()] = *$bytes;
-    };
-}
-text!(PROMPT, b"vela:/$ ");
-text!(
-    HELP,
-    b"help | cat <path> | uptime | run hello | run pic | run dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n"
-);
-text!(BOOT_DISPLAY, b"display boot");
-text!(BOOT_OK, b"Boot image scanout active\n");
-text!(DIAG, b"display diag");
-text!(DIAG_OK, b"Diagnostic scanout active\n");
-text!(PIXEL, b"display pixel");
-text!(PIXEL_OK, b"Pixel scanout active (360,640)\n");
-text!(ORBIT, b"display orbit");
-text!(ORBIT_OK, b"Orbit scanout active\n");
-text!(DISPLAY, b"display test");
-text!(BARS, b"ST7121 DSI bars enabled\n");
-text!(DISPLAY_ERROR, b"display error ");
-text!(HELP_CMD, b"help");
-text!(RUN_DMA, b"run dma");
-text!(PAUSE_CMD, b"sentinel pause");
-text!(RESUME_CMD, b"sentinel resume");
-text!(PAUSED, b"Sentinel heartbeat paused\n");
-text!(RESUMED, b"Sentinel heartbeat resumed\n");
-text!(NOTICES, b" notices=");
-text!(WAKE_PREFIX, b"sentinel wake ");
-text!(PREPARE_PREFIX, b"sentinel prepare ");
-text!(PREPARED, b"prepared");
-text!(PREPARED_MSG, b"Sentinel sleep prepared token=");
-text!(ARM_PREFIX, b"sentinel arm ");
-text!(WAIT_CMD, b"sentinel wait");
-text!(CANCEL_CMD, b"sentinel cancel");
-text!(
-    WAKE_HELP,
-    b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot\n"
-);
-text!(WAKE_ARMED, b"Sentinel wake armed token=");
-text!(WAKE_FIRED, b"Sentinel WAKE_EVENT token=");
-text!(WAKE_ELAPSED, b" elapsed_ticks=");
-text!(WAKE_CANCELLED, b"Sentinel wake cancelled\n");
-text!(WAKE_RANGE, b"wake delay must be 1..60000 ms\n");
-text!(WAKE_BUSY, b"wake busy; collect or cancel prior alarm\n");
-text!(WAKE_NONE, b"no pending wake\n");
-text!(WAKE_LATE, b"wake already fired; use sentinel wait\n");
-text!(WAKE_TIMEOUT, b"wake timeout; LP slot retained\n");
-text!(EVENT_ARMED, b" wake_armed");
-text!(EVENT_FIRED, b" wake_fired");
-text!(EVENT_CANCELLED, b" wake_cancelled");
-text!(LOG_CMD, b"sentinel log");
-text!(MARK_CMD, b"sentinel mark");
-text!(LOG_HEADER, b"Sentinel log epoch=");
-text!(LOG_HZ, b" hz=");
-text!(LOG_OLDEST, b"oldest=");
-text!(LOG_NEWEST, b" newest=");
-text!(LOG_OVERWRITTEN, b" overwritten=");
-text!(LOG_CAPACITY, b" capacity=");
-text!(LOG_NOTICES, b" diagnostic_notices=");
-text!(LOG_GONE, b"record overwritten during read; retry log\n");
-text!(LOG_TIME, b" lp_ticks=");
-text!(LOG_ARG0, b" a0=");
-text!(LOG_ARG1, b" a1=");
-text!(EVENT_BOOT, b" boot");
-text!(EVENT_FIRST, b" first_heartbeat");
-text!(EVENT_TIMEOUT, b" timeout");
-text!(EVENT_RECOVERED, b" recovered");
-text!(EVENT_HP, b" hp_diagnostic");
-text!(EVENT_UNKNOWN, b" unknown");
-text!(STATUS_CMD, b"sentinel status");
-text!(STATUS_PREFIX, b"Sentinel state=");
-text!(UNARMED, b"unarmed");
-text!(HEALTHY, b"healthy");
-text!(MISSED, b"missed");
-text!(AGE_MS, b" age_ms=");
-text!(LP_HZ, b" lp_hz=");
-text!(BEATS, b" beats=");
-text!(MISSES, b" missed=");
-text!(HELLO_CMD, b"sentinel hello");
-text!(ACK_MSG, b"Sentinel ACK seq ");
-text!(SENTINEL, b"sentinel");
-text!(READY, b"Sentinel READY v");
-text!(OFFLINE, b"Sentinel heartbeat timeout, epoch ");
-text!(PENDING, b"Sentinel pending, epoch ");
-text!(EPOCH, b", epoch ");
-text!(RUN_PIC, b"run pic");
-text!(RUN_HELLO, b"run hello");
-text!(MEMTEST_CMD, b"memtest");
-text!(MEM_OK, b"arena: aligned allocations, bounds, release OK\n");
-text!(MEM_FAIL, b"arena: FAIL\n");
-text!(UPTIME_CMD, b"uptime");
-text!(CAT, b"cat ");
-text!(LOADAVG, b"/proc/loadavg");
-text!(INTERRUPTS, b"/proc/interrupts");
-text!(USB_IRQ, b"usb_serial_jtag_rx ");
-text!(TIMER_IRQ, b"systimer0 ");
-text!(UPTIME, b"/proc/uptime");
-text!(NOT_FOUND, b"procfs: no such file\n");
-text!(BAD_REQUEST, b"procfs: bad request\n");
-text!(FAILED, b"service unavailable\n");
-text!(LINE_LONG, b"line too long\n");
-text!(UNKNOWN, b"unknown command (try help)\n");
-text!(ERASE, b"\x08 \x08");
-text!(NEWLINE, b"\n");
+//! Standalone U-mode userspace support library (`vela-user`).
+//! Provides thin syscall wrappers, bounded IPC message buffers, formatting
+//! helpers without `core::fmt` bloat, and an explicit bump arena.
 
-#[inline(always)]
-fn call6(number: u32, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) -> (u32, u32) {
-    let (result, second);
-    // SAFETY: syscall boundary; all integer state preserved except a0/a1 results.
-    unsafe {
-        core::arch::asm!("ecall",in("a7")number,inlateout("a0")a0=>result,
-        inlateout("a1")a1=>second,in("a2")a2,in("a3")a3,in("a4")a4,in("a5")a5);
-    }
-    (result, second)
-}
-#[inline(always)]
-fn call(number: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
-    call6(number, a0, a1, a2, a3, 0, 0).0
-}
-#[inline(always)]
-fn sleep() {
-    call(abi::SLEEP, 1, 0, 0, 0);
-}
-#[inline(always)]
-fn exit() -> ! {
-    call(abi::EXIT, 0, 0, 0, 0);
-    loop {
-        core::hint::spin_loop();
-    }
-}
-#[unsafe(link_section = ".user.text")]
-#[inline(never)]
-fn write(pointer: *const u8, length: usize) {
-    call(abi::WRITE, pointer as u32, length as u32, 0, 0);
-}
-struct Buffer {
-    bytes: MaybeUninit<[u8; abi::IPC_BYTES]>,
+pub mod arena;
+pub mod sys;
+
+use vela_abi::syscall as abi;
+
+pub struct Buffer {
+    bytes: [u8; abi::IPC_BYTES],
     len: usize,
-    reply: u32,
+    pub reply: u32,
 }
+
+impl Default for Buffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Buffer {
-    #[inline(always)]
-    fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            bytes: MaybeUninit::uninit(),
+            bytes: [0; abi::IPC_BYTES],
             len: 0,
             reply: 0,
         }
     }
-    #[inline(always)]
-    fn ptr(&self) -> *const u8 {
-        self.bytes.as_ptr().cast::<u8>()
+
+    pub fn len(&self) -> usize {
+        self.len
     }
-    #[inline(always)]
-    fn mut_ptr(&mut self) -> *mut u8 {
-        self.bytes.as_mut_ptr().cast::<u8>()
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
-    #[unsafe(link_section = ".user.text")]
-    #[inline(never)]
-    fn push(&mut self, byte: u8) {
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len.min(abi::IPC_BYTES);
+    }
+
+    pub fn pop(&mut self) -> bool {
+        if self.len == 0 {
+            false
+        } else {
+            self.len -= 1;
+            true
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    pub fn ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    pub fn mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    pub fn get(&self, index: usize) -> u8 {
+        if index < self.len {
+            self.bytes[index]
+        } else {
+            0
+        }
+    }
+
+    pub fn push(&mut self, byte: u8) {
         if self.len < abi::IPC_BYTES {
-            // SAFETY: bounded destination, len tracks initialized bytes only.
-            unsafe {
-                self.mut_ptr().add(self.len).write_volatile(byte);
-            }
+            self.bytes[self.len] = byte;
             self.len += 1;
         }
     }
-    #[inline(always)]
-    fn get(&self, index: usize) -> u8 {
-        if index >= self.len {
-            return 0;
-        }
-        // SAFETY: index below initialized length.
-        unsafe { self.ptr().add(index).read_volatile() }
-    }
-    #[unsafe(link_section = ".user.text")]
-    #[inline(never)]
-    fn append(&mut self, pointer: *const u8, length: usize) {
-        for i in 0..length {
-            // SAFETY: callers provide static RX bytes or initialized Buffer data.
-            self.push(unsafe { pointer.add(i).read_volatile() });
+
+    pub fn append(&mut self, slice: &[u8]) {
+        for &byte in slice {
+            self.push(byte);
         }
     }
-    #[inline(always)]
-    fn starts(&self, pointer: *const u8, length: usize) -> bool {
-        if self.len < length {
-            return false;
-        }
-        for i in 0..length {
-            // SAFETY: caller passes static user RX bytes of the specified length.
-            if self.get(i) != unsafe { pointer.add(i).read_volatile() } {
-                return false;
-            }
-        }
-        true
+
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        self.as_slice().starts_with(prefix)
     }
-    #[inline(always)]
-    fn delay_ms(&self, offset: usize) -> Option<u32> {
+
+    pub fn eq_at(&self, offset: usize, expected: &[u8]) -> bool {
+        self.len >= offset && &self.bytes[offset..self.len] == expected
+    }
+
+    pub fn delay_ms(&self, offset: usize) -> Option<u32> {
         if offset >= self.len {
             return None;
         }
         let mut value = 0u32;
-        for i in offset..self.len {
-            let byte = self.get(i);
+        for &byte in &self.bytes[offset..self.len] {
             if !byte.is_ascii_digit() {
                 return None;
             }
@@ -222,68 +111,44 @@ impl Buffer {
         }
         (value != 0).then_some(value)
     }
-    #[unsafe(link_section = ".user.text")]
-    #[inline(never)]
-    fn matches(&self, offset: usize, pointer: *const u8, length: usize) -> bool {
-        if self.len != offset + length {
-            return false;
-        }
-        for i in 0..length {
-            // SAFETY: static bytes length supplied by caller, no kernel memory.
-            if self.get(offset + i) != unsafe { pointer.add(i).read_volatile() } {
-                return false;
-            }
-        }
-        true
-    }
-    #[unsafe(link_section = ".user.text")]
-    #[inline(never)]
-    fn word(&self, offset: usize) -> u32 {
+
+    pub fn word(&self, offset: usize) -> u32 {
         u32::from(self.get(offset))
             | (u32::from(self.get(offset + 1)) << 8)
             | (u32::from(self.get(offset + 2)) << 16)
             | (u32::from(self.get(offset + 3)) << 24)
     }
-    #[unsafe(link_section = ".user.text")]
-    #[inline(never)]
-    fn decimal(&mut self, mut number: u32) {
-        let mut digits = MaybeUninit::<[u8; 10]>::uninit();
-        let ptr = digits.as_mut_ptr().cast::<u8>();
+
+    pub fn decimal(&mut self, mut number: u32) {
+        let mut digits = [0u8; 10];
         let mut count = 0;
         loop {
-            // SAFETY: u32 decimal representation has at most 10 digits.
-            unsafe {
-                ptr.add(count).write_volatile(b'0' + (number % 10) as u8);
-            }
+            digits[count] = b'0' + (number % 10) as u8;
             count += 1;
             number /= 10;
             if number == 0 {
                 break;
             }
         }
-        for i in 0..count {
-            self.push(unsafe { ptr.add(count - 1 - i).read_volatile() });
+        while count > 0 {
+            count -= 1;
+            self.push(digits[count]);
         }
     }
-    #[inline(always)]
-    fn hundredths(&mut self, number: u32) {
+
+    pub fn hundredths(&mut self, number: u32) {
         self.decimal(number / 100);
         self.push(b'.');
         self.push(b'0' + ((number / 10) % 10) as u8);
         self.push(b'0' + (number % 10) as u8);
     }
-    #[inline(never)]
-    #[unsafe(link_section = ".user.text")]
-    fn decimal64(&mut self, mut low: u32, mut high: u32) {
-        let mut digits = MaybeUninit::<[u8; 20]>::uninit();
-        let ptr = digits.as_mut_ptr().cast::<u8>();
+
+    pub fn decimal64(&mut self, mut low: u32, mut high: u32) {
+        let mut digits = [0u8; 20];
         let mut count = 0;
         loop {
             let (next_low, next_high, remainder) = div64(low, high, 10);
-            // SAFETY: a 64-bit integer has at most 20 decimal digits.
-            unsafe {
-                ptr.add(count).write_volatile(b'0' + remainder as u8);
-            }
+            digits[count] = b'0' + remainder as u8;
             count += 1;
             low = next_low;
             high = next_high;
@@ -291,13 +156,14 @@ impl Buffer {
                 break;
             }
         }
-        for i in 0..count {
-            self.push(unsafe { ptr.add(count - 1 - i).read_volatile() });
+        while count > 0 {
+            count -= 1;
+            self.push(digits[count]);
         }
     }
-    #[inline(always)]
-    fn receive(&mut self, handle: u32) -> bool {
-        let (result, reply) = call6(
+
+    pub fn receive(&mut self, handle: u32) -> bool {
+        let (result, reply) = sys::call6(
             abi::RECV,
             handle,
             self.mut_ptr() as u32,
@@ -313,24 +179,22 @@ impl Buffer {
         self.len = result as usize;
         true
     }
-    #[inline(always)]
-    fn send(&self, handle: u32) -> bool {
+
+    pub fn send(&self, handle: u32) -> bool {
         loop {
-            let result = call(abi::SEND, handle, self.ptr() as u32, self.len as u32, 0);
+            let result = sys::call(abi::SEND, handle, self.ptr() as u32, self.len as u32, 0);
             if result == 0 {
                 return true;
             }
             if result != abi::EAGAIN {
                 return false;
             }
-            sleep(); // explicit service backpressure, no CPU spin on full queue
+            sys::sleep(); // explicit service backpressure, no CPU spin on full queue
         }
     }
 }
-// Software word-pair division avoids importing kernel compiler-runtime routines
-// into the PMP-isolated image. Used only for formatting a 64-bit uptime.
-#[inline(always)]
-fn div64(low: u32, high: u32, divisor: u32) -> (u32, u32, u32) {
+
+pub fn div64(low: u32, high: u32, divisor: u32) -> (u32, u32, u32) {
     let (mut qlow, mut qhigh, mut remainder) = (0, 0, 0);
     for index in (0..64).rev() {
         let bit = if index >= 32 {
@@ -349,547 +213,4 @@ fn div64(low: u32, high: u32, divisor: u32) -> (u32, u32, u32) {
         }
     }
     (qlow, qhigh, remainder)
-}
-
-/// Tiny virtual-file interface: Read request carries a path; response byte0 is
-/// status (0 success, 1 ENOENT, 2 invalid request), followed by file contents.
-/// Policy, node selection and formatting are exclusively in this user task.
-#[inline(always)]
-fn read_node(request: &Buffer, response: &mut Buffer) {
-    response.len = 0;
-    if request.get(0) != 1 {
-        response.push(2);
-        response.append(BAD_REQUEST.as_ptr(), BAD_REQUEST.len());
-        return;
-    }
-    let load = request.matches(1, LOADAVG.as_ptr(), LOADAVG.len());
-    let uptime = request.matches(1, UPTIME.as_ptr(), UPTIME.len());
-    let interrupts = request.matches(1, INTERRUPTS.as_ptr(), INTERRUPTS.len());
-    if !load && !uptime && !interrupts {
-        response.push(1);
-        response.append(NOT_FOUND.as_ptr(), NOT_FOUND.len());
-        return;
-    }
-    let mut snapshot = Buffer::new();
-    let size = if interrupts {
-        abi::STATS_IRQ_BYTES
-    } else {
-        abi::STATS_BYTES
-    };
-    if call(abi::STATS, snapshot.mut_ptr() as u32, size as u32, 0, 0) != 0 {
-        response.push(2);
-        response.append(FAILED.as_ptr(), FAILED.len());
-        return;
-    }
-    snapshot.len = size;
-    response.push(0);
-    if load {
-        for offset in [32, 36, 40] {
-            let hundredths = (snapshot.word(offset) * 100 + 32768) >> 16;
-            response.hundredths(hundredths);
-            response.push(b' ');
-        }
-        response.decimal(snapshot.word(4));
-        response.push(b'/');
-        response.decimal(snapshot.word(0));
-        response.push(b' ');
-        response.decimal(snapshot.word(12));
-        response.push(b'\n');
-    } else if interrupts {
-        response.append(TIMER_IRQ.as_ptr(), TIMER_IRQ.len());
-        response.decimal64(snapshot.word(16), snapshot.word(20));
-        response.push(b'\n');
-        response.append(USB_IRQ.as_ptr(), USB_IRQ.len());
-        response.decimal64(snapshot.word(44), snapshot.word(48));
-        response.push(b'\n');
-    } else {
-        let (low, high, remainder) = div64(snapshot.word(24), snapshot.word(28), 100);
-        response.decimal64(low, high);
-        response.push(b'.');
-        response.push(b'0' + (remainder / 10) as u8);
-        response.push(b'0' + (remainder % 10) as u8);
-        response.push(b'\n');
-    }
-}
-#[unsafe(link_section = ".user.text")]
-#[unsafe(no_mangle)]
-pub extern "C" fn procfs_main(request_handle: u32, reply_handle: u32) -> ! {
-    loop {
-        let mut request = Buffer::new();
-        if !request.receive(request_handle) {
-            exit();
-        }
-        let mut response = Buffer::new();
-        read_node(&request, &mut response);
-        if request.reply != 0 {
-            // A timed-out client invalidates its one-shot reply token. Keep serving.
-            let _ = call(
-                abi::IPC_REPLY,
-                request.reply,
-                response.ptr() as u32,
-                response.len as u32,
-                0,
-            );
-        } else if !response.send(reply_handle) {
-            exit();
-        }
-    }
-}
-#[inline(always)]
-fn read_file(path: *const u8, length: usize, request_handle: u32, _reply_handle: u32) {
-    let mut request = Buffer::new();
-    request.push(1);
-    request.append(path, length);
-    let mut response = Buffer::new();
-    let result = call6(
-        abi::IPC_CALL,
-        request_handle,
-        request.ptr() as u32,
-        request.len as u32,
-        response.mut_ptr() as u32,
-        abi::IPC_BYTES as u32,
-        100,
-    )
-    .0;
-    if result == 0 || result > abi::IPC_BYTES as u32 {
-        write(FAILED.as_ptr(), FAILED.len());
-        return;
-    }
-    response.len = result as usize;
-    // Error replies carry userspace diagnostics, never fabricated file data.
-    unsafe {
-        write(response.ptr().add(1), response.len - 1);
-    }
-}
-#[inline(always)]
-fn arena_probe() -> bool {
-    let Ok(mut arena) = arena::Arena::new(4096) else {
-        return false;
-    };
-    let layout = core::alloc::Layout::from_size_align(31, 64).unwrap();
-    let first = arena.allocate(layout);
-    let second = arena.allocate(layout);
-    let mut ok = false;
-    if let (Some(a), Some(b)) = (first, second) {
-        // SAFETY: distinct live allocations, both at least 31 writable bytes.
-        unsafe {
-            a.as_ptr().write_volatile(0x5a);
-            b.as_ptr().write_volatile(0xa5);
-            ok = a.as_ptr().read_volatile() == 0x5a && b.as_ptr().read_volatile() == 0xa5;
-        }
-        ok &= a.as_ptr() as usize % 64 == 0 && b.as_ptr() as usize % 64 == 0;
-    }
-    ok &= arena
-        .allocate(core::alloc::Layout::from_size_align(4096, 1).unwrap())
-        .is_none();
-    let released = arena.release().is_ok();
-    ok && released && arena.allocate(layout).is_none()
-}
-#[inline(always)]
-fn sentinel_data(sequence: u32, data: &mut Buffer) -> (u32, u32) {
-    let mut result = (0, 0);
-    for _ in 0..8 {
-        result = call6(
-            abi::SENTINEL_LOG,
-            sequence,
-            data.mut_ptr() as u32,
-            24,
-            0,
-            0,
-            0,
-        );
-        if result.0 != (-16i32) as u32 {
-            break;
-        }
-        sleep(); // bounded retry if automatic heartbeat currently owns the request slot
-    }
-    if result.0 == 24 {
-        data.len = 24;
-    }
-    result
-}
-#[inline(always)]
-fn sentinel_log() {
-    let mut data = Buffer::new();
-    let (result, notices) = sentinel_data(0, &mut data);
-    if result != 24 {
-        write(FAILED.as_ptr(), FAILED.len());
-        return;
-    }
-    let oldest = data.word(4);
-    let newest = data.word(8);
-    let mut out = Buffer::new();
-    out.append(LOG_HEADER.as_ptr(), LOG_HEADER.len());
-    out.decimal(data.word(0));
-    out.append(LOG_HZ.as_ptr(), LOG_HZ.len());
-    out.decimal(data.word(20));
-    out.push(b'\n');
-    write(out.ptr(), out.len);
-    out.len = 0;
-    out.append(LOG_OLDEST.as_ptr(), LOG_OLDEST.len());
-    out.decimal(oldest);
-    out.append(LOG_NEWEST.as_ptr(), LOG_NEWEST.len());
-    out.decimal(newest);
-    out.append(LOG_OVERWRITTEN.as_ptr(), LOG_OVERWRITTEN.len());
-    out.decimal(data.word(12));
-    out.append(LOG_CAPACITY.as_ptr(), LOG_CAPACITY.len());
-    out.decimal(data.word(16));
-    out.push(b'\n');
-    write(out.ptr(), out.len);
-    out.len = 0;
-    out.append(LOG_NOTICES.as_ptr(), LOG_NOTICES.len());
-    out.decimal(notices);
-    out.push(b'\n');
-    write(out.ptr(), out.len);
-    // Bounded snapshot tail; new arrivals never make this an infinite dump.
-    for offset in 0..16u32 {
-        let sequence = oldest.wrapping_add(offset);
-        if oldest == 0 || sequence == 0 || sequence > newest {
-            break;
-        }
-        let result = sentinel_data(sequence, &mut data).0;
-        if result != 24 {
-            if result == (-75i32) as u32 {
-                write(LOG_GONE.as_ptr(), LOG_GONE.len());
-            } else {
-                write(FAILED.as_ptr(), FAILED.len());
-            }
-            break;
-        }
-        out.len = 0;
-        out.push(b'#');
-        out.decimal(data.word(0));
-        out.append(LOG_TIME.as_ptr(), LOG_TIME.len());
-        out.decimal64(data.word(8), data.word(12));
-        let (name, length) = match data.word(4) {
-            1 => (EVENT_BOOT.as_ptr(), EVENT_BOOT.len()),
-            2 => (EVENT_FIRST.as_ptr(), EVENT_FIRST.len()),
-            3 => (EVENT_TIMEOUT.as_ptr(), EVENT_TIMEOUT.len()),
-            4 => (EVENT_RECOVERED.as_ptr(), EVENT_RECOVERED.len()),
-            5 => (EVENT_HP.as_ptr(), EVENT_HP.len()),
-            6 => (EVENT_ARMED.as_ptr(), EVENT_ARMED.len()),
-            7 => (EVENT_FIRED.as_ptr(), EVENT_FIRED.len()),
-            8 => (EVENT_CANCELLED.as_ptr(), EVENT_CANCELLED.len()),
-            _ => (EVENT_UNKNOWN.as_ptr(), EVENT_UNKNOWN.len()),
-        };
-        out.append(name, length);
-        out.append(LOG_ARG0.as_ptr(), LOG_ARG0.len());
-        out.decimal(data.word(16));
-        out.append(LOG_ARG1.as_ptr(), LOG_ARG1.len());
-        out.decimal(data.word(20));
-        out.push(b'\n');
-        write(out.ptr(), out.len);
-    }
-}
-#[unsafe(link_section = ".user.text")]
-#[inline(never)]
-fn wake_command(line: &Buffer) -> bool {
-    let wait = line.matches(0, WAIT_CMD.as_ptr(), WAIT_CMD.len());
-    let cancel = line.matches(0, CANCEL_CMD.as_ptr(), CANCEL_CMD.len());
-    let prepare = line.starts(PREPARE_PREFIX.as_ptr(), PREPARE_PREFIX.len());
-    let arm = prepare || line.starts(ARM_PREFIX.as_ptr(), ARM_PREFIX.len());
-    let wake = line.starts(WAKE_PREFIX.as_ptr(), WAKE_PREFIX.len());
-    if !wait && !cancel && !arm && !wake {
-        return false;
-    }
-    let number = if cancel {
-        abi::SENTINEL_CANCEL_WAKE
-    } else if wait {
-        abi::SENTINEL_WAIT_WAKE
-    } else if prepare {
-        abi::SENTINEL_PREPARE_SLEEP
-    } else {
-        abi::SENTINEL_ARM_WAKE
-    };
-    let argument = if arm || wake {
-        let Some(ms) = line.delay_ms(if prepare {
-            PREPARE_PREFIX.len()
-        } else if arm {
-            ARM_PREFIX.len()
-        } else {
-            WAKE_PREFIX.len()
-        }) else {
-            write(WAKE_RANGE.as_ptr(), WAKE_RANGE.len());
-            return true;
-        };
-        ms
-    } else {
-        0
-    };
-    let mut result = (0, 0);
-    for _ in 0..8 {
-        result = call6(number, argument, 0, 0, 0, 0, 0);
-        if result.0 != (-16i32) as u32 {
-            break;
-        }
-        sleep();
-    }
-    if wake && (result.0 as i32) > 0 {
-        result = call6(abi::SENTINEL_WAIT_WAKE, result.0, 0, 0, 0, 0, 0);
-    }
-    if (result.0 as i32) <= 0 {
-        let (text, length) = match result.0 {
-            r if r == (-16i32) as u32 => (WAKE_BUSY.as_ptr(), WAKE_BUSY.len()),
-            r if r == (-2i32) as u32 => (WAKE_NONE.as_ptr(), WAKE_NONE.len()),
-            r if r == (-114i32) as u32 => (WAKE_LATE.as_ptr(), WAKE_LATE.len()),
-            r if r == (-110i32) as u32 => (WAKE_TIMEOUT.as_ptr(), WAKE_TIMEOUT.len()),
-            _ => (FAILED.as_ptr(), FAILED.len()),
-        };
-        write(text, length);
-    } else if cancel {
-        write(WAKE_CANCELLED.as_ptr(), WAKE_CANCELLED.len());
-    } else {
-        let mut out = Buffer::new();
-        if prepare {
-            out.append(PREPARED_MSG.as_ptr(), PREPARED_MSG.len());
-        } else if arm {
-            out.append(WAKE_ARMED.as_ptr(), WAKE_ARMED.len());
-        } else {
-            out.append(WAKE_FIRED.as_ptr(), WAKE_FIRED.len());
-        }
-        out.decimal(result.0);
-        if !arm {
-            out.append(WAKE_ELAPSED.as_ptr(), WAKE_ELAPSED.len());
-            out.decimal(result.1);
-        }
-        out.push(b'\n');
-        write(out.ptr(), out.len);
-    }
-    true
-}
-#[inline(always)]
-fn command(line: &Buffer, request_handle: u32, reply_handle: u32) {
-    if line.len == 0 {
-        return;
-    }
-    if wake_command(line) {
-        return;
-    }
-    if line.matches(0, HELP_CMD.as_ptr(), HELP_CMD.len()) {
-        write(HELP.as_ptr(), HELP.len());
-        write(WAKE_HELP.as_ptr(), WAKE_HELP.len());
-    } else if line.matches(0, DISPLAY.as_ptr(), DISPLAY.len())
-        || line.matches(0, ORBIT.as_ptr(), ORBIT.len())
-        || line.matches(0, PIXEL.as_ptr(), PIXEL.len())
-        || line.matches(0, DIAG.as_ptr(), DIAG.len())
-        || line.matches(0, BOOT_DISPLAY.as_ptr(), BOOT_DISPLAY.len())
-    {
-        let orbit = line.matches(0, ORBIT.as_ptr(), ORBIT.len());
-        let boot = line.matches(0, BOOT_DISPLAY.as_ptr(), BOOT_DISPLAY.len());
-        let diag = line.matches(0, DIAG.as_ptr(), DIAG.len());
-        let pixel = line.matches(0, PIXEL.as_ptr(), PIXEL.len());
-        let mut rc = call(
-            abi::DISPLAY_TEST,
-            1 + u32::from(orbit) + 2 * u32::from(pixel) + 3 * u32::from(diag) + 4 * u32::from(boot),
-            0,
-            0,
-            0,
-        );
-        while (rc as i32) > 0 {
-            call(abi::SLEEP, rc, 0, 0, 0);
-            rc = call(abi::DISPLAY_TEST, 0, 0, 0, 0);
-        }
-        if rc == 0 {
-            if boot {
-                write(BOOT_OK.as_ptr(), BOOT_OK.len());
-            } else if diag {
-                write(DIAG_OK.as_ptr(), DIAG_OK.len());
-            } else if pixel {
-                write(PIXEL_OK.as_ptr(), PIXEL_OK.len());
-            } else if orbit {
-                write(ORBIT_OK.as_ptr(), ORBIT_OK.len());
-            } else {
-                write(BARS.as_ptr(), BARS.len());
-            }
-        } else {
-            let mut out = Buffer::new();
-            out.append(DISPLAY_ERROR.as_ptr(), DISPLAY_ERROR.len());
-            out.decimal(0u32.wrapping_sub(rc));
-            out.push(b'\n');
-            write(out.ptr(), out.len);
-        }
-    } else if line.matches(0, RUN_HELLO.as_ptr(), RUN_HELLO.len())
-        || line.matches(0, RUN_PIC.as_ptr(), RUN_PIC.len())
-        || line.matches(0, RUN_DMA.as_ptr(), RUN_DMA.len())
-    {
-        let selector = if line.matches(0, RUN_DMA.as_ptr(), RUN_DMA.len()) {
-            2
-        } else {
-            u32::from(line.len == RUN_PIC.len())
-        };
-        if (call(abi::SPAWN_HELLO, selector, 0, 0, 0) as i32) < 0 {
-            write(FAILED.as_ptr(), FAILED.len());
-        }
-    } else if line.matches(0, LOG_CMD.as_ptr(), LOG_CMD.len()) {
-        sentinel_log();
-    } else if line.matches(0, MARK_CMD.as_ptr(), MARK_CMD.len()) {
-        let ticks = call(abi::TICKS, 0, 0, 0, 0);
-        let seq = call(abi::SENTINEL_DIAG, 0x4d41524b, ticks, 0, 0);
-        if (seq as i32) > 0 {
-            let mut out = Buffer::new();
-            out.append(ACK_MSG.as_ptr(), ACK_MSG.len());
-            out.decimal(seq);
-            out.push(b'\n');
-            write(out.ptr(), out.len);
-        } else {
-            write(FAILED.as_ptr(), FAILED.len());
-        }
-    } else if line.matches(0, PAUSE_CMD.as_ptr(), PAUSE_CMD.len())
-        || line.matches(0, RESUME_CMD.as_ptr(), RESUME_CMD.len())
-    {
-        let resume = line.matches(0, RESUME_CMD.as_ptr(), RESUME_CMD.len());
-        if call(abi::SENTINEL_CONTROL, u32::from(resume), 0, 0, 0) == 0 {
-            if resume {
-                write(RESUMED.as_ptr(), RESUMED.len());
-            } else {
-                write(PAUSED.as_ptr(), PAUSED.len());
-            }
-        } else {
-            write(FAILED.as_ptr(), FAILED.len());
-        }
-    } else if line.matches(0, STATUS_CMD.as_ptr(), STATUS_CMD.len()) {
-        let mut data = Buffer::new();
-        let (result, notices) = call6(abi::SENTINEL_QUERY, data.mut_ptr() as u32, 24, 0, 0, 0, 0);
-        if result == 24 {
-            data.len = 24;
-            let mut out = Buffer::new();
-            out.append(STATUS_PREFIX.as_ptr(), STATUS_PREFIX.len());
-            match data.word(0) {
-                0 => out.append(UNARMED.as_ptr(), UNARMED.len()),
-                1 => out.append(HEALTHY.as_ptr(), HEALTHY.len()),
-                3 => out.append(PREPARED.as_ptr(), PREPARED.len()),
-                _ => out.append(MISSED.as_ptr(), MISSED.len()),
-            }
-            out.append(AGE_MS.as_ptr(), AGE_MS.len());
-            out.decimal64(data.word(4), data.word(8));
-            out.append(LP_HZ.as_ptr(), LP_HZ.len());
-            out.decimal(data.word(12));
-            out.append(BEATS.as_ptr(), BEATS.len());
-            out.decimal(data.word(16));
-            out.append(MISSES.as_ptr(), MISSES.len());
-            out.decimal(data.word(20));
-            out.append(NOTICES.as_ptr(), NOTICES.len());
-            out.decimal(notices);
-            out.push(b'\n');
-            write(out.ptr(), out.len);
-        } else {
-            write(FAILED.as_ptr(), FAILED.len());
-        }
-    } else if line.matches(0, HELLO_CMD.as_ptr(), HELLO_CMD.len()) {
-        let seq = call(abi::SENTINEL_HELLO, 0, 0, 0, 0);
-        if (seq as i32) > 0 {
-            let mut out = Buffer::new();
-            out.append(ACK_MSG.as_ptr(), ACK_MSG.len());
-            out.decimal(seq);
-            out.push(b'\n');
-            write(out.ptr(), out.len);
-        } else {
-            write(FAILED.as_ptr(), FAILED.len());
-        }
-    } else if line.matches(0, SENTINEL.as_ptr(), SENTINEL.len()) {
-        let (version, epoch) = call6(abi::SENTINEL_STATUS, 0, 0, 0, 0, 0, 0);
-        let mut out = Buffer::new();
-        if version == (-110i32) as u32 {
-            out.append(OFFLINE.as_ptr(), OFFLINE.len());
-        } else if version != 0 {
-            out.append(READY.as_ptr(), READY.len());
-            out.decimal(version);
-            out.append(EPOCH.as_ptr(), EPOCH.len());
-        } else {
-            out.append(PENDING.as_ptr(), PENDING.len());
-        }
-        out.decimal(epoch);
-        out.push(b'\n');
-        write(out.ptr(), out.len);
-    } else if line.matches(0, MEMTEST_CMD.as_ptr(), MEMTEST_CMD.len()) {
-        if arena_probe() {
-            write(MEM_OK.as_ptr(), MEM_OK.len());
-        } else {
-            write(MEM_FAIL.as_ptr(), MEM_FAIL.len());
-        }
-    } else if line.matches(0, UPTIME_CMD.as_ptr(), UPTIME_CMD.len()) {
-        read_file(UPTIME.as_ptr(), UPTIME.len(), request_handle, reply_handle);
-    } else if line.len > CAT.len()
-        && line.get(0) == b'c'
-        && line.get(1) == b'a'
-        && line.get(2) == b't'
-        && line.get(3) == b' '
-    {
-        unsafe {
-            read_file(
-                line.ptr().add(4),
-                line.len - 4,
-                request_handle,
-                reply_handle,
-            );
-        }
-    } else {
-        write(UNKNOWN.as_ptr(), UNKNOWN.len());
-    }
-}
-#[unsafe(link_section = ".user.text")]
-#[unsafe(no_mangle)]
-pub extern "C" fn shell_main(reply_handle: u32, request_handle: u32, input_handle: u32) -> ! {
-    let mut line = Buffer::new();
-    let mut skip_lf = false;
-    let mut overflow = false;
-    write(PROMPT.as_ptr(), PROMPT.len());
-    loop {
-        let mut input = Buffer::new();
-        if !input.receive(input_handle) {
-            exit();
-        }
-        for i in 0..input.len {
-            let byte = input.get(i);
-            if byte == b'\n' && skip_lf {
-                skip_lf = false;
-                continue;
-            }
-            skip_lf = byte == b'\r';
-            if byte == b'\r' || byte == b'\n' {
-                write(NEWLINE.as_ptr(), NEWLINE.len());
-                if overflow {
-                    write(LINE_LONG.as_ptr(), LINE_LONG.len());
-                } else {
-                    command(&line, request_handle, reply_handle);
-                }
-                line.len = 0;
-                overflow = false;
-                write(PROMPT.as_ptr(), PROMPT.len());
-            } else if byte == 8 || byte == 127 {
-                if line.len != 0 {
-                    line.len -= 1;
-                    write(ERASE.as_ptr(), ERASE.len());
-                }
-            } else if (32..127).contains(&byte) {
-                if line.len < 80 {
-                    line.push(byte);
-                    // SAFETY: byte is a valid stack-local value for synchronous write.
-                    write(core::ptr::addr_of!(byte), 1);
-                } else {
-                    overflow = true;
-                }
-            }
-        }
-    }
-}
-#[unsafe(link_section = ".user.text")]
-#[unsafe(no_mangle)]
-pub extern "C" fn console_main(input_handle: u32, rx_event: u32) -> ! {
-    loop {
-        let mut input = Buffer::new();
-        let length = call(abi::CONSOLE_READ, input.mut_ptr() as u32, 32, 0, 0);
-        if length > 32 {
-            exit();
-        }
-        if length != 0 {
-            input.len = length as usize;
-            if !input.send(input_handle) {
-                exit();
-            }
-        }
-        if length == 0 && call(abi::EVENT_WAIT, rx_event, 0, 0, 0) != 0 {
-            exit();
-        }
-    }
 }

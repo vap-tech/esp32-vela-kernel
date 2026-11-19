@@ -21,6 +21,7 @@ fn main() {
         .expect("Python3 and Pillow required for display assets");
     assert!(status.success(), "convert display PNG assets");
     build_sentinel(&dir, &out);
+    build_user_services(&dir, &out);
     let linker = user_linker();
     for (name, pie) in [("hello", false), ("pic", true), ("dma", true)] {
         let source = format!("../user/apps/{name}/main.S");
@@ -100,6 +101,61 @@ fn build_sentinel(dir: &std::path::Path, out: &std::path::Path) {
         out.join("sentinel.bin"),
     )
     .expect("copy sentinel.bin");
+}
+
+fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
+    for path in [
+        "../user/Cargo.toml",
+        "../user/link.x",
+        "../user/src/lib.rs",
+        "../user/src/sys.rs",
+        "../user/src/arena.rs",
+        "../user/src/bin/procfs.rs",
+        "../user/src/bin/shell.rs",
+        "../user/src/bin/console.rs",
+        "../abi/Cargo.toml",
+        "../abi/src/lib.rs",
+        "../abi/src/syscall.rs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let manifest = dir.join("../user/Cargo.toml");
+    let script = dir.join("../user/link.x");
+    let user_target = out.join("user-target");
+    let flags = format!(
+        "-Crelocation-model=pie\x1f-Cstrip=symbols\x1f-Clink-arg=-pie\x1f-Clink-arg=-zmax-page-size=64\x1f-Clink-arg=-T{}",
+        script.display()
+    );
+    let status = std::process::Command::new(std::env::var_os("CARGO").unwrap())
+        .env_remove("RUSTFLAGS")
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .args([
+            "--bins",
+            "--release",
+            "--locked",
+            "--target",
+            "riscv32imac-unknown-none-elf",
+            "--target-dir",
+        ])
+        .arg(&user_target)
+        .status()
+        .expect("run cargo for vela-user services");
+    assert!(status.success(), "building vela-user ELF services failed");
+    for (bin, artifact) in [
+        ("vela-procfs", "procfs.elf"),
+        ("vela-shell", "shell.elf"),
+        ("vela-console", "console.elf"),
+    ] {
+        std::fs::copy(
+            user_target
+                .join("riscv32imac-unknown-none-elf/release")
+                .join(bin),
+            out.join(artifact),
+        )
+        .unwrap_or_else(|e| panic!("copy {artifact}: {e}"));
+    }
 }
 
 // Clang is required for the bundled user assembly; a separately installed LLD
