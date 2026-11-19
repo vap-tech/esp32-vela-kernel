@@ -146,3 +146,102 @@ impl Processes {
         Ok(index)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_space_enforces_wx_alignment_overlap_and_bounds() {
+        let mut space = AddressSpace::EMPTY;
+        let code = Region {
+            base: 0x4ff4_0000,
+            size: 8192,
+        };
+        assert_eq!(space.insert(code, READ | WRITE | EXECUTE), Err(22));
+        assert_eq!(space.insert(code, WRITE), Err(22));
+        assert_eq!(space.insert(code, 0), Err(22));
+        assert_eq!(
+            space.insert(
+                Region {
+                    base: 0x4ff4_1000,
+                    size: 8192,
+                },
+                READ | EXECUTE,
+            ),
+            Err(22)
+        );
+        assert_eq!(
+            space.insert(
+                Region {
+                    base: 0x4ff4_0000,
+                    size: 64,
+                },
+                READ,
+            ),
+            Err(22)
+        );
+
+        space.insert(code, READ | EXECUTE).unwrap();
+        assert_eq!(space.revision, 1);
+        assert!(space.permits(code.base, code.size, READ | EXECUTE));
+        assert!(!space.permits(code.base, code.size, WRITE));
+        assert!(!space.permits(code.base + code.size - 1, 2, READ));
+        assert!(!space.permits(usize::MAX, 1, READ));
+
+        // Overlapping mapping rejected.
+        assert_eq!(
+            space.insert(
+                Region {
+                    base: 0x4ff4_1000,
+                    size: 4096,
+                },
+                READ | WRITE,
+            ),
+            Err(22)
+        );
+
+        space.remove(code).unwrap();
+        assert_eq!(space.revision, 2);
+        assert!(!space.permits(code.base, 1, READ));
+    }
+
+    #[test]
+    fn address_space_and_process_table_enforce_limits_and_monotonic_ids() {
+        let mut space = AddressSpace::EMPTY;
+        for i in 0..REGIONS {
+            space
+                .insert(
+                    Region {
+                        base: 0x4ff4_0000 + i * 4096,
+                        size: 4096,
+                    },
+                    READ | WRITE,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            space.insert(
+                Region {
+                    base: 0x4ff4_0000 + REGIONS * 4096,
+                    size: 4096,
+                },
+                READ | WRITE,
+            ),
+            Err(28)
+        );
+
+        let mut procs = Processes::new();
+        for i in 0..PROCESSES {
+            let slot = procs.create(AddressSpace::EMPTY).unwrap();
+            assert_eq!(slot, i);
+            assert_eq!(procs.slots[slot].id, i as u32 + 1);
+        }
+        assert_eq!(procs.create(AddressSpace::EMPTY), Err(28));
+
+        procs.slots[0] = Process::EMPTY;
+        let reused = procs.create(AddressSpace::EMPTY).unwrap();
+        assert_eq!(reused, 0);
+        assert_eq!(procs.slots[reused].id, PROCESSES as u32 + 1);
+    }
+}

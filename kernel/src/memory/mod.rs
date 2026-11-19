@@ -125,3 +125,72 @@ impl RegionAllocator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocate_enforces_napot_alignment_and_owner_release() {
+        // Start slightly unaligned to verify page rounding up to 0x4ff6_0000.
+        let mut alloc = RegionAllocator::new(0x4ff5_f001, 0x4ff5_f001 + 32 * PAGE);
+        assert_eq!(alloc.allocate(0, PAGE), Err(22));
+        assert_eq!(alloc.allocate(1, 0), Err(22));
+
+        let r1 = alloc.allocate(1, 100).unwrap();
+        assert_eq!(r1.size, PAGE);
+        assert_eq!(r1.base % r1.size, 0);
+        assert!(alloc.owns(1, r1));
+        assert!(!alloc.owns(2, r1));
+
+        let r2 = alloc.allocate(2, 5000).unwrap();
+        assert_eq!(r2.size, 2 * PAGE);
+        assert_eq!(r2.base % r2.size, 0);
+        assert_eq!(alloc.free(1, r2), Err(1));
+
+        alloc.release_owner(1);
+        assert!(!alloc.owns(1, r1));
+        assert!(alloc.owns(2, r2));
+
+        // Freed page can be allocated again.
+        let r3 = alloc.allocate(3, PAGE).unwrap();
+        assert_eq!(r3, r1);
+    }
+
+    #[test]
+    fn reserve_detects_overlap_alignment_and_bounds() {
+        let base = 0x4ff8_0000;
+        let mut alloc = RegionAllocator::new(base, base + 8 * PAGE);
+        let r = alloc.reserve(1, base + 2 * PAGE, 5000).unwrap();
+        assert_eq!(
+            r,
+            Region {
+                base: base + 2 * PAGE,
+                size: 2 * PAGE,
+            }
+        );
+        // Overlapping reservation is rejected with EBUSY (16).
+        assert_eq!(alloc.reserve(2, base + 3 * PAGE, PAGE), Err(16));
+        // Misaligned for 8 KiB NAPOT region -> EINVAL (22).
+        assert_eq!(alloc.reserve(2, base + PAGE, 2 * PAGE), Err(22));
+        // Below pool or beyond pool -> ENOMEM (12).
+        assert_eq!(alloc.reserve(2, base - PAGE, PAGE), Err(12));
+        assert_eq!(alloc.reserve(2, base + 8 * PAGE, PAGE), Err(12));
+    }
+
+    #[test]
+    fn full_64_page_allocation_and_slot_limit() {
+        let base = 0x5000_0000;
+        let mut alloc = RegionAllocator::new(base, base + PAGES * PAGE);
+        let whole = alloc.allocate(1, PAGES * PAGE).unwrap();
+        assert_eq!(whole.base, base);
+        assert_eq!(whole.size, PAGES * PAGE);
+        assert_eq!(alloc.allocate(1, PAGE), Err(12));
+        alloc.free(1, whole).unwrap();
+
+        for _ in 0..ALLOCATIONS {
+            alloc.allocate(1, PAGE).unwrap();
+        }
+        assert_eq!(alloc.allocate(1, PAGE), Err(28));
+    }
+}

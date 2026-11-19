@@ -140,3 +140,84 @@ impl Ipc {
         closed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::Region;
+
+    fn make_message(bytes: &[u8], token: u32) -> Message {
+        let mut msg = Message::EMPTY;
+        msg.length = bytes.len();
+        msg.reply_token = token;
+        msg.data[..bytes.len()].copy_from_slice(bytes);
+        msg
+    }
+
+    #[test]
+    fn fifo_delivery_backpressure_and_non_destructive_emsgsize() {
+        let mut ipc = Ipc::new();
+        let obj = ipc.create(1).unwrap();
+        let ep = ipc.resolve(obj).unwrap();
+
+        assert!(ipc.receive(ep, MESSAGE_BYTES).unwrap().is_none());
+        for i in 0..QUEUE_DEPTH {
+            ipc.send(ep, make_message(&[b'a' + i as u8; 8], i as u32 + 1))
+                .unwrap();
+        }
+        assert_eq!(ipc.send(ep, make_message(b"extra", 99)), Err(EAGAIN));
+
+        // Too-small buffer returns EMSGSIZE without dropping the head message.
+        assert_eq!(ipc.receive(ep, 4).err(), Some(EMSGSIZE));
+        let first = ipc.receive(ep, 8).unwrap().unwrap();
+        assert_eq!(&first.data[..first.length], &[b'a'; 8]);
+        assert_eq!(first.reply_token, 1);
+
+        // Ring buffer wraps cleanly after dequeuing one item.
+        ipc.send(ep, make_message(b"wrap", 42)).unwrap();
+        for expected in [b'b', b'c', b'd'] {
+            let msg = ipc.receive(ep, MESSAGE_BYTES).unwrap().unwrap();
+            assert_eq!(&msg.data[..msg.length], &[expected; 8]);
+        }
+        let last = ipc.receive(ep, MESSAGE_BYTES).unwrap().unwrap();
+        assert_eq!(&last.data[..last.length], b"wrap");
+        assert_eq!(last.reply_token, 42);
+    }
+
+    #[test]
+    fn resolve_and_remove_task_enforce_generations_and_ownership() {
+        let mut ipc = Ipc::new();
+        assert_eq!(
+            ipc.resolve(Object::Memory {
+                owner: 1,
+                region: Region::default(),
+            }),
+            Err(EBADF)
+        );
+        let e0 = ipc.create(1).unwrap();
+        let e1 = ipc.create(2).unwrap();
+        let idx0 = ipc.resolve(e0).unwrap();
+        let idx1 = ipc.resolve(e1).unwrap();
+
+        let closed = ipc.remove_task(1);
+        assert!(closed[idx0]);
+        assert!(!closed[idx1]);
+        assert_eq!(ipc.resolve(e0), Err(EPIPE));
+        assert_eq!(ipc.receive(idx0, MESSAGE_BYTES).err(), Some(EPIPE));
+        assert_eq!(ipc.resolve(e1), Ok(idx1));
+
+        // Slot reuse gets a new generation so stale objects stay invalid.
+        let e0_new = ipc.create(3).unwrap();
+        assert_eq!(ipc.resolve(e0_new), Ok(idx0));
+        assert_eq!(ipc.resolve(e0), Err(EPIPE));
+    }
+
+    #[test]
+    fn endpoint_table_exhaustion_returns_enospc() {
+        let mut ipc = Ipc::new();
+        for _ in 0..MAX_ENDPOINTS {
+            ipc.create(1).unwrap();
+        }
+        assert_eq!(ipc.create(1), Err(ENOSPC));
+    }
+}

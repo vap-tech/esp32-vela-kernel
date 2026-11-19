@@ -105,3 +105,108 @@ impl Table {
         core::array::from_fn(|i| self.slots[i].cap)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generational_handles_reject_stale_reuse_and_enforce_rights() {
+        let mut table = Table::new();
+        let ep = Object::Endpoint {
+            index: 1,
+            generation: 1,
+        };
+        let handle = table
+            .install(Capability {
+                object: ep,
+                rights: SEND | RECEIVE,
+            })
+            .unwrap();
+        assert_eq!(table.get(handle, SEND).unwrap().object, ep);
+        assert_eq!(table.get(handle, CONTROL).err(), Some(EPERM));
+        assert_eq!(table.find(ep, RECEIVE), Some(handle));
+        assert_eq!(table.find(ep, CONTROL), None);
+
+        table.close(handle).unwrap();
+        assert_eq!(table.get(handle, 0).err(), Some(EBADF));
+
+        let reused = table
+            .install(Capability {
+                object: ep,
+                rights: SEND,
+            })
+            .unwrap();
+        assert_ne!(reused, handle);
+        assert_eq!(table.get(handle, 0).err(), Some(EBADF));
+        assert_eq!(table.get(reused, SEND).unwrap().object, ep);
+    }
+
+    #[test]
+    fn revoke_clears_matching_object_only_and_enforces_capacity_and_generation_limit() {
+        let mut table = Table::new();
+        let ep_a = Object::Endpoint {
+            index: 0,
+            generation: 1,
+        };
+        let ep_b = Object::Endpoint {
+            index: 1,
+            generation: 1,
+        };
+        let h_a1 = table
+            .install(Capability {
+                object: ep_a,
+                rights: SEND,
+            })
+            .unwrap();
+        let h_b = table
+            .install(Capability {
+                object: ep_b,
+                rights: SEND,
+            })
+            .unwrap();
+        let h_a2 = table
+            .install(Capability {
+                object: ep_a,
+                rights: RECEIVE,
+            })
+            .unwrap();
+
+        table.revoke(ep_a);
+        assert_eq!(table.get(h_a1, 0).err(), Some(EBADF));
+        assert_eq!(table.get(h_a2, 0).err(), Some(EBADF));
+        assert_eq!(table.get(h_b, SEND).unwrap().object, ep_b);
+
+        for _ in 0..15 {
+            table
+                .install(Capability {
+                    object: ep_b,
+                    rights: SEND,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            table
+                .install(Capability {
+                    object: ep_b,
+                    rights: SEND,
+                })
+                .err(),
+            Some((-28i32) as u32)
+        );
+
+        let mut exhausted = Table::new();
+        for s in &mut exhausted.slots {
+            s.generation = 0x7f_ffff;
+        }
+        assert_eq!(
+            exhausted
+                .install(Capability {
+                    object: ep_a,
+                    rights: SEND,
+                })
+                .err(),
+            Some((-28i32) as u32)
+        );
+    }
+}
