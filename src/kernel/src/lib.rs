@@ -6,6 +6,7 @@ pub mod elf;
 pub mod errno;
 pub mod id;
 pub mod ipc;
+pub mod lifecycle;
 pub mod memory;
 pub mod process;
 pub mod sched;

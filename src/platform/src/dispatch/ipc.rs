@@ -1,17 +1,16 @@
 use core::fmt::Write;
 use vela_kernel::{
-    capability::{self as cap, Object},
     errno::Errno,
-    id::{Handle, Pid, ProcSlot, ThreadSlot},
+    id::{Handle, Pid, ProcSlot},
     ipc::{self, Message},
-    sched::TASKS,
-    task::{Context, State, Wait},
+    lifecycle,
+    task::{Context, Wait},
 };
 
 use super::Args;
 use crate::{
     arch,
-    runtime::{Runtime, create_endpoint, grant},
+    runtime::Runtime,
     syscall,
     usermem::{copy_from_user, copy_to_user_within},
 };
@@ -37,53 +36,39 @@ impl Runtime {
         if !self.readable(args.a1 as usize, length) || !self.writable(args.a3 as usize, capacity) {
             return Err(Errno::Efault);
         }
-        let ep = self.endpoint(current, Handle(args.a0), cap::SEND)?;
-        let server_process = self.ipc.owner(ep).unwrap();
-        // No self-process RPC: avoid an unbounded dependency on caller-owned locks.
-        if server_process == current {
-            return Err(Errno::Edeadlk);
-        }
-        let server = self
-            .scheduler
-            .tasks
-            .iter()
-            .position(|t| t.process == server_process && t.state != State::Terminated)
-            .map(ThreadSlot)
-            .ok_or(Errno::Epipe)?;
-        let mut dependency = server;
-        for _ in 0..TASKS {
-            if dependency == thread {
-                return Err(Errno::Edeadlk);
-            }
-            if let Wait::Reply { server, .. } = self.scheduler.task(dependency).wait {
-                dependency = server;
-            } else {
-                break;
-            }
-        }
+        let (ep, server) = lifecycle::find_rpc_server(
+            &self.processes,
+            &self.ipc,
+            &self.scheduler,
+            current,
+            thread,
+            Handle(args.a0),
+        )?;
         let (generation, token) = self.calls.next_token(thread)?;
         let mut message = Message::EMPTY;
         message.length = length;
         message.reply_token = token;
         copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
-        self.ipc.send(ep, message)?;
-        self.calls.activate(thread, generation, ep);
         let until = if timeout == 0 {
             None
         } else {
             Some(self.scheduler.uptime().saturating_add(u64::from(timeout)))
         };
-        self.scheduler.block_opt(
-            Wait::Reply {
-                token,
-                pointer: args.a3 as usize,
-                capacity,
-                server,
-            },
+        let woken = lifecycle::commit_ipc_call(
+            &self.processes,
+            &mut self.ipc,
+            &mut self.calls,
+            &mut self.scheduler,
+            ep,
+            server,
+            generation,
+            message,
+            args.a3 as usize,
+            capacity,
             until,
-        );
-        self.complete_receivers(ep, false);
-        self.scheduler.inherit();
+            copy_to_user_within,
+        )?;
+        self.note_woken_receiver(woken);
         *switch = true;
         Ok(0)
     }
@@ -94,40 +79,19 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        let (client, server) = self.calls.lookup_for_reply(args.a0)?;
-        if self.scheduler.task(server).process != current {
-            return Err(Errno::Eperm);
-        }
-        let Wait::Reply {
-            token,
-            pointer,
-            capacity,
-            ..
-        } = self.scheduler.task(client).wait
-        else {
-            return Err(Errno::Epipe);
-        };
-        if token != args.a0 {
-            return Err(Errno::Epipe);
-        }
         let length = args.a2 as usize;
-        if length > capacity || length > ipc::MESSAGE_BYTES {
-            return Err(Errno::Emsgsize);
-        }
-        let target = self.scheduler.task(client).process;
+        let reply =
+            lifecycle::prepare_ipc_reply(&self.calls, &self.scheduler, current, args.a0, length)?;
         let mut message = Message::EMPTY;
         message.length = length;
         copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
         copy_to_user_within(
-            &self.processes.slot(target).memory,
-            pointer,
-            capacity,
+            &self.processes.slot(reply.target).memory,
+            reply.pointer,
+            reply.capacity,
             &message.data[..length],
         )?;
-        self.calls.deactivate(client);
-        self.scheduler.wake_with(client, args.a2);
-        self.scheduler.inherit();
-        self.scheduler.prefer(client);
+        lifecycle::finish_ipc_reply(&mut self.calls, &mut self.scheduler, reply.client, length);
         *switch = self.scheduler.should_preempt();
         Ok(0)
     }
@@ -137,65 +101,34 @@ impl Runtime {
         current: ProcSlot,
         args: Args,
     ) -> Result<u32, Errno> {
-        let peer = match self.processes.find_alive(Pid(args.a1)) {
-            Some(p) if p != current => p,
-            _ => return Err(Errno::Einval),
-        };
-        if args.a2 > u16::MAX as u32 {
-            return Err(Errno::Einval);
-        }
-        let rights = args.a2 as u16;
-        let source_handle = Handle(args.a0);
-        let source = self
-            .processes
-            .slot(current)
-            .capabilities
-            .get(source_handle, cap::GRANT)?;
-        if let Object::Memory { region, .. } = source.object {
-            if rights & !(cap::READ | cap::WRITE) != 0 || rights & cap::READ == 0 {
-                return Err(Errno::Einval);
-            }
-            let handle = grant(&mut self.processes, current, source_handle, peer, rights)?;
-            if let Err(e) = self
-                .processes
-                .slot_mut(peer)
-                .memory
-                .insert(region, rights as u8)
-            {
-                self.processes
-                    .slot_mut(peer)
-                    .capabilities
-                    .close(handle)
-                    .unwrap();
-                return Err(e);
-            }
-            Ok(handle.raw())
-        } else if args.number == syscall::MEM_GRANT {
-            Err(Errno::Einval)
-        } else {
-            grant(&mut self.processes, current, source_handle, peer, rights).map(Handle::raw)
-        }
+        let rights = u16::try_from(args.a2).map_err(|_| Errno::Einval)?;
+        lifecycle::grant_or_map(
+            &mut self.processes,
+            current,
+            Handle(args.a0),
+            Pid(args.a1),
+            rights,
+            args.number == syscall::MEM_GRANT,
+        )
+        .map(Handle::raw)
     }
 
     pub(super) fn sys_cap_revoke(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        let c = self
-            .processes
-            .slot(current)
-            .capabilities
-            .get(Handle(args.a0), cap::CONTROL)?;
-        self.invalidate_object(c.object, Some(current));
-        if let Object::Endpoint { index, .. } = c.object {
-            self.calls
-                .fail_where(&mut self.scheduler, Errno::Epipe, |call, task| {
-                    call.endpoint() == index && task.process != current
-                });
-            self.complete_receivers(index, false);
-        }
+        let woken = lifecycle::revoke_capability(
+            &mut self.processes,
+            &mut self.ipc,
+            &mut self.calls,
+            &mut self.scheduler,
+            current,
+            Handle(args.a0),
+            copy_to_user_within,
+        )?;
+        self.note_woken_receiver(woken);
         Ok(0)
     }
 
     pub(super) fn sys_endpoint_create(&mut self, current: ProcSlot) -> Result<u32, Errno> {
-        create_endpoint(&mut self.ipc, &mut self.processes, current).map(Handle::raw)
+        lifecycle::create_endpoint(&mut self.ipc, &mut self.processes, current).map(Handle::raw)
     }
 
     pub(super) fn sys_endpoint_close(
@@ -203,23 +136,16 @@ impl Runtime {
         current: ProcSlot,
         args: Args,
     ) -> Result<u32, Errno> {
-        let handle = Handle(args.a0);
-        let capability = self.processes.slot(current).capabilities.get(handle, 0)?;
-        let ep = self.ipc.resolve(capability.object)?;
-        if capability.rights & cap::CONTROL != 0 {
-            self.calls
-                .fail_for_endpoint(&mut self.scheduler, ep, Errno::Epipe);
-            self.ipc.close(ep);
-            self.invalidate_object(capability.object, None);
-            self.complete_receivers(ep, true);
-        } else {
-            self.processes
-                .slot_mut(current)
-                .capabilities
-                .close(handle)
-                .unwrap();
-            self.complete_receivers(ep, false);
-        }
+        let woken = lifecycle::close_endpoint(
+            &mut self.processes,
+            &mut self.ipc,
+            &mut self.calls,
+            &mut self.scheduler,
+            current,
+            Handle(args.a0),
+            copy_to_user_within,
+        )?;
+        self.note_woken_receiver(woken);
         Ok(0)
     }
 

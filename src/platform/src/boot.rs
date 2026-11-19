@@ -4,6 +4,7 @@ use vela_kernel::{
     capability::{self as cap, Capability},
     id::ProcSlot,
     ipc::Ipc,
+    lifecycle::{create_endpoint, grant},
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
     sched::Scheduler,
@@ -15,7 +16,7 @@ use crate::{
     display::DisplayControl,
     dma::DmaChannel,
     pmp,
-    runtime::{BootLogs, CONSOLE_RX, RUNTIME, Runtime, create_endpoint, grant},
+    runtime::{BootLogs, CONSOLE_RX, RUNTIME, Runtime},
     sentinel::SentinelClient,
     soc, users,
 };

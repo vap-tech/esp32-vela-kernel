@@ -1,14 +1,15 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     call::CallTable,
-    capability::{self as cap, Capability, Object},
+    capability::Object,
     errno::Errno,
-    id::{Handle, Pid, ProcSlot, ThreadSlot},
-    ipc::{self, Ipc},
+    id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
+    ipc::Ipc,
+    lifecycle::{self, ReapedProcess},
     memory::RegionAllocator,
-    process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
+    process::{AddressSpace, EXECUTE, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
-    task::{Context, Region, State, Wait},
+    task::{Region, State, Wait},
 };
 
 use crate::{
@@ -66,89 +67,9 @@ pub struct BootCell(pub UnsafeCell<MaybeUninit<Runtime>>);
 unsafe impl Sync for BootCell {}
 pub static RUNTIME: BootCell = BootCell(UnsafeCell::new(MaybeUninit::uninit()));
 
-pub fn create_endpoint(
-    ipc: &mut Ipc,
-    processes: &mut Processes,
-    owner: ProcSlot,
-) -> Result<Handle, Errno> {
-    let object = ipc.create(owner)?;
-    match processes.slot_mut(owner).capabilities.install(Capability {
-        object,
-        rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL,
-    }) {
-        Ok(handle) => Ok(handle),
-        Err(e) => {
-            let ep = ipc.resolve(object)?;
-            ipc.close(ep);
-            Err(e)
-        }
-    }
-}
-
-pub fn grant(
-    processes: &mut Processes,
-    owner: ProcSlot,
-    handle: Handle,
-    peer: ProcSlot,
-    rights: u16,
-) -> Result<Handle, Errno> {
-    let source = processes.slot(owner).capabilities.get(handle, cap::GRANT)?;
-    if rights == 0 || rights & !source.rights != 0 || rights & (cap::CONTROL | cap::GRANT) != 0 {
-        return Err(Errno::Eperm);
-    }
-    processes.slot_mut(peer).capabilities.install(Capability {
-        object: source.object,
-        rights,
-    })
-}
-
 impl Runtime {
     pub fn endpoint(&self, process: ProcSlot, handle: Handle, rights: u16) -> Result<usize, Errno> {
-        let capability = self
-            .processes
-            .slot(process)
-            .capabilities
-            .get(handle, rights)?;
-        self.ipc.resolve(capability.object)
-    }
-
-    pub fn invalidate_object(&mut self, object: Object, keep_owner: Option<ProcSlot>) {
-        for idx in 0..self.processes.slots.len() {
-            let process = ProcSlot(idx);
-            if Some(process) == keep_owner {
-                continue;
-            }
-            self.processes.slot_mut(process).capabilities.revoke(object);
-            if let Object::Memory { region, .. } = object {
-                if self
-                    .processes
-                    .slot(process)
-                    .memory
-                    .maps
-                    .iter()
-                    .any(|m| m.region == region)
-                {
-                    self.processes
-                        .slot_mut(process)
-                        .memory
-                        .remove(region)
-                        .unwrap();
-                    for thread_idx in 0..TASKS {
-                        let thread = ThreadSlot(thread_idx);
-                        if self.scheduler.task(thread).process == process {
-                            if let Wait::Receive {
-                                pointer, capacity, ..
-                            } = self.scheduler.task(thread).wait
-                            {
-                                if region.contains(pointer, capacity) {
-                                    self.scheduler.wake_with(thread, Errno::Efault.to_abi());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        lifecycle::resolve_endpoint(&self.processes, &self.ipc, process, handle, rights)
     }
 
     pub fn memory(&self) -> &AddressSpace {
@@ -163,121 +84,45 @@ impl Runtime {
         self.memory().permits(pointer, length, WRITE)
     }
 
-    pub fn complete_receivers(&mut self, endpoint: usize, closed: bool) {
-        for i in 0..TASKS {
-            let thread = ThreadSlot(i);
-            let task = *self.scheduler.task(thread);
-            if task.state != State::Blocked {
-                continue;
-            }
-            if let Wait::Receive {
-                endpoint: waiting,
-                handle,
-                pointer,
-                capacity,
-            } = task.wait
-            {
-                if waiting != endpoint {
-                    continue;
-                }
-                let result = if closed || self.endpoint(task.process, handle, ipc::RECEIVE).is_err()
-                {
-                    Err(Errno::Epipe)
-                } else {
-                    self.ipc.receive(endpoint, capacity)
-                };
-                let value = match result {
-                    Ok(None) => continue,
-                    Ok(Some(message)) => {
-                        self.calls
-                            .bind_reply(&mut self.scheduler, message.reply_token, thread);
-                        self.scheduler
-                            .task_mut(thread)
-                            .context
-                            .set_return2(message.reply_token);
-                        match copy_to_user_within(
-                            &self.processes.slot(task.process).memory,
-                            pointer,
-                            capacity,
-                            &message.data[..message.length],
-                        ) {
-                            Ok(()) => message.length as u32,
-                            Err(e) => e.to_abi(),
-                        }
-                    }
-                    Err(error) => error.to_abi(),
-                };
-                // Blocked ecall already advanced mepc and was saved. Update its
-                // own return register before making the task runnable.
-                self.scheduler.wake_with(thread, value);
-                if let Wait::Receive { .. } = task.wait {
-                    self.scheduler.prefer(thread);
-                }
-                if !self.logs.wake {
-                    self.logs.wake = true;
-                    let _ = writeln!(self.console, "[ipc] receiver woke task={}", task.id.raw());
-                }
-            }
+    pub fn note_woken_receiver(&mut self, woken: Option<Tid>) {
+        if let Some(tid) = woken
+            && !self.logs.wake
+        {
+            self.logs.wake = true;
+            let _ = writeln!(self.console, "[ipc] receiver woke task={}", tid.raw());
         }
     }
 
+    pub fn complete_receivers(&mut self, endpoint: usize, closed: bool) {
+        let woken = lifecycle::complete_receivers(
+            &self.processes,
+            &mut self.ipc,
+            &mut self.calls,
+            &mut self.scheduler,
+            endpoint,
+            closed,
+            copy_to_user_within,
+        );
+        self.note_woken_receiver(woken);
+    }
+
+    pub fn finish_reaped_process(&mut self, reaped: ReapedProcess) {
+        self.sentinel.release_wake_on_exit(reaped.pid);
+        self.dma.release_process(reaped.pid);
+        self.pmp_images[reaped.slot.index()] = None;
+        self.note_woken_receiver(reaped.first_woken);
+    }
+
     pub fn terminate(&mut self) {
-        let process = self.scheduler.current().process;
-        let exiting = self.scheduler.current;
-        self.calls.deactivate(exiting);
-        self.calls
-            .fail_for_server(&mut self.scheduler, exiting, Errno::Epipe);
-        self.scheduler.terminate();
-        if self
-            .scheduler
-            .tasks
-            .iter()
-            .any(|t| t.process == process && t.state != State::Terminated)
-        {
-            return;
-        }
-        let owner = self.processes.slot(process).id;
-        self.sentinel.release_wake_on_exit(owner);
-        self.dma.release_process(owner);
-        self.processes.slot_mut(process).state = Lifecycle::Dying;
-        let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
-        let ipc = &self.ipc;
-        self.calls
-            .fail_where(&mut self.scheduler, Errno::Epipe, |call, _| {
-                ipc.owner(call.endpoint()) == Some(process)
-            });
-        let closed = self.ipc.remove_task(process);
-        for (i, is_closed) in closed.iter().enumerate() {
-            if *is_closed {
-                self.invalidate_object(objects[i], None);
-            }
-        }
-        for capability in self
-            .processes
-            .slot(process)
-            .capabilities
-            .objects()
-            .into_iter()
-            .flatten()
-        {
-            if let Object::Memory {
-                owner: mem_owner, ..
-            } = capability.object
-            {
-                if mem_owner == owner {
-                    self.invalidate_object(capability.object, Some(process));
-                }
-            }
-        }
-        self.processes.slot_mut(process).capabilities.clear();
-        self.allocator.release_owner(owner);
-        self.processes.slot_mut(process).state = Lifecycle::Free;
-        self.processes.slot_mut(process).memory = AddressSpace::EMPTY;
-        self.pmp_images[process.index()] = None;
-        for (ep, is_closed) in closed.into_iter().enumerate() {
-            if is_closed {
-                self.complete_receivers(ep, true);
-            }
+        if let Some(reaped) = lifecycle::terminate_current_thread(
+            &mut self.processes,
+            &mut self.ipc,
+            &mut self.calls,
+            &mut self.allocator,
+            &mut self.scheduler,
+            copy_to_user_within,
+        ) {
+            self.finish_reaped_process(reaped);
         }
     }
 

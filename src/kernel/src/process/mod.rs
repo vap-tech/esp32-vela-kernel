@@ -7,7 +7,7 @@ use crate::{
 };
 pub const PROCESSES: usize = 8;
 pub const REGIONS: usize = 6;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifecycle {
     Free,
     Alive,

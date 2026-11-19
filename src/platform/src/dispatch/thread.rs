@@ -1,12 +1,17 @@
 use vela_kernel::{
     errno::Errno,
-    id::{Pid, ProcSlot, ThreadSlot, Tid},
-    process::EXECUTE,
-    task::{Region, State, Wait},
+    id::{Pid, ProcSlot, Tid},
+    lifecycle,
+    task::{Region, Wait},
 };
 
 use super::Args;
-use crate::{arch, runtime::Runtime, syscall, usermem::copy_to_user};
+use crate::{
+    arch,
+    runtime::Runtime,
+    syscall,
+    usermem::{copy_to_user, copy_to_user_within},
+};
 
 impl Runtime {
     pub(super) fn sys_spawn_hello(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
@@ -39,21 +44,13 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        if args.a1 > u32::from(self.processes.slot(current).priority_ceiling) {
-            return Err(Errno::Einval);
-        }
-        let target_tid = Tid(args.a0);
-        let thread = self
-            .scheduler
-            .tasks
-            .iter()
-            .position(|t| {
-                t.id == target_tid && t.process == current && t.state != State::Terminated
-            })
-            .map(ThreadSlot)
-            .ok_or(Errno::Eperm)?;
-        self.scheduler.task_mut(thread).priority = args.a1 as u8;
-        self.scheduler.inherit();
+        lifecycle::set_thread_priority(
+            &self.processes,
+            &mut self.scheduler,
+            current,
+            Tid(args.a0),
+            args.a1,
+        )?;
         *switch = self.scheduler.should_preempt();
         Ok(0)
     }
@@ -63,61 +60,38 @@ impl Runtime {
         current: ProcSlot,
         args: Args,
     ) -> Result<u32, Errno> {
-        let entry = args.a0 as usize;
         let stack = Region {
             base: args.a1 as usize,
             size: args.a2 as usize,
         };
-        let priority = args.a4;
-        let affinity = args.a5;
-        let proc = self.processes.slot(current);
-        if entry & 1 != 0
-            || !self.memory().permits(entry, 2, EXECUTE)
-            || stack.base & 15 != 0
-            || stack.size < 256
-            || stack.size & 15 != 0
-            || !self.writable(stack.base, stack.size)
-            || priority > u32::from(proc.priority_ceiling)
-            || affinity != 1
-            || !self.allocator.owns(proc.id, stack)
-        {
-            return Err(Errno::Einval);
-        }
-        let end = stack.base + stack.size;
-        if self.scheduler.tasks.iter().any(|t| {
-            t.process == current
-                && t.state != State::Terminated
-                && stack.base < t.stack.base + t.stack.size
-                && t.stack.base < end
-        }) {
-            return Err(Errno::Einval);
-        }
-        let context = arch::TrapFrame::user(entry, end, args.a3);
-        self.scheduler
-            .create_thread(
-                current,
-                context,
-                stack,
-                entry,
-                priority as u8,
-                affinity as u8,
-            )
-            .map(Tid::raw)
+        lifecycle::spawn_user_thread(
+            &self.processes,
+            &self.allocator,
+            &mut self.scheduler,
+            current,
+            args.a0 as usize,
+            stack,
+            args.a4,
+            args.a5,
+            |entry, sp| arch::TrapFrame::user(entry, sp, args.a3),
+        )
+        .map(Tid::raw)
     }
 
     pub(super) fn sys_process_exit(
         &mut self,
-        current: ProcSlot,
+        _current: ProcSlot,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        for thread in &mut self.scheduler.tasks {
-            if thread.process == current {
-                thread.state = State::Terminated;
-                thread.wait = Wait::None;
-                thread.deadline = None;
-            }
-        }
-        self.terminate();
+        let reaped = lifecycle::terminate_process(
+            &mut self.processes,
+            &mut self.ipc,
+            &mut self.calls,
+            &mut self.allocator,
+            &mut self.scheduler,
+            copy_to_user_within,
+        );
+        self.finish_reaped_process(reaped);
         *switch = true;
         Ok(0)
     }
