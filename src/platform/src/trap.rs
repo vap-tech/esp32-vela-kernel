@@ -50,7 +50,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             }
             runtime.complete_dma(false);
         }
-        soc::scanout::tick();
+        runtime.display.tick();
         runtime.sentinel.tick(uptime);
         runtime.scheduler.tick(uptime, &mut runtime.calls);
         switch = true;

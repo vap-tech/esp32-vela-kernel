@@ -1,26 +1,64 @@
 pub const NAME: &str = "M5Stack Tab5";
 mod images;
 mod st7121;
+
 use crate::soc::{
+    clock,
     display_io::{self as io, Bus},
     dsi,
+    psram::{Controller as PsramController, Probe as PsramProbe},
+    scanout::{Scanout, Snapshot as ScanoutSnapshot},
 };
+use core::fmt;
+
 const BUS: Bus = Bus { sda: 31, scl: 32 };
 const RESET_BITS: u8 = 0x30; // expander 1 P4 LCD, P5 touch
-fn change(reg: u8, mask: u8, bits: u8) -> Result<(), u32> {
-    let old = BUS.transfer(0x43, &[reg], true).map_err(|_| 1u32)?;
-    BUS.transfer(0x43, &[reg, (old & !mask) | bits], false)
-        .map_err(|_| 1u32)?;
+
+#[derive(Clone, Copy)]
+pub enum Diagnostic {
+    Psram(PsramProbe),
+    Scanout(ScanoutSnapshot),
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Psram(probe) => probe.fmt(f),
+            Self::Scanout(snapshot) => snapshot.fmt(f),
+        }
+    }
+}
+
+unsafe fn change(reg: u8, mask: u8, bits: u8) -> Result<(), u32> {
+    unsafe {
+        let old = BUS.transfer(0x43, &[reg], true).map_err(|_| 1u32)?;
+        BUS.transfer(0x43, &[reg, (old & !mask) | bits], false)
+            .map_err(|_| 1u32)?;
+    }
     Ok(())
 }
-fn backlight(on: bool) {
-    io::latch(22, on);
-    io::configure(22, false);
-    io::drive(22, true);
+
+unsafe fn backlight(on: bool) {
+    unsafe {
+        io::latch(22, on);
+        io::configure(22, false);
+        io::drive(22, true);
+    }
 }
-/// Sequential trusted operations. Positive result is a minimum delay in 10ms
-/// ticks before the next stage. The shell sleeps between stages.
-pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
+
+/// Sequential trusted display bring-up steps. Positive result is a minimum delay
+/// in 10ms ticks before the next stage; the shell sleeps between stages.
+///
+/// # Safety
+/// Exclusive HP0 ownership of the Tab5 display I2C bus, backlight GPIO/LEDC,
+/// CPLL/display clocks, MSPI2/3 PSRAM, MIPI-DSI host/PHY, and DW-GDMA CH0 with
+/// machine interrupts masked.
+pub unsafe fn display_step(
+    stage: u8,
+    mode: u8,
+    psram: &mut PsramController,
+    scanout: &mut Scanout,
+) -> (Option<Diagnostic>, Result<u32, u32>) {
     let orbit = mode != 1;
     if mode >= 4 && (5..45).contains(&stage) {
         let image = if mode == 4 {
@@ -28,89 +66,100 @@ pub fn display_step(stage: u8, mode: u8) -> Result<u32, u32> {
         } else {
             &images::BOOT
         };
-        images::draw_rows(image, usize::from(stage - 5) * 32, 32)?;
-        return Ok(1);
+        return (
+            None,
+            unsafe { images::draw_rows(image, usize::from(stage - 5) * 32, 32) }.map(|()| 1),
+        );
     }
     let stage = if mode >= 4 && stage >= 45 {
         stage - 40
     } else {
         stage
     };
-    match stage {
-        0 => {
-            BUS.init();
-            backlight(false);
-            change(0x05, RESET_BITS, 0)?;
-            change(0x0d, RESET_BITS, RESET_BITS)?;
-            change(0x0b, RESET_BITS, RESET_BITS)?;
-            change(0x07, RESET_BITS, 0)?;
-            change(0x03, RESET_BITS, RESET_BITS)?;
-            Ok(3)
-        }
-        1 => {
-            // LCD_RST releases through the expander pull-up, never drives 3.3 V high.
-            change(0x03, 0x10, 0)?;
-            change(0x05, 0x20, 0x20)?;
-            Ok(65)
-        }
-        2 => {
-            let version = BUS.transfer(0x55, &[0, 0], true).map_err(|_| 2u32)?;
-            if version != 1 {
-                return Err(0x100 + u32::from(version));
+    unsafe {
+        match stage {
+            0 => {
+                let res = (|| {
+                    BUS.init();
+                    backlight(false);
+                    change(0x05, RESET_BITS, 0)?;
+                    change(0x0d, RESET_BITS, RESET_BITS)?;
+                    change(0x0b, RESET_BITS, RESET_BITS)?;
+                    change(0x07, RESET_BITS, 0)?;
+                    change(0x03, RESET_BITS, RESET_BITS)?;
+                    Ok(3)
+                })();
+                (None, res)
             }
-            crate::soc::clock::display_speed().map_err(|_| 9u32)?;
-            if mode >= 4 {
-                crate::soc::psram::initialize()?;
+            1 => {
+                // LCD_RST releases through the expander pull-up, never drives 3.3 V high.
+                let res = change(0x03, 0x10, 0)
+                    .and_then(|()| change(0x05, 0x20, 0x20))
+                    .map(|()| 65);
+                (None, res)
             }
-            dsi::power_phy();
-            Ok(2)
+            2 => {
+                let mut diag = None;
+                let res = (|| {
+                    let version = BUS.transfer(0x55, &[0, 0], true).map_err(|_| 2u32)?;
+                    if version != 1 {
+                        return Err(0x100 + u32::from(version));
+                    }
+                    clock::display_speed().map_err(|_| 9u32)?;
+                    if mode >= 4 {
+                        let (probe, init) = psram.initialize();
+                        diag = probe.map(Diagnostic::Psram);
+                        init?;
+                    }
+                    dsi::power_phy();
+                    Ok(2)
+                })();
+                (diag, res)
+            }
+            3 => {
+                let res = (|| {
+                    dsi::start().map_err(|_| 3u32)?;
+                    for command in st7121::INIT {
+                        dsi::dcs(command).map_err(|_| 4u32)?;
+                    }
+                    dsi::dcs(&[0x11]).map_err(|_| 4u32)?;
+                    Ok(13)
+                })();
+                (None, res)
+            }
+            4 => (None, dsi::dcs(&[0x29]).map(|()| 81).map_err(|_| 4u32)),
+            5 => {
+                let res = (|| {
+                    for command in [&[0x35, 0][..], &[0x36, 0], &[0x3a, 0x55]] {
+                        dsi::dcs(command).map_err(|_| 4u32)?;
+                    }
+                    if !dsi::video(!orbit) {
+                        return Err(5);
+                    }
+                    if !io::backlight_pwm(22, 160) {
+                        return Err(7);
+                    }
+                    if orbit {
+                        scanout.start(include_bytes!("orbit.a8"), [0x85, 0xbf, 0xff], mode);
+                        return Ok(12);
+                    }
+                    Ok(0)
+                })();
+                (None, res)
+            }
+            6 if orbit => {
+                scanout.clear_underrun();
+                (None, Ok(50))
+            }
+            7 if orbit => {
+                let snapshot = scanout.snapshot();
+                let failed = snapshot.frames < 2 || snapshot.underrun;
+                (
+                    Some(Diagnostic::Scanout(snapshot)),
+                    if failed { Err(8) } else { Ok(0) },
+                )
+            }
+            _ => (None, Err(6)),
         }
-        3 => {
-            dsi::start().map_err(|_| 3u32)?;
-            for command in st7121::INIT {
-                dsi::dcs(command).map_err(|_| 4u32)?;
-            }
-            dsi::dcs(&[0x11]).map_err(|_| 4u32)?;
-            Ok(13)
-        }
-        4 => {
-            dsi::dcs(&[0x29]).map_err(|_| 4u32)?;
-            Ok(81)
-        }
-        5 => {
-            for command in [&[0x35, 0][..], &[0x36, 0], &[0x3a, 0x55]] {
-                dsi::dcs(command).map_err(|_| 4u32)?;
-            }
-            if !dsi::video(!orbit) {
-                return Err(5);
-            }
-            if !io::backlight_pwm(22, 160) {
-                return Err(7);
-            }
-            if orbit {
-                crate::soc::scanout::start(include_bytes!("orbit.a8"), [0x85, 0xbf, 0xff], mode);
-                return Ok(12);
-            }
-            Ok(0)
-        }
-        6 if orbit => {
-            crate::soc::scanout::clear_underrun();
-            Ok(50)
-        }
-        7 if orbit => {
-            crate::soc::scanout::debug();
-            use core::fmt::Write;
-            let _ = writeln!(
-                unsafe { crate::soc::console::Console::new() },
-                "[scan] frames={} underrun={}",
-                crate::soc::scanout::frames(),
-                crate::soc::scanout::underrun()
-            );
-            if crate::soc::scanout::frames() < 2 || crate::soc::scanout::underrun() {
-                return Err(8);
-            }
-            Ok(0)
-        }
-        _ => Err(6),
     }
 }

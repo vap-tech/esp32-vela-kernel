@@ -29,17 +29,19 @@ impl Reader {
         self.cursor = 0;
         self.loaded = 0;
     }
-    fn next(&mut self) -> Result<Option<(usize, u16)>, u32> {
+    unsafe fn next(&mut self) -> Result<Option<(usize, u16)>, u32> {
         if self.cursor == self.asset.length {
             return Ok(None);
         }
         if self.cursor >= self.base + self.loaded || self.loaded == 0 {
             self.base = self.cursor;
             self.loaded = (self.asset.length - self.cursor).min(4096);
-            flash::read(
-                self.asset.address + self.cursor as u32,
-                &mut self.words[..self.loaded / 4],
-            )?;
+            unsafe {
+                flash::read(
+                    self.asset.address + self.cursor as u32,
+                    &mut self.words[..self.loaded / 4],
+                )?;
+            }
         }
         let word = self.words[(self.cursor - self.base) / 4];
         self.cursor += 4;
@@ -51,9 +53,9 @@ impl Reader {
     }
 }
 
-fn verify(asset: &'static Asset) -> Result<(), u32> {
+unsafe fn verify(asset: &'static Asset) -> Result<(), u32> {
     let mut header = [0u32; 16];
-    flash::read(0x100000, &mut header)?;
+    unsafe { flash::read(0x100000, &mut header)? };
     for (word, expected) in header.iter().zip(HEADER.chunks_exact(4)) {
         if *word != u32::from_le_bytes(expected.try_into().unwrap()) {
             return Err(17);
@@ -65,7 +67,7 @@ fn verify(asset: &'static Asset) -> Result<(), u32> {
     let mut reader = Reader::new(asset);
     let mut crc = u32::MAX;
     let mut pixels = 0usize;
-    while let Some((count, pixel)) = reader.next()? {
+    while let Some((count, pixel)) = unsafe { reader.next()? } {
         pixels = pixels
             .checked_add(count)
             .filter(|&n| n <= psram::FRAME_BYTES / 2)
@@ -91,7 +93,11 @@ fn verify(asset: &'static Asset) -> Result<(), u32> {
 }
 
 /// Fill and verify one bounded row range in the kernel-owned framebuffer.
-pub fn draw_rows(asset: &'static Asset, row: usize, rows: usize) -> Result<(), u32> {
+///
+/// # Safety
+/// Exclusive HP0 ownership of Flash ROM reads and the initialized PSRAM
+/// framebuffer window (`psram::DIRECT..+FRAME_BYTES`) with IRQs masked.
+pub unsafe fn draw_rows(asset: &'static Asset, row: usize, rows: usize) -> Result<(), u32> {
     let first = row.checked_mul(720).ok_or(13u32)?;
     let end = rows
         .checked_mul(720)
@@ -99,7 +105,7 @@ pub fn draw_rows(asset: &'static Asset, row: usize, rows: usize) -> Result<(), u
         .filter(|&n| n <= psram::FRAME_BYTES / 2)
         .ok_or(13u32)?;
     if row == 0 {
-        verify(asset)?;
+        unsafe { verify(asset)? };
     }
     let mut reader = Reader::new(asset);
     // The second pass compares CPU readback against the same Flash source.
@@ -107,7 +113,7 @@ pub fn draw_rows(asset: &'static Asset, row: usize, rows: usize) -> Result<(), u
         reader.rewind();
         let mut position = 0usize;
         while position < end {
-            let (count, pixel) = reader.next()?.ok_or(13u32)?;
+            let (count, pixel) = unsafe { reader.next()? }.ok_or(13u32)?;
             let next = position
                 .checked_add(count)
                 .filter(|&n| n <= psram::FRAME_BYTES / 2)

@@ -1,6 +1,9 @@
 //! Serialized ROM reads from the selected 16 MiB Flash. Code/stack are in SRAM.
 //! HP0 kernel paths hold IRQs masked. No other runtime Flash writer exists.
-pub fn read(address: u32, destination: &mut [u32]) -> Result<(), u32> {
+
+/// # Safety
+/// Exclusive HP0 SPI Flash ROM reader with IRQs masked and code/stack in SRAM.
+pub unsafe fn read(address: u32, destination: &mut [u32]) -> Result<(), u32> {
     let bytes = destination.len().checked_mul(4).ok_or(16u32)?;
     let end = (address as usize).checked_add(bytes).ok_or(16u32)?;
     if address % 4 != 0 || bytes == 0 || end > 16 * 1024 * 1024 {

@@ -33,7 +33,12 @@ impl Runtime {
             Authority::Display,
             cap::CONTROL,
         )?;
-        self.display.step(args.a1)
+        let (diag, result) = self.display.step(args.a1);
+        if let Some(diag) = diag {
+            use core::fmt::Write;
+            let _ = write!(self.console, "{diag}");
+        }
+        result
     }
 
     pub(super) fn sys_dma_copy(
