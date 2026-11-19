@@ -1,8 +1,8 @@
 ![Vela Microkernel](readme.svg)
 
-# Vela v0.3
+# Vela
 
-Space Flow bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
+Bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
 Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
 100 Hz priority round robin, bounded process/thread pools, no global heap or async runtime.
 LP Sentinel independently observes HP heartbeats, keeps a diagnostic journal
