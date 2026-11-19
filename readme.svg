@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="180" viewBox="0 0 640 180" fill="none">
+  <defs>
+    <linearGradient id="velaGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6FD3FF"/>
+      <stop offset="100%" stop-color="#85BFFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon -->
+  <g transform="translate(28 30)" stroke="url(#velaGradient)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Core -->
+    <circle cx="60" cy="60" r="14"/>
+
+    <!-- Satellite nodes -->
+    <circle cx="104" cy="20" r="8"/>
+    <circle cx="18" cy="102" r="8"/>
+
+    <!-- Orbit arcs -->
+    <path d="M52 117.5a58 58 0 0 0 58.2-89.4"/>
+    <path d="M69 2.5A58 58 0 0 0 11 91.9"/>
+
+    <!-- Microkernel / pixel accents -->
+    <rect x="56" y="13" width="6" height="6" rx="1" fill="#85BFFF" stroke="none"/>
+    <rect x="87" y="86" width="6" height="6" rx="1" fill="#85BFFF" stroke="none"/>
+    <rect x="28" y="42" width="6" height="6" rx="1" fill="#85BFFF" stroke="none"/>
+  </g>
+
+  <!-- Wordmark -->
+  <g transform="translate(168 54)">
+    <text x="0" y="34"
+          font-family="Inter, JetBrains Mono, SFMono-Regular, Menlo, monospace"
+          font-size="42"
+          font-weight="700"
+          letter-spacing="1"
+          fill="#D9F3FF">vela</text>
+
+    <text x="2" y="68"
+          font-family="Inter, JetBrains Mono, SFMono-Regular, Menlo, monospace"
+          font-size="15"
+          font-weight="500"
+          letter-spacing="2"
+          fill="#85BFFF">MICROKERNEL • RUST • NO_STD • BARE METAL</text>
+
+    <text x="2" y="95"
+          font-family="Inter, JetBrains Mono, SFMono-Regular, Menlo, monospace"
+          font-size="13"
+          font-weight="400"
+          letter-spacing="1.2"
+          fill="#6FAED0">ESP32 P4 / C6 / C5 / S3</text>
+  </g>
+</svg>
