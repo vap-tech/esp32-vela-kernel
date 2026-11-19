@@ -1,6 +1,7 @@
 use vela_kernel::{
     capability::{self as cap, Capability, Object},
     errno::Errno,
+    id::{Handle, ProcSlot, ThreadSlot},
     process::{READ, WRITE},
     sched::TASKS,
     task::{Region, State, Wait},
@@ -10,7 +11,7 @@ use super::Args;
 use crate::{arch, runtime::Runtime};
 
 impl Runtime {
-    pub(super) fn sys_mem_cap(&self, current: usize, args: Args) -> Result<u32, Errno> {
+    pub(super) fn sys_mem_cap(&self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
         let region = self
             .memory()
             .maps
@@ -18,41 +19,51 @@ impl Runtime {
             .find(|m| m.region.base == args.a0 as usize)
             .map(|m| m.region)
             .ok_or(Errno::Ebadf)?;
-        self.processes.slots[current]
+        self.processes
+            .slot(current)
             .capabilities
             .find(
                 Object::Memory {
-                    owner: self.processes.slots[current].id,
+                    owner: self.processes.slot(current).id,
                     region,
                 },
                 cap::CONTROL,
             )
+            .map(Handle::raw)
             .ok_or(Errno::Ebadf)
     }
 
     pub(super) fn sys_mem_alloc(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         frame: &mut arch::TrapFrame,
     ) -> Result<u32, Errno> {
-        let owner = self.processes.slots[current].id;
+        let owner = self.processes.slot(current).id;
         let region = self.allocator.allocate(owner, args.a0 as usize)?;
-        if let Err(e) = self.processes.slots[current]
+        if let Err(e) = self
+            .processes
+            .slot_mut(current)
             .memory
             .insert(region, READ | WRITE)
         {
             self.allocator.free(owner, region).unwrap();
             return Err(e);
         }
-        if let Err(e) = self.processes.slots[current]
+        if let Err(e) = self
+            .processes
+            .slot_mut(current)
             .capabilities
             .install(Capability {
                 object: Object::Memory { owner, region },
                 rights: cap::READ | cap::WRITE | cap::GRANT | cap::CONTROL,
             })
         {
-            self.processes.slots[current].memory.remove(region).unwrap();
+            self.processes
+                .slot_mut(current)
+                .memory
+                .remove(region)
+                .unwrap();
             self.allocator.free(owner, region).unwrap();
             return Err(e);
         }
@@ -64,14 +75,16 @@ impl Runtime {
         Ok(region.base as u32)
     }
 
-    pub(super) fn sys_mem_free(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
+    pub(super) fn sys_mem_free(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
         let region = Region {
             base: args.a0 as usize,
             size: args.a1 as usize,
         };
-        let owner = self.processes.slots[current].id;
+        let owner = self.processes.slot(current).id;
         if !self.allocator.owns(owner, region)
-            || self.processes.slots[current]
+            || self
+                .processes
+                .slot(current)
                 .capabilities
                 .find(Object::Memory { owner, region }, cap::CONTROL)
                 .is_none()
@@ -89,16 +102,17 @@ impl Runtime {
         self.allocator.free(owner, region).unwrap();
         // Cancel pending receives before the physical region can be reused.
         for i in 0..TASKS {
-            if self.scheduler.tasks[i].process != current {
+            let thread = ThreadSlot(i);
+            if self.scheduler.task(thread).process != current {
                 continue;
             }
             if let Wait::Receive {
                 pointer, capacity, ..
-            } = self.scheduler.tasks[i].wait
+            } = self.scheduler.task(thread).wait
             {
                 if region.contains(pointer, capacity) {
-                    self.scheduler.tasks[i].context.registers[8] = Errno::Efault.to_abi();
-                    self.scheduler.wake(i);
+                    self.scheduler.task_mut(thread).context.registers[8] = Errno::Efault.to_abi();
+                    self.scheduler.wake(thread);
                 }
             }
         }

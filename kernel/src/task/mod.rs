@@ -1,3 +1,5 @@
+use crate::id::{Handle, ProcSlot, ThreadSlot, Ticks, Tid};
+
 /// Half-open user mapping. No overflow or cross-region syscall buffers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Region {
@@ -25,12 +27,12 @@ pub enum State {
 pub enum Wait {
     Sentinel {
         sequence: u32,
-        deadline: u64,
+        deadline: Ticks,
         pointer: usize,
     },
     SentinelWake {
         token: u32,
-        deadline: u64,
+        deadline: Ticks,
     },
     Dma,
     Event {
@@ -39,7 +41,7 @@ pub enum Wait {
     None,
     Receive {
         endpoint: usize,
-        handle: u32,
+        handle: Handle,
         pointer: usize,
         capacity: usize,
     },
@@ -47,21 +49,21 @@ pub enum Wait {
         token: u32,
         pointer: usize,
         capacity: usize,
-        server: usize,
-        until: u64,
+        server: ThreadSlot,
+        until: Option<Ticks>,
     },
     Sleep {
-        until: u64,
+        until: Ticks,
     },
 }
 #[derive(Clone, Copy)]
 pub struct Thread<C: Copy> {
-    pub id: u32,
+    pub id: Tid,
     pub wait: Wait,
     pub state: State,
     pub context: C,
     pub entry: usize,
-    pub process: usize,
+    pub process: ProcSlot,
     pub priority: u8,
     pub effective_priority: u8,
     pub affinity: u8,

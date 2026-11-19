@@ -3,6 +3,7 @@ pub mod capability;
 pub mod dma;
 pub mod elf;
 pub mod errno;
+pub mod id;
 pub mod ipc;
 pub mod memory;
 pub mod process;

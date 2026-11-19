@@ -1,6 +1,10 @@
 //! Process-local, generational capabilities. Grants are deliberately one-level:
 //! recipients cannot forward GRANT/CONTROL; owner revocation is object-wide.
-use crate::{errno::Errno, task::Region};
+use crate::{
+    errno::Errno,
+    id::{Handle, Pid},
+    task::Region,
+};
 pub const READ: u16 = 1;
 pub const WRITE: u16 = 2;
 pub const EXECUTE: u16 = 4;
@@ -13,7 +17,7 @@ pub const CONTROL: u16 = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     Endpoint { index: usize, generation: u32 },
-    Memory { owner: u32, region: Region },
+    Memory { owner: Pid, region: Region },
     Event { index: usize, generation: u32 },
 }
 #[derive(Clone, Copy)]
@@ -47,7 +51,7 @@ impl Table {
             slots: [Slot::EMPTY; 16],
         }
     }
-    pub fn install(&mut self, cap: Capability) -> Result<u32, Errno> {
+    pub fn install(&mut self, cap: Capability) -> Result<Handle, Errno> {
         let (i, s) = self
             .slots
             .iter_mut()
@@ -56,24 +60,25 @@ impl Table {
             .ok_or(Errno::Enospc)?;
         s.generation += 1;
         s.cap = Some(cap);
-        Ok((s.generation << 8) | (i as u32 + 1))
+        Ok(Handle((s.generation << 8) | (i as u32 + 1)))
     }
-    fn slot(&self, handle: u32) -> Result<usize, Errno> {
-        let i = (handle & 255).wrapping_sub(1) as usize;
+    fn slot(&self, handle: Handle) -> Result<usize, Errno> {
+        let raw = handle.raw();
+        let i = (raw & 255).wrapping_sub(1) as usize;
         let s = self.slots.get(i).ok_or(Errno::Ebadf)?;
-        if s.generation != handle >> 8 || s.cap.is_none() {
+        if s.generation != raw >> 8 || s.cap.is_none() {
             return Err(Errno::Ebadf);
         }
         Ok(i)
     }
-    pub fn get(&self, handle: u32, rights: u16) -> Result<Capability, Errno> {
+    pub fn get(&self, handle: Handle, rights: u16) -> Result<Capability, Errno> {
         let cap = self.slots[self.slot(handle)?].cap.ok_or(Errno::Ebadf)?;
         if cap.rights & rights != rights {
             return Err(Errno::Eperm);
         }
         Ok(cap)
     }
-    pub fn close(&mut self, handle: u32) -> Result<Capability, Errno> {
+    pub fn close(&mut self, handle: Handle) -> Result<Capability, Errno> {
         let i = self.slot(handle)?;
         self.slots[i].cap.take().ok_or(Errno::Ebadf)
     }
@@ -84,7 +89,7 @@ impl Table {
             }
         }
     }
-    pub fn find(&self, object: Object, rights: u16) -> Option<u32> {
+    pub fn find(&self, object: Object, rights: u16) -> Option<Handle> {
         self.slots
             .iter()
             .enumerate()
@@ -92,7 +97,7 @@ impl Table {
                 s.cap
                     .is_some_and(|c| c.object == object && c.rights & rights == rights)
             })
-            .map(|(i, s)| (s.generation << 8) | (i as u32 + 1))
+            .map(|(i, s)| Handle((s.generation << 8) | (i as u32 + 1)))
     }
     pub fn clear(&mut self) {
         for s in &mut self.slots {

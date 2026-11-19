@@ -1,6 +1,6 @@
 //! Single-hart IPC. Serialize with scheduler under masked machine IRQs.
 //! No user pointers inside this module.
-use crate::{capability::Object, errno::Errno};
+use crate::{capability::Object, errno::Errno, id::ProcSlot};
 pub const MAX_ENDPOINTS: usize = 8;
 pub const HANDLES: usize = 6;
 pub const MESSAGE_BYTES: usize = 96;
@@ -22,7 +22,7 @@ impl Message {
 }
 #[derive(Clone, Copy)]
 struct Endpoint {
-    owner: Option<usize>,
+    owner: Option<ProcSlot>,
     generation: u32,
     queue: [Message; QUEUE_DEPTH],
     head: usize,
@@ -63,7 +63,7 @@ impl Ipc {
         }
         Ok(index)
     }
-    pub fn create(&mut self, owner: usize) -> Result<Object, Errno> {
+    pub fn create(&mut self, owner: ProcSlot) -> Result<Object, Errno> {
         let index = self
             .endpoints
             .iter()
@@ -80,7 +80,7 @@ impl Ipc {
             generation: self.generation,
         })
     }
-    pub fn owner(&self, index: usize) -> Option<usize> {
+    pub fn owner(&self, index: usize) -> Option<ProcSlot> {
         self.endpoints.get(index)?.owner
     }
     pub fn object(&self, index: usize) -> Object {
@@ -123,7 +123,7 @@ impl Ipc {
     pub fn close(&mut self, ep: usize) {
         self.endpoints[ep] = Endpoint::EMPTY;
     }
-    pub fn remove_task(&mut self, task: usize) -> [bool; MAX_ENDPOINTS] {
+    pub fn remove_task(&mut self, task: ProcSlot) -> [bool; MAX_ENDPOINTS] {
         let mut closed = [false; MAX_ENDPOINTS];
         for (ep, flag) in closed.iter_mut().enumerate() {
             if self.endpoints[ep].owner == Some(task) {
@@ -138,7 +138,7 @@ impl Ipc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::Region;
+    use crate::{id::Pid, task::Region};
 
     fn make_message(bytes: &[u8], token: u32) -> Message {
         let mut msg = Message::EMPTY;
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn fifo_delivery_backpressure_and_non_destructive_emsgsize() {
         let mut ipc = Ipc::new();
-        let obj = ipc.create(1).unwrap();
+        let obj = ipc.create(ProcSlot(1)).unwrap();
         let ep = ipc.resolve(obj).unwrap();
 
         assert!(ipc.receive(ep, MESSAGE_BYTES).unwrap().is_none());
@@ -183,17 +183,17 @@ mod tests {
         let mut ipc = Ipc::new();
         assert_eq!(
             ipc.resolve(Object::Memory {
-                owner: 1,
+                owner: Pid(1),
                 region: Region::default(),
             }),
             Err(Errno::Ebadf)
         );
-        let e0 = ipc.create(1).unwrap();
-        let e1 = ipc.create(2).unwrap();
+        let e0 = ipc.create(ProcSlot(1)).unwrap();
+        let e1 = ipc.create(ProcSlot(2)).unwrap();
         let idx0 = ipc.resolve(e0).unwrap();
         let idx1 = ipc.resolve(e1).unwrap();
 
-        let closed = ipc.remove_task(1);
+        let closed = ipc.remove_task(ProcSlot(1));
         assert!(closed[idx0]);
         assert!(!closed[idx1]);
         assert_eq!(ipc.resolve(e0), Err(Errno::Epipe));
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(ipc.resolve(e1), Ok(idx1));
 
         // Slot reuse gets a new generation so stale objects stay invalid.
-        let e0_new = ipc.create(3).unwrap();
+        let e0_new = ipc.create(ProcSlot(3)).unwrap();
         assert_eq!(ipc.resolve(e0_new), Ok(idx0));
         assert_eq!(ipc.resolve(e0), Err(Errno::Epipe));
     }
@@ -210,8 +210,8 @@ mod tests {
     fn endpoint_table_exhaustion_returns_enospc() {
         let mut ipc = Ipc::new();
         for _ in 0..MAX_ENDPOINTS {
-            ipc.create(1).unwrap();
+            ipc.create(ProcSlot(1)).unwrap();
         }
-        assert_eq!(ipc.create(1), Err(Errno::Enospc));
+        assert_eq!(ipc.create(ProcSlot(1)), Err(Errno::Enospc));
     }
 }

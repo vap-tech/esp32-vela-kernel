@@ -2,8 +2,9 @@ use core::fmt::Write;
 use vela_kernel::{
     capability::{self as cap, Object},
     errno::Errno,
+    id::{Handle, Pid, ProcSlot, ThreadSlot},
     ipc::{self, Message},
-    process::{Lifecycle, WRITE},
+    process::WRITE,
     sched::TASKS,
     task::{State, Wait},
 };
@@ -18,7 +19,7 @@ use crate::{
 impl Runtime {
     pub(super) fn sys_ipc_call(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
@@ -36,7 +37,7 @@ impl Runtime {
         if !self.readable(args.a1 as usize, length) || !self.writable(args.a3 as usize, capacity) {
             return Err(Errno::Efault);
         }
-        let ep = self.endpoint(current, args.a0, cap::SEND)?;
+        let ep = self.endpoint(current, Handle(args.a0), cap::SEND)?;
         let server_process = self.ipc.owner(ep).unwrap();
         // No self-process RPC: avoid an unbounded dependency on caller-owned locks.
         if server_process == current {
@@ -47,23 +48,24 @@ impl Runtime {
             .tasks
             .iter()
             .position(|t| t.process == server_process && t.state != State::Terminated)
+            .map(ThreadSlot)
             .ok_or(Errno::Epipe)?;
         let mut dependency = server;
         for _ in 0..TASKS {
             if dependency == thread {
                 return Err(Errno::Edeadlk);
             }
-            if let Wait::Reply { server, .. } = self.scheduler.tasks[dependency].wait {
+            if let Wait::Reply { server, .. } = self.scheduler.task(dependency).wait {
                 dependency = server;
             } else {
                 break;
             }
         }
-        if self.calls[thread].generation == 0x7f_ffff {
+        if self.calls[thread.index()].generation == 0x7f_ffff {
             return Err(Errno::Enospc);
         }
-        let generation = self.calls[thread].generation + 1;
-        let token = (generation << 8) | (thread as u32 + 1);
+        let generation = self.calls[thread.index()].generation + 1;
+        let token = (generation << 8) | (thread.index() as u32 + 1);
         let mut message = Message::EMPTY;
         message.length = length;
         message.reply_token = token;
@@ -72,16 +74,16 @@ impl Runtime {
             message.data[i] = unsafe { (args.a1 as *const u8).add(i).read() };
         }
         self.ipc.send(ep, message)?;
-        self.calls[thread] = Call {
+        self.calls[thread.index()] = Call {
             generation,
             active: true,
             endpoint: ep,
             server: None,
         };
         let until = if timeout == 0 {
-            0
+            None
         } else {
-            self.scheduler.snapshot().uptime_ticks + u64::from(timeout)
+            Some(self.scheduler.uptime().saturating_add(u64::from(timeout)))
         };
         self.scheduler.block(Wait::Reply {
             token,
@@ -98,17 +100,18 @@ impl Runtime {
 
     pub(super) fn sys_ipc_reply(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        let client = (args.a0 & 255).wrapping_sub(1) as usize;
-        let call = self.calls.get(client).copied().ok_or(Errno::Ebadf)?;
+        let client_idx = (args.a0 & 255).wrapping_sub(1) as usize;
+        let call = self.calls.get(client_idx).copied().ok_or(Errno::Ebadf)?;
+        let client = ThreadSlot(client_idx);
         if !call.active || call.generation != args.a0 >> 8 {
             return Err(Errno::Epipe);
         }
         let server = call.server.ok_or(Errno::Eperm)?;
-        if self.scheduler.tasks[server].process != current {
+        if self.scheduler.task(server).process != current {
             return Err(Errno::Eperm);
         }
         let Wait::Reply {
@@ -116,7 +119,7 @@ impl Runtime {
             pointer,
             capacity,
             ..
-        } = self.scheduler.tasks[client].wait
+        } = self.scheduler.task(client).wait
         else {
             return Err(Errno::Epipe);
         };
@@ -126,9 +129,11 @@ impl Runtime {
         if args.a2 as usize > capacity || args.a2 as usize > ipc::MESSAGE_BYTES {
             return Err(Errno::Emsgsize);
         }
-        let target = self.scheduler.tasks[client].process;
+        let target = self.scheduler.task(client).process;
         if !self.readable(args.a1 as usize, args.a2 as usize)
-            || !self.processes.slots[target]
+            || !self
+                .processes
+                .slot(target)
                 .memory
                 .permits(pointer, capacity, WRITE)
         {
@@ -143,8 +148,8 @@ impl Runtime {
         unsafe {
             deliver(pointer, &message);
         }
-        self.scheduler.tasks[client].context.registers[8] = args.a2;
-        self.calls[client].active = false;
+        self.scheduler.task_mut(client).context.registers[8] = args.a2;
+        self.calls[client.index()].active = false;
         self.scheduler.wake(client);
         self.scheduler.inherit();
         self.scheduler.prefer(client);
@@ -154,15 +159,10 @@ impl Runtime {
 
     pub(super) fn sys_cap_or_mem_grant(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
     ) -> Result<u32, Errno> {
-        let peer = match self
-            .processes
-            .slots
-            .iter()
-            .position(|p| p.state == Lifecycle::Alive && p.id == args.a1)
-        {
+        let peer = match self.processes.find_alive(Pid(args.a1)) {
             Some(p) if p != current => p,
             _ => return Err(Errno::Einval),
         };
@@ -170,44 +170,53 @@ impl Runtime {
             return Err(Errno::Einval);
         }
         let rights = args.a2 as u16;
-        let source = self.processes.slots[current]
+        let source_handle = Handle(args.a0);
+        let source = self
+            .processes
+            .slot(current)
             .capabilities
-            .get(args.a0, cap::GRANT)?;
+            .get(source_handle, cap::GRANT)?;
         if let Object::Memory { region, .. } = source.object {
             if rights & !(cap::READ | cap::WRITE) != 0 || rights & cap::READ == 0 {
                 return Err(Errno::Einval);
             }
-            let handle = grant(&mut self.processes, current, args.a0, peer, rights)?;
-            if let Err(e) = self.processes.slots[peer]
+            let handle = grant(&mut self.processes, current, source_handle, peer, rights)?;
+            if let Err(e) = self
+                .processes
+                .slot_mut(peer)
                 .memory
                 .insert(region, rights as u8)
             {
-                self.processes.slots[peer]
+                self.processes
+                    .slot_mut(peer)
                     .capabilities
                     .close(handle)
                     .unwrap();
                 return Err(e);
             }
-            Ok(handle)
+            Ok(handle.raw())
         } else if args.number == syscall::MEM_GRANT {
             Err(Errno::Einval)
         } else {
-            grant(&mut self.processes, current, args.a0, peer, rights)
+            grant(&mut self.processes, current, source_handle, peer, rights).map(Handle::raw)
         }
     }
 
-    pub(super) fn sys_cap_revoke(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
-        let c = self.processes.slots[current]
+    pub(super) fn sys_cap_revoke(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        let c = self
+            .processes
+            .slot(current)
             .capabilities
-            .get(args.a0, cap::CONTROL)?;
+            .get(Handle(args.a0), cap::CONTROL)?;
         self.invalidate_object(c.object, Some(current));
         if let Object::Endpoint { index, .. } = c.object {
             for i in 0..TASKS {
+                let thread = ThreadSlot(i);
                 if self.calls[i].active
                     && self.calls[i].endpoint == index
-                    && self.scheduler.tasks[i].process != current
+                    && self.scheduler.task(thread).process != current
                 {
-                    self.fail_call(i, Errno::Epipe);
+                    self.fail_call(thread, Errno::Epipe);
                 }
             }
             self.complete_receivers(index, false);
@@ -215,26 +224,32 @@ impl Runtime {
         Ok(0)
     }
 
-    pub(super) fn sys_endpoint_create(&mut self, current: usize) -> Result<u32, Errno> {
-        create_endpoint(&mut self.ipc, &mut self.processes, current)
+    pub(super) fn sys_endpoint_create(&mut self, current: ProcSlot) -> Result<u32, Errno> {
+        create_endpoint(&mut self.ipc, &mut self.processes, current).map(Handle::raw)
     }
 
-    pub(super) fn sys_endpoint_close(&mut self, current: usize, args: Args) -> Result<u32, Errno> {
-        let capability = self.processes.slots[current].capabilities.get(args.a0, 0)?;
+    pub(super) fn sys_endpoint_close(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+    ) -> Result<u32, Errno> {
+        let handle = Handle(args.a0);
+        let capability = self.processes.slot(current).capabilities.get(handle, 0)?;
         let ep = self.ipc.resolve(capability.object)?;
         if capability.rights & cap::CONTROL != 0 {
             for i in 0..TASKS {
                 if self.calls[i].active && self.calls[i].endpoint == ep {
-                    self.fail_call(i, Errno::Epipe);
+                    self.fail_call(ThreadSlot(i), Errno::Epipe);
                 }
             }
             self.ipc.close(ep);
             self.invalidate_object(capability.object, None);
             self.complete_receivers(ep, true);
         } else {
-            self.processes.slots[current]
+            self.processes
+                .slot_mut(current)
                 .capabilities
-                .close(args.a0)
+                .close(handle)
                 .unwrap();
             self.complete_receivers(ep, false);
         }
@@ -243,7 +258,7 @@ impl Runtime {
 
     pub(super) fn sys_send(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
@@ -255,7 +270,7 @@ impl Runtime {
             return Err(Errno::Efault);
         }
         // Validate namespace/rights before touching sender's data.
-        let ep = self.endpoint(current, args.a0, ipc::SEND)?;
+        let ep = self.endpoint(current, Handle(args.a0), ipc::SEND)?;
         let mut message = Message::EMPTY;
         message.length = length;
         for i in 0..length {
@@ -271,7 +286,7 @@ impl Runtime {
 
     pub(super) fn sys_recv(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         frame: &mut arch::TrapFrame,
         switch: &mut bool,
@@ -283,7 +298,8 @@ impl Runtime {
         if !self.writable(args.a1 as usize, capacity) {
             return Err(Errno::Efault);
         }
-        let ep = self.endpoint(current, args.a0, ipc::RECEIVE)?;
+        let handle = Handle(args.a0);
+        let ep = self.endpoint(current, handle, ipc::RECEIVE)?;
         match self.ipc.receive(ep, capacity)? {
             Some(message) => {
                 self.bind_reply(message.reply_token, self.scheduler.current);
@@ -300,14 +316,18 @@ impl Runtime {
                 // transaction, so send cannot race and lose the wakeup.
                 self.scheduler.block(Wait::Receive {
                     endpoint: ep,
-                    handle: args.a0,
+                    handle,
                     pointer: args.a1 as usize,
                     capacity,
                 });
                 *switch = true;
                 if !self.logged_block {
                     self.logged_block = true;
-                    let _ = writeln!(self.console, "[ipc] recv blocked task={}", current + 1);
+                    let _ = writeln!(
+                        self.console,
+                        "[ipc] recv blocked task={}",
+                        current.index() + 1
+                    );
                 }
                 Ok(0) // replaced with completed length/error before wakeup
             }

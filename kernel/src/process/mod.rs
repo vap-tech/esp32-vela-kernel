@@ -1,5 +1,10 @@
 //! Process-owned address spaces. Slot indices never cross the user ABI.
-use crate::{capability::Table, errno::Errno, task::Region};
+use crate::{
+    capability::Table,
+    errno::Errno,
+    id::{Pid, ProcSlot},
+    task::Region,
+};
 pub const PROCESSES: usize = 8;
 pub const REGIONS: usize = 6;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,7 +102,7 @@ impl AddressSpace {
 }
 #[derive(Clone, Copy)]
 pub struct Process {
-    pub id: u32,
+    pub id: Pid,
     pub state: Lifecycle,
     pub memory: AddressSpace,
     pub capabilities: Table,
@@ -105,7 +110,7 @@ pub struct Process {
 }
 impl Process {
     pub const EMPTY: Self = Self {
-        id: 0,
+        id: Pid::NONE,
         state: Lifecycle::Free,
         memory: AddressSpace::EMPTY,
         capabilities: Table::new(),
@@ -114,7 +119,7 @@ impl Process {
 }
 pub struct Processes {
     pub slots: [Process; PROCESSES],
-    next_id: u32,
+    next_id: Pid,
 }
 impl Default for Processes {
     fn default() -> Self {
@@ -125,17 +130,29 @@ impl Processes {
     pub const fn new() -> Self {
         Self {
             slots: [Process::EMPTY; PROCESSES],
-            next_id: 1,
+            next_id: Pid(1),
         }
     }
-    pub fn create(&mut self, memory: AddressSpace) -> Result<usize, Errno> {
+    pub fn slot(&self, slot: ProcSlot) -> &Process {
+        &self.slots[slot.index()]
+    }
+    pub fn slot_mut(&mut self, slot: ProcSlot) -> &mut Process {
+        &mut self.slots[slot.index()]
+    }
+    pub fn find_alive(&self, pid: Pid) -> Option<ProcSlot> {
+        self.slots
+            .iter()
+            .position(|p| p.state == Lifecycle::Alive && p.id == pid)
+            .map(ProcSlot)
+    }
+    pub fn create(&mut self, memory: AddressSpace) -> Result<ProcSlot, Errno> {
         let index = self
             .slots
             .iter()
             .position(|p| p.state == Lifecycle::Free)
             .ok_or(Errno::Enospc)?;
         let id = self.next_id;
-        self.next_id = id.checked_add(1).ok_or(Errno::Eoverflow)?;
+        self.next_id = id.checked_next().ok_or(Errno::Eoverflow)?;
         self.slots[index] = Process {
             id,
             state: Lifecycle::Alive,
@@ -143,7 +160,7 @@ impl Processes {
             capabilities: Table::new(),
             priority_ceiling: 1,
         };
-        Ok(index)
+        Ok(ProcSlot(index))
     }
 }
 
@@ -237,14 +254,14 @@ mod tests {
         let mut procs = Processes::new();
         for i in 0..PROCESSES {
             let slot = procs.create(AddressSpace::EMPTY).unwrap();
-            assert_eq!(slot, i);
-            assert_eq!(procs.slots[slot].id, i as u32 + 1);
+            assert_eq!(slot, ProcSlot(i));
+            assert_eq!(procs.slot(slot).id, Pid(i as u32 + 1));
         }
         assert_eq!(procs.create(AddressSpace::EMPTY), Err(Errno::Enospc));
 
-        procs.slots[0] = Process::EMPTY;
+        *procs.slot_mut(ProcSlot(0)) = Process::EMPTY;
         let reused = procs.create(AddressSpace::EMPTY).unwrap();
-        assert_eq!(reused, 0);
-        assert_eq!(procs.slots[reused].id, PROCESSES as u32 + 1);
+        assert_eq!(reused, ProcSlot(0));
+        assert_eq!(procs.slot(reused).id, Pid(PROCESSES as u32 + 1));
     }
 }

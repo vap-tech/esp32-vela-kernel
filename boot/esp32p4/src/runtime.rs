@@ -2,6 +2,7 @@ use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     capability::{self as cap, Capability, Object},
     errno::Errno,
+    id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks},
     ipc::{self, Ipc, Message},
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
@@ -17,7 +18,7 @@ pub struct Call {
     pub generation: u32,
     pub active: bool,
     pub endpoint: usize,
-    pub server: Option<usize>,
+    pub server: Option<ThreadSlot>,
 }
 
 impl Call {
@@ -32,7 +33,7 @@ impl Call {
 pub struct Runtime {
     pub scheduler: Scheduler<arch::TrapFrame>,
     pub processes: Processes,
-    pub active_space: Option<(usize, u32)>,
+    pub active_space: Option<(ProcSlot, u32)>,
     pub pmp_images: [Option<(u32, pmp::Prepared)>; vela_kernel::process::PROCESSES],
     pub allocator: RegionAllocator,
     pub console: soc::console::Console,
@@ -42,7 +43,7 @@ pub struct Runtime {
     pub in_idle: bool,
     pub dma: vela_kernel::dma::Lease,
     pub dma_length: usize,
-    pub dma_deadline: u64,
+    pub dma_deadline: Ticks,
     pub sentinel_epoch: Option<u32>,
     pub sentinel_ready: bool,
     pub sentinel_wake: Option<WakeTicket>,
@@ -56,7 +57,7 @@ pub struct Runtime {
     pub display_mode: u8,
     pub display_stage: u8,
     pub sentinel_heartbeat: bool,
-    pub sentinel_next_beat: u64,
+    pub sentinel_next_beat: Ticks,
     pub sentinel_notifications: u32,
     pub sentinel_last_publish: u32,
     pub usb_rx_interrupts: u64,
@@ -90,10 +91,10 @@ pub unsafe fn deliver(pointer: usize, message: &Message) {
 pub fn create_endpoint(
     ipc: &mut Ipc,
     processes: &mut Processes,
-    owner: usize,
-) -> Result<u32, Errno> {
+    owner: ProcSlot,
+) -> Result<Handle, Errno> {
     let object = ipc.create(owner)?;
-    match processes.slots[owner].capabilities.install(Capability {
+    match processes.slot_mut(owner).capabilities.install(Capability {
         object,
         rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL,
     }) {
@@ -108,18 +109,16 @@ pub fn create_endpoint(
 
 pub fn grant(
     processes: &mut Processes,
-    owner: usize,
-    handle: u32,
-    peer: usize,
+    owner: ProcSlot,
+    handle: Handle,
+    peer: ProcSlot,
     rights: u16,
-) -> Result<u32, Errno> {
-    let source = processes.slots[owner]
-        .capabilities
-        .get(handle, cap::GRANT)?;
+) -> Result<Handle, Errno> {
+    let source = processes.slot(owner).capabilities.get(handle, cap::GRANT)?;
     if rights == 0 || rights & !source.rights != 0 || rights & (cap::CONTROL | cap::GRANT) != 0 {
         return Err(Errno::Eperm);
     }
-    processes.slots[peer].capabilities.install(Capability {
+    processes.slot_mut(peer).capabilities.install(Capability {
         object: source.object,
         rights,
     })
@@ -129,12 +128,13 @@ impl Runtime {
     pub fn finish_wake_waiter(&mut self, ticket: WakeTicket, result: u32, elapsed: u32) -> bool {
         if let Some(i) = self.scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked
-                && self.processes.slots[t.process].id == ticket.owner
+                && self.processes.slot(t.process).id == ticket.owner
                 && matches!(t.wait, Wait::SentinelWake { token, .. } if token == ticket.token)
         }) {
-            self.scheduler.tasks[i].context.registers[8] = result;
-            self.scheduler.tasks[i].context.registers[9] = elapsed;
-            self.scheduler.wake(i);
+            let thread = ThreadSlot(i);
+            self.scheduler.task_mut(thread).context.registers[8] = result;
+            self.scheduler.task_mut(thread).context.registers[9] = elapsed;
+            self.scheduler.wake(thread);
             return true;
         }
         false
@@ -153,15 +153,11 @@ impl Runtime {
         }
         // Read actual SYSTIMER elapsed time, not the requested delay or delivered IRQ count.
         // SAFETY: MIE=0, hart0 has exclusive ownership of SYSTIMER snapshot.
-        let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wake snapshot");
+        let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wake snapshot"));
         let elapsed = now.saturating_sub(ticket.started).min(u64::from(u32::MAX)) as u32;
         ticket.phase = WakePhase::Fired(elapsed);
         self.sentinel_wake = Some(ticket);
-        let alive = self
-            .processes
-            .slots
-            .iter()
-            .any(|p| p.id == ticket.owner && p.state == Lifecycle::Alive);
+        let alive = self.processes.find_alive(ticket.owner).is_some();
         if !alive || self.finish_wake_waiter(ticket, ticket.token, elapsed) {
             self.sentinel_wake = None;
         }
@@ -284,7 +280,8 @@ impl Runtime {
         }) else {
             return;
         };
-        let Wait::Sentinel { pointer, .. } = self.scheduler.tasks[i].wait else {
+        let thread = ThreadSlot(i);
+        let Wait::Sentinel { pointer, .. } = self.scheduler.task(thread).wait else {
             unreachable!()
         };
         let result = if error {
@@ -292,8 +289,8 @@ impl Runtime {
         } else if pointer == 0 {
             reply.request
         } else {
-            let process = self.scheduler.tasks[i].process;
-            if !self.processes.slots[process].memory.permits(
+            let process = self.scheduler.task(thread).process;
+            if !self.processes.slot(process).memory.permits(
                 pointer,
                 sentinel_wire::LOG_BYTES,
                 WRITE,
@@ -331,8 +328,8 @@ impl Runtime {
                     _ => unreachable!(),
                 };
                 if command == sentinel_wire::LOG_READ && values[0] != self.sentinel_argument {
-                    self.scheduler.tasks[i].context.registers[8] = Errno::Einval.to_abi();
-                    self.scheduler.wake(i);
+                    self.scheduler.task_mut(thread).context.registers[8] = Errno::Einval.to_abi();
+                    self.scheduler.wake(thread);
                     return;
                 }
                 for (index, value) in values.into_iter().enumerate() {
@@ -346,16 +343,17 @@ impl Runtime {
                 sentinel_wire::LOG_BYTES as u32
             }
         };
-        self.scheduler.tasks[i].context.registers[8] = result;
-        self.scheduler.tasks[i].context.registers[9] = if command == sentinel_wire::LOG_META {
+        self.scheduler.task_mut(thread).context.registers[8] = result;
+        self.scheduler.task_mut(thread).context.registers[9] = if command == sentinel_wire::LOG_META
+        {
             self.sentinel_diagnostics
         } else {
             self.sentinel_notifications
         };
-        self.scheduler.wake(i);
+        self.scheduler.wake(thread);
     }
 
-    pub fn sentinel_tick(&mut self, uptime: u64) {
+    pub fn sentinel_tick(&mut self, uptime: Ticks) {
         if self.heartbeat_link.retry_due(uptime) {
             // Keep the slot and payload stable until the original heartbeat completes.
             unsafe {
@@ -379,13 +377,14 @@ impl Runtime {
         }
     }
 
-    pub fn bind_reply(&mut self, token: u32, server: usize) {
+    pub fn bind_reply(&mut self, token: u32, server: ThreadSlot) {
         if token == 0 {
             return;
         }
-        let client = (token & 255).wrapping_sub(1) as usize;
-        if let Some(call) = self.calls.get_mut(client) {
+        let client_idx = (token & 255).wrapping_sub(1) as usize;
+        if let Some(call) = self.calls.get_mut(client_idx) {
             if call.active && call.generation == token >> 8 {
+                let client = ThreadSlot(client_idx);
                 call.server = Some(server);
                 if let Wait::Reply {
                     token,
@@ -393,9 +392,9 @@ impl Runtime {
                     capacity,
                     until,
                     ..
-                } = self.scheduler.tasks[client].wait
+                } = self.scheduler.task(client).wait
                 {
-                    self.scheduler.tasks[client].wait = Wait::Reply {
+                    self.scheduler.task_mut(client).wait = Wait::Reply {
                         token,
                         pointer,
                         capacity,
@@ -407,55 +406,70 @@ impl Runtime {
         }
     }
 
-    pub fn fail_call(&mut self, client: usize, error: Errno) {
-        self.calls[client].active = false;
-        if matches!(self.scheduler.tasks[client].wait, Wait::Reply { .. }) {
-            self.scheduler.tasks[client].context.registers[8] = error.to_abi();
+    pub fn fail_call(&mut self, client: ThreadSlot, error: Errno) {
+        self.calls[client.index()].active = false;
+        if matches!(self.scheduler.task(client).wait, Wait::Reply { .. }) {
+            self.scheduler.task_mut(client).context.registers[8] = error.to_abi();
             self.scheduler.wake(client);
         }
     }
 
-    pub fn expire_calls(&mut self, uptime: u64) {
+    pub fn expire_calls(&mut self, uptime: Ticks) {
         for i in 0..TASKS {
+            let client = ThreadSlot(i);
             if self.calls[i].active {
-                if let Wait::Reply { until, .. } = self.scheduler.tasks[i].wait {
-                    if until != 0 && until <= uptime {
-                        self.fail_call(i, Errno::Etimedout);
+                if let Wait::Reply {
+                    until: Some(deadline),
+                    ..
+                } = self.scheduler.task(client).wait
+                {
+                    if deadline <= uptime {
+                        self.fail_call(client, Errno::Etimedout);
                     }
                 }
             }
         }
     }
 
-    pub fn endpoint(&self, process: usize, handle: u32, rights: u16) -> Result<usize, Errno> {
-        let capability = self.processes.slots[process]
+    pub fn endpoint(&self, process: ProcSlot, handle: Handle, rights: u16) -> Result<usize, Errno> {
+        let capability = self
+            .processes
+            .slot(process)
             .capabilities
             .get(handle, rights)?;
         self.ipc.resolve(capability.object)
     }
 
-    pub fn invalidate_object(&mut self, object: Object, keep_owner: Option<usize>) {
-        for process in 0..self.processes.slots.len() {
+    pub fn invalidate_object(&mut self, object: Object, keep_owner: Option<ProcSlot>) {
+        for idx in 0..self.processes.slots.len() {
+            let process = ProcSlot(idx);
             if Some(process) == keep_owner {
                 continue;
             }
-            self.processes.slots[process].capabilities.revoke(object);
+            self.processes.slot_mut(process).capabilities.revoke(object);
             if let Object::Memory { region, .. } = object {
-                if self.processes.slots[process]
+                if self
+                    .processes
+                    .slot(process)
                     .memory
                     .maps
                     .iter()
                     .any(|m| m.region == region)
                 {
-                    self.processes.slots[process].memory.remove(region).unwrap();
-                    for thread in 0..TASKS {
-                        if self.scheduler.tasks[thread].process == process {
+                    self.processes
+                        .slot_mut(process)
+                        .memory
+                        .remove(region)
+                        .unwrap();
+                    for thread_idx in 0..TASKS {
+                        let thread = ThreadSlot(thread_idx);
+                        if self.scheduler.task(thread).process == process {
                             if let Wait::Receive {
                                 pointer, capacity, ..
-                            } = self.scheduler.tasks[thread].wait
+                            } = self.scheduler.task(thread).wait
                             {
                                 if region.contains(pointer, capacity) {
-                                    self.scheduler.tasks[thread].context.registers[8] =
+                                    self.scheduler.task_mut(thread).context.registers[8] =
                                         Errno::Efault.to_abi();
                                     self.scheduler.wake(thread);
                                 }
@@ -468,7 +482,7 @@ impl Runtime {
     }
 
     pub fn memory(&self) -> &AddressSpace {
-        &self.processes.slots[self.scheduler.current().process].memory
+        &self.processes.slot(self.scheduler.current().process).memory
     }
 
     pub fn readable(&self, pointer: usize, length: usize) -> bool {
@@ -481,7 +495,8 @@ impl Runtime {
 
     pub fn complete_receivers(&mut self, endpoint: usize, closed: bool) {
         for i in 0..TASKS {
-            let task = self.scheduler.tasks[i];
+            let thread = ThreadSlot(i);
+            let task = *self.scheduler.task(thread);
             if task.state != State::Blocked {
                 continue;
             }
@@ -504,9 +519,11 @@ impl Runtime {
                 let value = match result {
                     Ok(None) => continue,
                     Ok(Some(message)) => {
-                        self.bind_reply(message.reply_token, i);
-                        self.scheduler.tasks[i].context.registers[9] = message.reply_token;
-                        if !self.processes.slots[task.process]
+                        self.bind_reply(message.reply_token, thread);
+                        self.scheduler.task_mut(thread).context.registers[9] = message.reply_token;
+                        if !self
+                            .processes
+                            .slot(task.process)
                             .memory
                             .permits(pointer, capacity, WRITE)
                         {
@@ -523,14 +540,14 @@ impl Runtime {
                 };
                 // Blocked ecall already advanced mepc and was saved. Update its
                 // own return register before making the task runnable.
-                self.scheduler.tasks[i].context.registers[8] = value;
-                self.scheduler.wake(i);
+                self.scheduler.task_mut(thread).context.registers[8] = value;
+                self.scheduler.wake(thread);
                 if let Wait::Receive { .. } = task.wait {
-                    self.scheduler.prefer(i);
+                    self.scheduler.prefer(thread);
                 }
                 if !self.logged_wake {
                     self.logged_wake = true;
-                    let _ = writeln!(self.console, "[ipc] receiver woke task={}", task.id);
+                    let _ = writeln!(self.console, "[ipc] receiver woke task={}", task.id.raw());
                 }
             }
         }
@@ -539,10 +556,10 @@ impl Runtime {
     pub fn terminate(&mut self) {
         let process = self.scheduler.current().process;
         let exiting = self.scheduler.current;
-        self.calls[exiting].active = false;
+        self.calls[exiting.index()].active = false;
         for i in 0..TASKS {
             if self.calls[i].active && self.calls[i].server == Some(exiting) {
-                self.fail_call(i, Errno::Epipe);
+                self.fail_call(ThreadSlot(i), Errno::Epipe);
             }
         }
         self.scheduler.terminate();
@@ -554,7 +571,7 @@ impl Runtime {
         {
             return;
         }
-        let owner = self.processes.slots[process].id;
+        let owner = self.processes.slot(process).id;
         if self
             .sentinel_wake
             .is_some_and(|ticket| ticket.release_on_exit(owner))
@@ -562,11 +579,11 @@ impl Runtime {
             self.sentinel_wake = None;
         }
         self.dma.release_process(owner);
-        self.processes.slots[process].state = Lifecycle::Dying;
+        self.processes.slot_mut(process).state = Lifecycle::Dying;
         let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
         for i in 0..TASKS {
             if self.calls[i].active && self.ipc.owner(self.calls[i].endpoint) == Some(process) {
-                self.fail_call(i, Errno::Epipe);
+                self.fail_call(ThreadSlot(i), Errno::Epipe);
             }
         }
         let closed = self.ipc.remove_task(process);
@@ -575,24 +592,28 @@ impl Runtime {
                 self.invalidate_object(objects[i], None);
             }
         }
-        for capability in self.processes.slots[process]
+        for capability in self
+            .processes
+            .slot(process)
             .capabilities
             .objects()
             .into_iter()
             .flatten()
         {
-            if let Object::Memory { owner, .. } = capability.object {
-                if owner == self.processes.slots[process].id {
+            if let Object::Memory {
+                owner: mem_owner, ..
+            } = capability.object
+            {
+                if mem_owner == owner {
                     self.invalidate_object(capability.object, Some(process));
                 }
             }
         }
-        self.processes.slots[process].capabilities.clear();
-        self.allocator
-            .release_owner(self.processes.slots[process].id);
-        self.processes.slots[process].state = Lifecycle::Free;
-        self.processes.slots[process].memory = AddressSpace::EMPTY;
-        self.pmp_images[process] = None;
+        self.processes.slot_mut(process).capabilities.clear();
+        self.allocator.release_owner(owner);
+        self.processes.slot_mut(process).state = Lifecycle::Free;
+        self.processes.slot_mut(process).memory = AddressSpace::EMPTY;
+        self.pmp_images[process.index()] = None;
         for (ep, is_closed) in closed.into_iter().enumerate() {
             if is_closed {
                 self.complete_receivers(ep, true);
@@ -600,10 +621,10 @@ impl Runtime {
         }
     }
 
-    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<u32, Errno> {
+    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<Pid, Errno> {
         let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| Errno::Enoexec)?;
         let process = self.processes.create(AddressSpace::EMPTY)?;
-        let owner = self.processes.slots[process].id;
+        let owner = self.processes.slot(process).id;
         let result = (|| {
             let mut space = AddressSpace::EMPTY;
             let bias = if image.pic {
@@ -687,14 +708,14 @@ impl Runtime {
             let frame = arch::TrapFrame::user(entry, stack.base + stack.size, arg);
             self.scheduler
                 .create_thread(process, frame, stack, entry, 1, 1)?;
-            self.processes.slots[process].memory = space;
-            self.pmp_images[process] = Some((space.revision, prepared));
+            self.processes.slot_mut(process).memory = space;
+            self.pmp_images[process.index()] = Some((space.revision, prepared));
             Ok(owner)
         })();
         if result.is_err() {
             self.dma.release_process(owner);
             self.allocator.release_owner(owner);
-            self.processes.slots[process] = vela_kernel::process::Process::EMPTY;
+            *self.processes.slot_mut(process) = vela_kernel::process::Process::EMPTY;
         }
         result
     }
@@ -703,25 +724,22 @@ impl Runtime {
         let Some(owner) = self.dma.finish(success) else {
             return;
         };
-        let Some(process) = self
-            .processes
-            .slots
-            .iter()
-            .position(|p| p.id == owner && p.state == Lifecycle::Alive)
-        else {
+        let Some(process) = self.processes.find_alive(owner) else {
             return;
         };
         if success {
-            self.processes.slots[process]
+            self.processes
+                .slot_mut(process)
                 .memory
                 .dma_access(soc::dma::page(), true)
                 .unwrap();
         }
         for i in 0..TASKS {
-            let t = &mut self.scheduler.tasks[i];
+            let thread = ThreadSlot(i);
+            let t = self.scheduler.task_mut(thread);
             if t.process == process && t.state == State::Blocked && matches!(t.wait, Wait::Dma) {
                 t.context.registers[8] = if success { 0 } else { Errno::Eio.to_abi() };
-                self.scheduler.wake(i);
+                self.scheduler.wake(thread);
             }
         }
     }

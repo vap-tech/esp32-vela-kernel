@@ -1,6 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{
     errno::Errno,
+    id::{ThreadSlot, Ticks},
     sched::TASKS,
     task::{State, Wait},
 };
@@ -43,7 +44,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         unsafe {
             soc::timer::acknowledge();
         }
-        let uptime = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER snapshot timeout");
+        let uptime =
+            Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER snapshot timeout"));
         if matches!(
             runtime.dma,
             vela_kernel::dma::Lease::Device(_) | vela_kernel::dma::Lease::Detached
@@ -56,20 +58,23 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         }
         if runtime.sentinel_pending {
             for i in 0..TASKS {
-                if matches!(runtime.scheduler.tasks[i].wait, Wait::Sentinel { deadline, .. } if uptime >= deadline)
+                let thread = ThreadSlot(i);
+                if matches!(runtime.scheduler.task(thread).wait, Wait::Sentinel { deadline, .. } if uptime >= deadline)
                 {
-                    runtime.scheduler.tasks[i].context.registers[8] = Errno::Etimedout.to_abi();
-                    runtime.scheduler.wake(i);
+                    runtime.scheduler.task_mut(thread).context.registers[8] =
+                        Errno::Etimedout.to_abi();
+                    runtime.scheduler.wake(thread);
                 }
             }
         }
         for i in 0..TASKS {
-            if runtime.scheduler.tasks[i].state == State::Blocked
-                && matches!(runtime.scheduler.tasks[i].wait, Wait::SentinelWake { deadline, .. } if uptime >= deadline)
+            let thread = ThreadSlot(i);
+            if runtime.scheduler.task(thread).state == State::Blocked
+                && matches!(runtime.scheduler.task(thread).wait, Wait::SentinelWake { deadline, .. } if uptime >= deadline)
             {
-                runtime.scheduler.tasks[i].context.registers[8] = Errno::Etimedout.to_abi();
-                runtime.scheduler.tasks[i].context.registers[9] = 0;
-                runtime.scheduler.wake(i);
+                runtime.scheduler.task_mut(thread).context.registers[8] = Errno::Etimedout.to_abi();
+                runtime.scheduler.task_mut(thread).context.registers[9] = 0;
+                runtime.scheduler.wake(thread);
                 // Keep the LP token reserved: a late event cannot complete a new alarm.
             }
         }
@@ -93,7 +98,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
             t.state == State::Blocked && matches!(t.wait, Wait::Event { object: CONSOLE_RX })
         }) {
-            runtime.scheduler.wake(i);
+            runtime.scheduler.wake(ThreadSlot(i));
             switch = from_idle || runtime.scheduler.should_preempt();
         } else {
             switch = from_idle;
@@ -105,7 +110,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         let _ = writeln!(
             runtime.console,
             "[fault] task={} cause={:#x} pc={:#x} value={:#x}",
-            runtime.scheduler.current().id,
+            runtime.scheduler.current().id.raw(),
             frame.mcause,
             frame.mepc,
             frame.mtval
@@ -135,17 +140,18 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         return &runtime.idle_frame;
     }
     runtime.in_idle = false;
-    let task = &mut runtime.scheduler.tasks[runtime.scheduler.current];
+    let current_thread = runtime.scheduler.current;
+    let task = runtime.scheduler.task_mut(current_thread);
     task.context.mcause = cause;
     let process = task.process;
-    let memory = runtime.processes.slots[process].memory;
+    let memory = runtime.processes.slot(process).memory;
     // SAFETY: activate only selected task's RX code / RW stack before mret.
     if runtime.active_space != Some((process, memory.revision)) {
-        let image = match runtime.pmp_images[process] {
+        let image = match runtime.pmp_images[process.index()] {
             Some((revision, image)) if revision == memory.revision => image,
             _ => {
                 let image = pmp::Prepared::new(&memory).unwrap();
-                runtime.pmp_images[process] = Some((memory.revision, image));
+                runtime.pmp_images[process.index()] = Some((memory.revision, image));
                 image
             }
         };

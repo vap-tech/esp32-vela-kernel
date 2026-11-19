@@ -1,6 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{
     capability::{self as cap, Capability},
+    id::{ProcSlot, Ticks},
     ipc::Ipc,
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
@@ -68,14 +69,18 @@ extern "C" fn rust_main() -> ! {
         processes.create(memory).unwrap();
     }
     // Explicit boot policy. Kernel IPC module has no service names/protocols.
+    let procfs = ProcSlot(0);
+    let shell = ProcSlot(1);
+    let console_proc = ProcSlot(2);
     let mut ipc = Ipc::new();
-    let request = create_endpoint(&mut ipc, &mut processes, 0).unwrap();
-    let reply = create_endpoint(&mut ipc, &mut processes, 1).unwrap();
-    let input = create_endpoint(&mut ipc, &mut processes, 1).unwrap();
-    let shell_request = grant(&mut processes, 0, request, 1, cap::SEND).unwrap();
-    let proc_reply = grant(&mut processes, 1, reply, 0, cap::SEND).unwrap();
-    let console_input = grant(&mut processes, 1, input, 2, cap::SEND).unwrap();
-    let rx_event = processes.slots[2]
+    let request = create_endpoint(&mut ipc, &mut processes, procfs).unwrap();
+    let reply = create_endpoint(&mut ipc, &mut processes, shell).unwrap();
+    let input = create_endpoint(&mut ipc, &mut processes, shell).unwrap();
+    let shell_request = grant(&mut processes, procfs, request, shell, cap::SEND).unwrap();
+    let proc_reply = grant(&mut processes, shell, reply, procfs, cap::SEND).unwrap();
+    let console_input = grant(&mut processes, shell, input, console_proc, cap::SEND).unwrap();
+    let rx_event = processes
+        .slot_mut(console_proc)
         .capabilities
         .install(Capability {
             object: CONSOLE_RX,
@@ -88,9 +93,9 @@ extern "C" fn rust_main() -> ! {
         users::console_main as *const () as usize,
     ];
     let args = [
-        [request, proc_reply, 0],
-        [reply, shell_request, input],
-        [console_input, rx_event, 0],
+        [request.raw(), proc_reply.raw(), 0],
+        [reply.raw(), shell_request.raw(), input.raw()],
+        [console_input.raw(), rx_event.raw(), 0],
     ];
     let contexts = core::array::from_fn(|i| {
         let mut frame =
@@ -100,7 +105,7 @@ extern "C" fn rust_main() -> ! {
         frame
     });
     // SAFETY: isolated physical regions, no users executing.
-    let initial_pmp = pmp::Prepared::new(&processes.slots[0].memory).unwrap();
+    let initial_pmp = pmp::Prepared::new(&processes.slot(procfs).memory).unwrap();
     assert!(unsafe { initial_pmp.activate() }, "PMP readback");
     let _ = writeln!(
         console,
@@ -117,16 +122,17 @@ extern "C" fn rust_main() -> ! {
     scheduler.tasks[0].effective_priority = 0;
     scheduler.tasks[2].priority = 2;
     scheduler.tasks[2].effective_priority = 2;
-    processes.slots[2].priority_ceiling = 2;
+    processes.slot_mut(console_proc).priority_ceiling = 2;
     let runtime = Runtime {
         scheduler,
         console,
-        active_space: Some((0, 2)),
+        active_space: Some((procfs, 2)),
         pmp_images: core::array::from_fn(|i| {
-            if processes.slots[i].state == Lifecycle::Alive {
+            let slot = ProcSlot(i);
+            if processes.slot(slot).state == Lifecycle::Alive {
                 Some((
-                    processes.slots[i].memory.revision,
-                    pmp::Prepared::new(&processes.slots[i].memory).unwrap(),
+                    processes.slot(slot).memory.revision,
+                    pmp::Prepared::new(&processes.slot(slot).memory).unwrap(),
                 ))
             } else {
                 None
@@ -143,7 +149,7 @@ extern "C" fn rust_main() -> ! {
         in_idle: false,
         dma: vela_kernel::dma::Lease::Free,
         dma_length: 0,
-        dma_deadline: 0,
+        dma_deadline: Ticks::ZERO,
         sentinel_epoch: None,
         sentinel_ready: false,
         sentinel_wake: None,
@@ -157,7 +163,7 @@ extern "C" fn rust_main() -> ! {
         display_mode: 1,
         display_stage: u8::MAX,
         sentinel_heartbeat: true,
-        sentinel_next_beat: 0,
+        sentinel_next_beat: Ticks::ZERO,
         sentinel_notifications: 0,
         sentinel_last_publish: 0,
         usb_rx_interrupts: 0,

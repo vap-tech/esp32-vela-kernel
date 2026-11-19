@@ -1,5 +1,6 @@
 use vela_kernel::{
     errno::Errno,
+    id::{Pid, ProcSlot, Ticks},
     sentinel::{WakePhase, WakeTicket},
     task::{State, Wait},
 };
@@ -10,10 +11,10 @@ use crate::{arch, runtime::Runtime, sentinel_wire, soc, syscall};
 impl Runtime {
     pub(super) fn sys_sentinel_control(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
     ) -> Result<u32, Errno> {
-        if self.processes.slots[current].id != 2 {
+        if self.processes.slot(current).id != Pid(2) {
             return Err(Errno::Eperm);
         }
         if args.a0 > 1 {
@@ -21,20 +22,20 @@ impl Runtime {
         }
         self.sentinel_heartbeat = args.a0 != 0;
         if self.sentinel_heartbeat {
-            self.sentinel_next_beat = 0;
+            self.sentinel_next_beat = Ticks::ZERO;
         }
         Ok(0)
     }
 
     pub(super) fn sys_sentinel_arm_or_prepare(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let sleep = args.number == syscall::SENTINEL_PREPARE_SLEEP;
-        let owner = self.processes.slots[current].id;
-        if owner != 2 {
+        let owner = self.processes.slot(current).id;
+        if owner != Pid(2) {
             return Err(Errno::Eperm);
         }
         if !(1..=60_000).contains(&args.a0) {
@@ -44,7 +45,7 @@ impl Runtime {
             return Err(Errno::Ebusy);
         }
         // SAFETY: sole hart snapshot owner under masked IRQs.
-        let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER arm snapshot");
+        let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER arm snapshot"));
         let sequence = self.sentinel_request(
             if sleep {
                 sentinel_wire::PREPARE_SLEEP
@@ -58,14 +59,14 @@ impl Runtime {
             token: sequence,
             owner,
             started: now,
-            expires: now + (u64::from(args.a0) + 9) / 10 + 100,
+            expires: now.saturating_add((u64::from(args.a0) + 9) / 10 + 100),
             delay_ms: args.a0,
             sleep,
             phase: WakePhase::Requested,
         });
         self.scheduler.block(Wait::Sentinel {
             sequence,
-            deadline: now + 100,
+            deadline: now.saturating_add(100),
             pointer: 0,
         });
         *switch = true;
@@ -74,13 +75,13 @@ impl Runtime {
 
     pub(super) fn sys_sentinel_wait_wake(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         frame: &mut arch::TrapFrame,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let ticket = self.sentinel_wake.ok_or(Errno::Enoent)?;
-        if ticket.owner != self.processes.slots[current].id {
+        if ticket.owner != self.processes.slot(current).id {
             return Err(Errno::Eperm);
         }
         if args.a0 != 0 && args.a0 != ticket.token {
@@ -98,7 +99,7 @@ impl Runtime {
             return Err(Errno::Ebusy);
         }
         // SAFETY: masked hart0 snapshot owner, no scheduler references escape.
-        let now = unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wait snapshot");
+        let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wait snapshot"));
         if now >= ticket.expires {
             return Err(Errno::Etimedout);
         }
@@ -112,12 +113,12 @@ impl Runtime {
 
     pub(super) fn sys_sentinel_cancel_wake(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let ticket = self.sentinel_wake.ok_or(Errno::Enoent)?;
-        if ticket.owner != self.processes.slots[current].id {
+        if ticket.owner != self.processes.slot(current).id {
             return Err(Errno::Eperm);
         }
         if args.a0 != 0 && args.a0 != ticket.token {
@@ -137,7 +138,7 @@ impl Runtime {
         )?;
         self.scheduler.block(Wait::Sentinel {
             sequence,
-            deadline: self.scheduler.snapshot().uptime_ticks + 100,
+            deadline: self.scheduler.uptime().saturating_add(100),
             pointer: 0,
         });
         *switch = true;
@@ -146,11 +147,11 @@ impl Runtime {
 
     pub(super) fn sys_sentinel_command(
         &mut self,
-        current: usize,
+        current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        if self.processes.slots[current].id != 2 {
+        if self.processes.slot(current).id != Pid(2) {
             return Err(Errno::Eperm);
         }
         let (command, arg0, arg1, pointer, size) = match args.number {
@@ -182,7 +183,7 @@ impl Runtime {
             return Err(Errno::Efault);
         }
         let sequence = self.sentinel_request(command, arg0, arg1)?;
-        let deadline = self.scheduler.snapshot().uptime_ticks.saturating_add(100);
+        let deadline = self.scheduler.uptime().saturating_add(100);
         self.scheduler.block(Wait::Sentinel {
             sequence,
             deadline,

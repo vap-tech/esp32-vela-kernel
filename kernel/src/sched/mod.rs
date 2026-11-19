@@ -1,5 +1,6 @@
 use crate::{
     errno::Errno,
+    id::{ProcSlot, ThreadSlot, Ticks, Tid},
     stats::{HZ, LoadAverage, Snapshot},
     task::{Region, State, Thread, Wait},
 };
@@ -12,13 +13,13 @@ pub const BOOT_THREADS: usize = 3;
 /// C is architecture-owned saved CPU state; this crate has no SoC dependency.
 pub struct Scheduler<C: Copy> {
     pub tasks: [Thread<C>; TASKS],
-    pub current: usize,
+    pub current: ThreadSlot,
     ticks: u64,
-    uptime: u64,
-    sampled_at: u64,
-    last_id: u32,
+    uptime: Ticks,
+    sampled_at: Ticks,
+    last_id: Tid,
     load: LoadAverage,
-    preferred: Option<usize>,
+    preferred: Option<ThreadSlot>,
 }
 impl<C: Copy> Scheduler<C> {
     pub fn new(
@@ -27,7 +28,11 @@ impl<C: Copy> Scheduler<C> {
         stacks: [Region; BOOT_THREADS],
     ) -> Self {
         let tasks = core::array::from_fn(|i| Thread {
-            id: if i < BOOT_THREADS { i as u32 + 1 } else { 0 },
+            id: if i < BOOT_THREADS {
+                Tid(i as u32 + 1)
+            } else {
+                Tid::NONE
+            },
             wait: Wait::None,
             state: if i >= BOOT_THREADS {
                 State::Terminated
@@ -38,7 +43,7 @@ impl<C: Copy> Scheduler<C> {
             },
             context: contexts[i.min(BOOT_THREADS - 1)],
             entry: entries[i.min(BOOT_THREADS - 1)],
-            process: i,
+            process: ProcSlot(i),
             priority: 1,
             effective_priority: 1,
             affinity: 1,
@@ -48,24 +53,33 @@ impl<C: Copy> Scheduler<C> {
         });
         Self {
             tasks,
-            current: 0,
+            current: ThreadSlot(0),
             ticks: 0,
-            uptime: 0,
-            sampled_at: 0,
-            last_id: BOOT_THREADS as u32,
+            uptime: Ticks::ZERO,
+            sampled_at: Ticks::ZERO,
+            last_id: Tid(BOOT_THREADS as u32),
             load: LoadAverage::default(),
             preferred: None,
         }
     }
+    pub fn task(&self, slot: ThreadSlot) -> &Thread<C> {
+        &self.tasks[slot.index()]
+    }
+    pub fn task_mut(&mut self, slot: ThreadSlot) -> &mut Thread<C> {
+        &mut self.tasks[slot.index()]
+    }
+    pub fn uptime(&self) -> Ticks {
+        self.uptime
+    }
     pub fn create_thread(
         &mut self,
-        process: usize,
+        process: ProcSlot,
         context: C,
         stack: Region,
         entry: usize,
         priority: u8,
         affinity: u8,
-    ) -> Result<u32, Errno> {
+    ) -> Result<Tid, Errno> {
         if priority > 3 || affinity == 0 || affinity & !3 != 0 {
             return Err(Errno::Einval);
         }
@@ -74,7 +88,7 @@ impl<C: Copy> Scheduler<C> {
             .iter()
             .position(|t| t.state == State::Terminated)
             .ok_or(Errno::Enospc)?;
-        let id = self.last_id.checked_add(1).ok_or(Errno::Eoverflow)?;
+        let id = self.last_id.checked_next().ok_or(Errno::Eoverflow)?;
         self.tasks[index] = Thread {
             id,
             process,
@@ -93,15 +107,16 @@ impl<C: Copy> Scheduler<C> {
         Ok(id)
     }
     pub fn current(&self) -> &Thread<C> {
-        &self.tasks[self.current]
+        &self.tasks[self.current.index()]
     }
     pub fn save(&mut self, context: C) {
-        self.tasks[self.current].context = context;
+        self.tasks[self.current.index()].context = context;
     }
-    pub fn tick(&mut self, uptime: u64) {
+    pub fn tick(&mut self, uptime: Ticks) {
         self.ticks += 1;
-        if self.tasks[self.current].state == State::Running {
-            self.tasks[self.current].runtime_ticks += uptime.saturating_sub(self.uptime);
+        let cur = self.current.index();
+        if self.tasks[cur].state == State::Running {
+            self.tasks[cur].runtime_ticks += uptime.saturating_sub(self.uptime);
         }
         for task in &mut self.tasks {
             if task.state == State::Blocked
@@ -114,13 +129,14 @@ impl<C: Copy> Scheduler<C> {
         self.uptime = uptime;
         while self.uptime.saturating_sub(self.sampled_at) >= 5 * HZ {
             self.load.sample(self.snapshot().runnable_tasks);
-            self.sampled_at += 5 * HZ;
+            self.sampled_at = self.sampled_at.saturating_add(5 * HZ);
         }
     }
-    pub fn select(&mut self, preemptive: bool) -> Option<usize> {
-        let was_running = self.tasks[self.current].state == State::Running;
+    pub fn select(&mut self, preemptive: bool) -> Option<ThreadSlot> {
+        let cur = self.current.index();
+        let was_running = self.tasks[cur].state == State::Running;
         if was_running {
-            self.tasks[self.current].state = State::Ready;
+            self.tasks[cur].state = State::Ready;
         }
         self.inherit();
         let best = self
@@ -130,31 +146,32 @@ impl<C: Copy> Scheduler<C> {
             .map(|t| t.effective_priority)
             .max();
         if let Some(preferred) = self.preferred.take() {
-            let t = &self.tasks[preferred];
+            let idx = preferred.index();
+            let t = &self.tasks[idx];
             if t.state == State::Ready && t.affinity & 1 != 0 && Some(t.effective_priority) == best
             {
-                self.tasks[preferred].state = State::Running;
+                self.tasks[idx].state = State::Running;
                 self.current = preferred;
                 return Some(preferred);
             }
         }
         for offset in 1..=self.tasks.len() {
-            let next = (self.current + offset) % self.tasks.len();
+            let next = (cur + offset) % self.tasks.len();
             if self.tasks[next].state == State::Ready
                 && self.tasks[next].affinity & 1 != 0
                 && Some(self.tasks[next].effective_priority) == best
             {
-                if preemptive && was_running && next != self.current {
-                    self.tasks[self.current].preemptions += 1;
+                if preemptive && was_running && next != cur {
+                    self.tasks[cur].preemptions += 1;
                 }
                 self.tasks[next].state = State::Running;
-                self.current = next;
-                return Some(next);
+                self.current = ThreadSlot(next);
+                return Some(ThreadSlot(next));
             }
         }
         None
     }
-    pub fn prefer(&mut self, thread: usize) {
+    pub fn prefer(&mut self, thread: ThreadSlot) {
         self.preferred = Some(thread);
     }
     pub fn should_preempt(&self) -> bool {
@@ -177,11 +194,12 @@ impl<C: Copy> Scheduler<C> {
                 }
                 if let Wait::Reply { server, .. } = self.tasks[i].wait {
                     let priority = self.tasks[i].effective_priority;
-                    if server < TASKS
-                        && self.tasks[server].state != State::Terminated
-                        && self.tasks[server].effective_priority < priority
+                    let srv = server.index();
+                    if srv < TASKS
+                        && self.tasks[srv].state != State::Terminated
+                        && self.tasks[srv].effective_priority < priority
                     {
-                        self.tasks[server].effective_priority = priority;
+                        self.tasks[srv].effective_priority = priority;
                         changed = true;
                     }
                 }
@@ -192,18 +210,21 @@ impl<C: Copy> Scheduler<C> {
         }
     }
     pub fn block(&mut self, wait: Wait) {
-        self.tasks[self.current].wait = wait;
-        self.tasks[self.current].state = State::Blocked;
+        let cur = self.current.index();
+        self.tasks[cur].wait = wait;
+        self.tasks[cur].state = State::Blocked;
     }
-    pub fn wake(&mut self, task: usize) {
-        if self.tasks[task].state == State::Blocked {
-            self.tasks[task].wait = Wait::None;
-            self.tasks[task].state = State::Ready;
+    pub fn wake(&mut self, task: ThreadSlot) {
+        let idx = task.index();
+        if self.tasks[idx].state == State::Blocked {
+            self.tasks[idx].wait = Wait::None;
+            self.tasks[idx].state = State::Ready;
         }
     }
     pub fn terminate(&mut self) {
-        self.tasks[self.current].wait = Wait::None;
-        self.tasks[self.current].state = State::Terminated;
+        let cur = self.current.index();
+        self.tasks[cur].wait = Wait::None;
+        self.tasks[cur].state = State::Terminated;
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
@@ -222,9 +243,9 @@ impl<C: Copy> Scheduler<C> {
                 .iter()
                 .filter(|t| t.state == State::Running)
                 .count() as u32,
-            last_task_id: self.last_id,
+            last_task_id: self.last_id.raw(),
             scheduler_ticks: self.ticks,
-            uptime_ticks: self.uptime,
+            uptime_ticks: self.uptime.raw(),
             load_q16: self.load.values(),
         }
     }
@@ -255,21 +276,21 @@ mod tests {
     #[test]
     fn priority_round_robin_and_preferred_tie_break() {
         let mut s = test_scheduler();
-        assert_eq!(s.select(true), Some(1));
+        assert_eq!(s.select(true), Some(ThreadSlot(1)));
         assert_eq!(s.tasks[0].preemptions, 1);
-        assert_eq!(s.select(false), Some(2));
+        assert_eq!(s.select(false), Some(ThreadSlot(2)));
         assert_eq!(s.tasks[1].preemptions, 0);
 
         // Preferred thread wins when tied at the highest ready priority.
-        s.prefer(0);
-        assert_eq!(s.select(false), Some(0));
+        s.prefer(ThreadSlot(0));
+        assert_eq!(s.select(false), Some(ThreadSlot(0)));
 
         // Higher priority always beats lower preferred thread.
         s.tasks[2].priority = 3;
         s.tasks[2].effective_priority = 3;
         assert!(s.should_preempt());
-        s.prefer(1);
-        assert_eq!(s.select(true), Some(2));
+        s.prefer(ThreadSlot(1));
+        assert_eq!(s.select(true), Some(ThreadSlot(2)));
     }
 
     #[test]
@@ -280,30 +301,30 @@ mod tests {
         s.tasks[2].priority = 3; // high-priority client A
 
         // B (1) waits on C (0), A (2) waits on B (1).
-        s.current = 1;
+        s.current = ThreadSlot(1);
         s.tasks[1].state = State::Running;
         s.block(Wait::Reply {
             token: 1,
             pointer: 0,
             capacity: 0,
-            server: 0,
-            until: 0,
+            server: ThreadSlot(0),
+            until: None,
         });
-        s.current = 2;
+        s.current = ThreadSlot(2);
         s.tasks[2].state = State::Running;
         s.block(Wait::Reply {
             token: 2,
             pointer: 0,
             capacity: 0,
-            server: 1,
-            until: 0,
+            server: ThreadSlot(1),
+            until: None,
         });
 
         s.inherit();
         assert_eq!(s.tasks[1].effective_priority, 3);
         assert_eq!(s.tasks[0].effective_priority, 3);
 
-        s.wake(2);
+        s.wake(ThreadSlot(2));
         s.inherit();
         assert_eq!(s.tasks[1].effective_priority, 1);
         assert_eq!(s.tasks[0].effective_priority, 1);
@@ -312,17 +333,17 @@ mod tests {
     #[test]
     fn tick_wakes_sleepers_tracks_runtime_and_samples_load() {
         let mut s = test_scheduler();
-        s.block(Wait::Sleep { until: 10 });
-        assert_eq!(s.select(false), Some(1));
-        s.tick(5);
+        s.block(Wait::Sleep { until: Ticks(10) });
+        assert_eq!(s.select(false), Some(ThreadSlot(1)));
+        s.tick(Ticks(5));
         assert_eq!(s.tasks[0].state, State::Blocked);
         assert_eq!(s.tasks[1].runtime_ticks, 5);
 
-        s.tick(10);
+        s.tick(Ticks(10));
         assert_eq!(s.tasks[0].state, State::Ready);
 
         // Advance past 5-second sampling window.
-        s.tick(5 * HZ);
+        s.tick(Ticks(5 * HZ));
         let snap = s.snapshot();
         assert_eq!(snap.uptime_ticks, 5 * HZ);
         assert!(snap.load_q16[0] > 0);
@@ -337,24 +358,24 @@ mod tests {
             size: 4096,
         };
         assert_eq!(
-            s.create_thread(0, 0, stack, 0x400, 4, 1),
+            s.create_thread(ProcSlot(0), 0, stack, 0x400, 4, 1),
             Err(Errno::Einval)
         );
         assert_eq!(
-            s.create_thread(0, 0, stack, 0x400, 1, 0),
+            s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 0),
             Err(Errno::Einval)
         );
         assert_eq!(
-            s.create_thread(0, 0, stack, 0x400, 1, 4),
+            s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 4),
             Err(Errno::Einval)
         );
 
         for i in 0..(TASKS - BOOT_THREADS) {
-            let tid = s.create_thread(0, 0, stack, 0x400, 1, 1).unwrap();
-            assert_eq!(tid, BOOT_THREADS as u32 + i as u32 + 1);
+            let tid = s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 1).unwrap();
+            assert_eq!(tid, Tid(BOOT_THREADS as u32 + i as u32 + 1));
         }
         assert_eq!(
-            s.create_thread(0, 0, stack, 0x400, 1, 1),
+            s.create_thread(ProcSlot(0), 0, stack, 0x400, 1, 1),
             Err(Errno::Enospc)
         );
     }
