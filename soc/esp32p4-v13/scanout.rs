@@ -1,7 +1,7 @@
 //! RGB565 scanout on the dedicated DesignWare AXI DMA channel 0.
-//! HP0 is the sole owner. Four frames of LLIs reference 32-row black bands
-//! and the centered 64-row image band. Pixel mode uses three spans per frame
-//! with a fixed black source word and one word containing a white pixel.
+//! HP0 owns a four-frame ring. Each frame has a fixed black source, an
+//! incrementing image span, and the fixed black source again.
+//! Orbit stores a 64-row RGB565 band. Pixel mode uses a single source word.
 //! All CPU accesses use the direct SRAM alias.
 use crate::pac::{read, write};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -20,13 +20,10 @@ const FRAME_DONE: u32 = 2;
 const ERRORS: u32 = 0x3fe0;
 const VALID: u32 = 1 << 31;
 const SLOTS: usize = 4;
-const BAND_ROWS: usize = 32;
-const BLACK_BANDS: usize = (HEIGHT - ICON) / 2 / BAND_ROWS;
-const PER_FRAME: usize = BLACK_BANDS * 2 + 1;
+const PER_FRAME: usize = 3;
 const NODES: usize = PER_FRAME * SLOTS;
 const BURSTS: u32 = (1 << 6) | (16 << 7) | (1 << 15) | (16 << 16);
 
-static ACTIVE_NODES: AtomicU32 = AtomicU32::new(0);
 static FRAMES: AtomicU32 = AtomicU32::new(0);
 static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn reg(addr: usize) -> u32 {
@@ -45,14 +42,11 @@ pub fn tick() {
     if !RUNNING.load(Ordering::Relaxed) {
         return;
     }
-    let nodes = ACTIVE_NODES.load(Ordering::Relaxed) as usize;
-    for i in 0..nodes {
+    for i in 0..NODES {
         let ctl = DIRECT + descriptors() + 64 * i + 36;
         if reg(ctl) & VALID == 0 {
             put(ctl, BURSTS | VALID);
-            if i % (nodes / SLOTS) == nodes / SLOTS - 1
-                && FRAMES.fetch_add(1, Ordering::Relaxed) == 0
-            {
+            if i % PER_FRAME == PER_FRAME - 1 && FRAMES.fetch_add(1, Ordering::Relaxed) == 0 {
                 put(BRIDGE + 0x54, 1);
             }
         }
@@ -99,9 +93,8 @@ pub fn underrun() -> bool {
 pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
     let black = core::ptr::addr_of!(_orbit_black) as usize;
     let band = core::ptr::addr_of!(_orbit_band) as usize;
-    let black_bytes = if pixel_only { 8 } else { WIDTH * BAND_ROWS * 2 };
     let band_bytes = if pixel_only { 8 } else { WIDTH * ICON * 2 };
-    for off in (0..black_bytes).step_by(4) {
+    for off in (0..8).step_by(4) {
         put(DIRECT + black + off, 0);
     }
     for off in (0..band_bytes).step_by(4) {
@@ -117,28 +110,22 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
             unsafe { ((DIRECT + band + 2 * pixel) as *mut u16).write_volatile(rgb) }
         }
     }
-    let nodes = if pixel_only { 3 * SLOTS } else { NODES };
-    ACTIVE_NODES.store(nodes as u32, Ordering::Relaxed);
     if pixel_only {
         unsafe {
             ((DIRECT + band) as *mut u16).write_volatile(0xffff);
         }
     }
-    for i in 0..nodes {
-        let (src, rows) = if i % PER_FRAME == BLACK_BANDS {
-            (band, ICON)
-        } else {
-            (black, BAND_ROWS)
-        };
-        let (src, items, fixed) = if pixel_only {
-            let before = (WIDTH * (HEIGHT / 2) + WIDTH / 2) / 4;
-            match i % 3 {
-                0 => (black, before, true),
-                1 => (band, 1, false),
-                _ => (black, WIDTH * HEIGHT / 4 - before - 1, true),
-            }
-        } else {
-            (src, rows * WIDTH / 4, false)
+    let before = if pixel_only {
+        (WIDTH * (HEIGHT / 2) + WIDTH / 2) / 4
+    } else {
+        WIDTH * ((HEIGHT - ICON) / 2) / 4
+    };
+    let middle = if pixel_only { 1 } else { WIDTH * ICON / 4 };
+    for i in 0..NODES {
+        let (src, items, fixed) = match i % PER_FRAME {
+            0 => (black, before, true),
+            1 => (band, middle, false),
+            _ => (black, WIDTH * HEIGHT / 4 - before - middle, true),
         };
         let desc = descriptors() + i * 64;
         for off in (0..64).step_by(4) {
@@ -149,7 +136,7 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
         put(DIRECT + desc + 16, (items - 1) as u32); // 64-bit items
         put(
             DIRECT + desc + 24,
-            (descriptors() + 64 * ((i + 1) % nodes)) as u32 | 1,
+            (descriptors() + 64 * ((i + 1) % NODES)) as u32 | 1,
         );
         put(DIRECT + desc + 36, BURSTS | VALID);
 
@@ -184,11 +171,8 @@ pub fn start(coverage: &[u8; ICON * ICON], color: [u8; 3], pixel_only: bool) {
     put(BRIDGE + 0x08, 256);
     put(BRIDGE + 0x8c, 768);
     put(BRIDGE + 0x0c, (1 << 31) | (WIDTH * HEIGHT / 4) as u32);
-    put(
-        BRIDGE + 0x6c,
-        reg(BRIDGE + 0x6c) | if pixel_only { 1 << 28 } else { 0 },
-    );
-    put(BRIDGE + 0x88, if pixel_only { 3 << 4 } else { 1 << 4 }); // Pixel mode has three DMA blocks per frame
+    put(BRIDGE + 0x6c, reg(BRIDGE + 0x6c) | (1 << 28));
+    put(BRIDGE + 0x88, (PER_FRAME as u32) << 4);
     put(BRIDGE + 4, 1);
     put(BRIDGE + 0x54, 1);
     barrier();

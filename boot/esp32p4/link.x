@@ -2,15 +2,16 @@ OUTPUT_ARCH(riscv)
 ENTRY(_start)
 MEMORY {
  ENTRY (rx) : ORIGIN = 0x30100000, LENGTH = 8K
- DISPLAY (rw) : ORIGIN = 0x4ff00000, LENGTH = 152K
+ DISPLAY (rw) : ORIGIN = 0x4ff00000, LENGTH = 96K
  BOOT_STACK (rw) : ORIGIN = 0x4ff26000, LENGTH = 8K
  UPPER (rwx) : ORIGIN = 0x4ff40000, LENGTH = 432K
  STACK (rw) : ORIGIN = 0x4ffac000, LENGTH = 80K
 }
 SECTIONS {
  .display (NOLOAD) : ALIGN(64) {
-  _orbit_lli = .; . += 4 * 39 * 64;
-  _orbit_black = .; . += 720 * 32 * 2;
+  _orbit_lli = .; . += 4 * 3 * 64;
+  _orbit_black = .; . += 8;
+  . = ALIGN(64);
   _orbit_band = .; . += 720 * 64 * 2;
  } > DISPLAY
  .entry : ALIGN(16) { _entry_start = .; KEEP(*(.text.entry)); _entry_end = .; } > ENTRY
@@ -36,6 +37,8 @@ SECTIONS {
  } > UPPER
  _dma_page = ORIGIN(STACK) - 8192;
  _dma_descriptors = _dma_page + 4096;
+ ASSERT(SIZEOF(.display) <= LENGTH(DISPLAY), "Display exceeds SRAM reservation")
+ ASSERT(ORIGIN(DISPLAY) + LENGTH(DISPLAY) <= ORIGIN(BOOT_STACK), "Display overlaps boot stack")
  ASSERT(_bss_end <= _dma_page, "Runtime overlaps DMA arena")
  _boot_stack_top = ORIGIN(BOOT_STACK) + LENGTH(BOOT_STACK);
  _stack_bottom = ORIGIN(STACK);

@@ -287,25 +287,34 @@ changed from prepared to healthy, with zero missed transitions and notices.
 The vertical bars have been visually confirmed on Tab5. Backlight now uses
 LEDC channel 0 at 39.06 kHz with 62.5% duty, checked through duty readback.
 
-Experimental shell command `display orbit` renders the 64×64 asset derived
-from `orbit.svg` into a reserved internal SRAM band and attempts continuous
-RGB565 scanout through DW-GDMA. The latest Tab5 run returned display error 8
-with FIFO underrun and zero completed frames. Continuous icon scanout still
-requires work. The command prints DMA diagnostics and stops scanout on this
-failure. Error 7 reports a backlight PWM readback timeout.
+`display orbit` renders the 64×64 asset derived from `orbit.svg` into a
+64-row RGB565 band centered on the 720×1280 display. Each frame uses three
+DW-GDMA spans for black, the band and black again. The black spans repeatedly
+read one 64-bit zero word. The driver keeps four frames of descriptors and
+rearms consumed entries from the existing 100 Hz timer.
+
+The image band occupies 92160 bytes, the zero word 8 bytes and twelve DMA
+descriptors 768 bytes. With 56 bytes of alignment padding, the display
+section occupies 92992 bytes within a 96 KiB linker reservation. This uses
+internal SRAM. The coverage asset occupies another 4096 bytes in the firmware.
+The raster is prepared once when the command starts.
+
+Error 7 reports a backlight PWM readback timeout. The stream check reports
+error 8 for insufficient frame progress or recurring FIFO underrun and leaves
+the diagnostic stream available for inspection.
 
 Regenerate the checked-in coverage asset using `/usr/bin/python3
 tools/orbit_asset.py` with PyGObject, Pycairo and librsvg installed.
-The lower SRAM display reservation occupies 148224 bytes within
-0x4ff00000..0x4ff26000, before the boot stack.
+The display section starts at 0x4ff00000. Linker assertions bound its size
+and keep the reservation below the boot stack at 0x4ff26000.
 
 
 ### Minimal pixel scanout
 
 `display pixel` initializes ST7121 and enables one white RGB565 pixel at
 (360, 640) on a black 720×1280 image. The DMA source uses two 64-bit words
-and twelve 64-byte descriptors (784 bytes actively used). The existing
-148224-byte lower SRAM reservation also serves the experimental Orbit path.
+and twelve 64-byte descriptors (784 bytes actively used). The shared
+92992-byte display section also serves Orbit.
 No additional pixel buffer is allocated.
 
 Display initialization selects the fixed rev1.x CPU/MEM/SYS 180 MHz, APB
@@ -322,3 +331,8 @@ and checks another 500 ms of scanout. Error 9 indicates clock setup failure.
 The fixed clock point persists after the display command. Runtime DVFS and
 power-state transitions require separate integration.
 Hardware log is `target/display-pixel-smoke.log`.
+
+
+Tab5 Orbit smoke passed 40 frames without recurring FIFO underrun at DPI
+80 MHz and CPU/MEM 180 MHz. Shell, procfs and Sentinel remained operational.
+Hardware log is `target/display-orbit-smoke.log`.
