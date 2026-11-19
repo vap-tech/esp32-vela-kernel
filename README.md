@@ -1,3 +1,5 @@
+![Vela Microkernel](readme.svg)
+
 # Vela v0.3
 
 Space Flow bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
