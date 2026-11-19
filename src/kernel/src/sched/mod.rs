@@ -157,12 +157,13 @@ impl<C: Copy> Scheduler<C> {
             self.tasks[cur].state = State::Ready;
         }
         self.inherit();
-        let best = self
-            .tasks
-            .iter()
-            .filter(|t| t.state == State::Ready && t.affinity & 1 != 0)
-            .map(|t| t.effective_priority)
-            .max();
+        let mut best: Option<u8> = None;
+        for t in &self.tasks {
+            if t.state == State::Ready && t.affinity & 1 != 0 {
+                best = Some(best.map_or(t.effective_priority, |b| b.max(t.effective_priority)));
+            }
+        }
+        best?;
         if let Some(preferred) = self.preferred.take() {
             let idx = preferred.index();
             let t = &self.tasks[idx];
@@ -200,8 +201,15 @@ impl<C: Copy> Scheduler<C> {
         })
     }
     pub fn inherit(&mut self) {
+        let mut any_reply = false;
         for t in &mut self.tasks {
             t.effective_priority = t.priority;
+            if t.state == State::Blocked && matches!(t.wait, Wait::Reply { .. }) {
+                any_reply = true;
+            }
+        }
+        if !any_reply {
+            return;
         }
         // At most TASKS dependency edges. Bounded transitive donation; no heap.
         for _ in 0..TASKS {

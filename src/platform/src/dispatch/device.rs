@@ -68,8 +68,8 @@ impl Runtime {
         let space = &mut self.processes.slot_mut(current).memory;
         space.dma_access(soc::dma::page(), false)?;
         let prepared = pmp::Prepared::new(space).unwrap();
-        assert!(unsafe { prepared.activate() });
-        self.pmp_images[current.index()] = Some((space.revision, prepared));
+        assert!(unsafe { prepared.activate(true) });
+        self.pmp_images[current.index()] = Some((space.revision, prepared, true));
         self.active_space = Some((current, space.revision));
         self.dma
             .submit(pid, len, self.scheduler.uptime().saturating_add(100));

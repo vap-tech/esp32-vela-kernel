@@ -171,8 +171,9 @@ extern "C" fn rust_main() -> ! {
         .unwrap();
 
     // SAFETY: isolated physical regions, no users executing yet.
-    let (revision, initial_pmp) = runtime.pmp_images[procfs.slot.index()].unwrap();
-    assert!(unsafe { initial_pmp.activate() }, "PMP readback");
+    let (revision, initial_pmp, _) = runtime.pmp_images[procfs.slot.index()].unwrap();
+    assert!(unsafe { initial_pmp.activate_initial() }, "PMP readback");
+    runtime.pmp_images[procfs.slot.index()] = Some((revision, initial_pmp, true));
     runtime.active_space = Some((procfs.slot, revision));
     runtime.scheduler.activate_initial(ThreadSlot(0));
 

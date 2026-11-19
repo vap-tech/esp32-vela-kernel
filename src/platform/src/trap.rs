@@ -5,7 +5,7 @@ use vela_kernel::{
 };
 
 use crate::{
-    arch, pmp,
+    arch,
     runtime::{CONSOLE_RX, RUNTIME},
     soc,
 };
@@ -109,16 +109,22 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     } else {
         fatal(frame);
     }
+    // Preserve active trap bookkeeping, canonicalize target privilege and MPIL.
+    let cause = frame.mcause & !((3 << 28) | (255 << 16));
+    if !from_idle && !switch {
+        let process = runtime.scheduler.current().process;
+        // SAFETY: sole hart0 M-mode trap exit after boot PMP initialization.
+        if !unsafe { runtime.ensure_active_space(process) } {
+            fatal(frame);
+        }
+        frame.mcause = cause;
+        runtime.cycles.on_trap_exit(arch::mcycle());
+        return frame;
+    }
     if !from_idle {
         runtime.scheduler.save(*frame);
     }
-    let selected = if switch {
-        runtime.scheduler.select(interrupt)
-    } else {
-        Some(runtime.scheduler.current)
-    };
-    // Preserve active trap bookkeeping, canonicalize target privilege and MPIL.
-    let cause = frame.mcause & !((3 << 28) | (255 << 16));
+    let selected = runtime.scheduler.select(interrupt);
     if selected.is_none() {
         runtime.in_idle = true;
         runtime.idle_frame.mcause = cause | (3 << 28) | (1 << 27);
@@ -134,21 +140,9 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     let task = runtime.scheduler.task_mut(current_thread);
     task.context.mcause = cause;
     let process = task.process;
-    let memory = runtime.processes.slot(process).memory;
     // SAFETY: activate only selected task's RX code / RW stack before mret.
-    if runtime.active_space != Some((process, memory.revision)) {
-        let image = match runtime.pmp_images[process.index()] {
-            Some((revision, image)) if revision == memory.revision => image,
-            _ => {
-                let image = pmp::Prepared::new(&memory).unwrap();
-                runtime.pmp_images[process.index()] = Some((memory.revision, image));
-                image
-            }
-        };
-        if !unsafe { image.activate() } {
-            fatal(frame);
-        }
-        runtime.active_space = Some((process, memory.revision));
+    if !unsafe { runtime.ensure_active_space(process) } {
+        fatal(frame);
     }
     runtime.cycles.on_trap_exit(arch::mcycle());
     &runtime.scheduler.task(current_thread).context

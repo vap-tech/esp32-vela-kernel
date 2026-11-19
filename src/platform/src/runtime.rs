@@ -44,7 +44,7 @@ pub struct Runtime {
     pub scheduler: Scheduler<arch::TrapFrame>,
     pub processes: Processes,
     pub active_space: Option<(ProcSlot, u32)>,
-    pub pmp_images: [Option<(u32, pmp::Prepared)>; vela_kernel::process::PROCESSES],
+    pub pmp_images: [Option<(u32, pmp::Prepared, bool)>; vela_kernel::process::PROCESSES],
     pub allocator: RegionAllocator,
     pub console: soc::console::Console,
     pub ipc: Ipc,
@@ -86,6 +86,37 @@ impl Runtime {
 
     pub fn memory(&self) -> &AddressSpace {
         &self.processes.slot(self.scheduler.current().process).memory
+    }
+
+    /// Ensure hardware PMP matches `process`'s current `AddressSpace` revision.
+    ///
+    /// # Safety
+    /// Local hart M-mode with IRQs masked after `activate_initial` succeeded at boot.
+    #[inline(always)]
+    pub unsafe fn ensure_active_space(&mut self, process: ProcSlot) -> bool {
+        let revision = self.processes.slot(process).memory.revision;
+        if self.active_space == Some((process, revision)) {
+            return true;
+        }
+        let slot = process.index();
+        let (image, verified) = match self.pmp_images[slot] {
+            Some((rev, image, verified)) if rev == revision => (image, verified),
+            _ => {
+                let memory = &self.processes.slot(process).memory;
+                let Ok(image) = pmp::Prepared::new(memory) else {
+                    return false;
+                };
+                (image, false)
+            }
+        };
+        if !unsafe { image.activate(!verified) } {
+            return false;
+        }
+        if !verified {
+            self.pmp_images[slot] = Some((revision, image, true));
+        }
+        self.active_space = Some((process, revision));
+        true
     }
 
     pub fn readable(&self, pointer: usize, length: usize) -> bool {
@@ -223,7 +254,7 @@ impl Runtime {
                 core::arch::asm!("fence.i", options(nostack));
             }
             self.processes.slot_mut(process).memory = space;
-            self.pmp_images[process.index()] = Some((space.revision, prepared));
+            self.pmp_images[process.index()] = Some((space.revision, prepared, false));
             Ok((
                 LoadedElf {
                     slot: process,

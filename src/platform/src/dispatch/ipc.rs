@@ -12,7 +12,7 @@ use crate::{
     arch,
     runtime::Runtime,
     syscall,
-    usermem::{copy_from_user, copy_to_user_within},
+    usermem::{copy_between_users, copy_from_user, copy_to_user_within},
 };
 
 impl Runtime {
@@ -82,14 +82,13 @@ impl Runtime {
         let length = args.a2 as usize;
         let reply =
             lifecycle::prepare_ipc_reply(&self.calls, &self.scheduler, current, args.a0, length)?;
-        let mut message = Message::EMPTY;
-        message.length = length;
-        copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
-        copy_to_user_within(
+        copy_between_users(
+            &self.processes.slot(current).memory,
+            args.a1 as usize,
             &self.processes.slot(reply.target).memory,
             reply.pointer,
             reply.capacity,
-            &message.data[..length],
+            length,
         )?;
         lifecycle::finish_ipc_reply(&mut self.calls, &mut self.scheduler, reply.client, length);
         *switch = self.scheduler.should_preempt();
