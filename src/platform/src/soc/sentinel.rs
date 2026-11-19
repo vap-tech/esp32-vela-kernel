@@ -139,3 +139,12 @@ pub unsafe fn retry_heartbeat(sequence: u32) {
         fence();
     }
 }
+
+/// Reassert only the command doorbell while the original request still owns the slot.
+/// LP ignores `sequence <= last_request` if already handled, or executes once if missed.
+pub unsafe fn reassert_command(command: u32) {
+    unsafe {
+        word(wire::COMMAND).write_volatile(command);
+        fence();
+    }
+}

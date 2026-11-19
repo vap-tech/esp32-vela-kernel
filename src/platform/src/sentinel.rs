@@ -3,7 +3,7 @@ use vela_kernel::{
     id::{Pid, ThreadSlot, Ticks},
     process::Processes,
     sched::Scheduler,
-    sentinel::{Heartbeat, WakePhase, WakeTicket},
+    sentinel::{RequestKind, RequestLink, Retry, WakePhase, WakeTicket},
     task::{State, Wait},
 };
 
@@ -11,15 +11,10 @@ use crate::{arch, runtime::device_wait, sentinel_wire, soc, usermem::copy_to_use
 
 pub struct SentinelClient {
     epoch: Option<u32>,
-    ready: bool,
+    link: RequestLink,
     wake: Option<WakeTicket>,
-    sequence: u32,
-    pending: bool,
-    command: u32,
-    argument: u32,
     diagnostics: u32,
     hz: u32,
-    heartbeat_link: Heartbeat,
     heartbeat: bool,
     next_beat: Ticks,
     notifications: u32,
@@ -27,18 +22,13 @@ pub struct SentinelClient {
 }
 
 impl SentinelClient {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             epoch: None,
-            ready: false,
+            link: RequestLink::new(),
             wake: None,
-            sequence: 0,
-            pending: false,
-            command: 0,
-            argument: 0,
             diagnostics: 0,
             hz: 0,
-            heartbeat_link: Heartbeat::default(),
             heartbeat: true,
             next_beat: Ticks::ZERO,
             notifications: 0,
@@ -53,6 +43,10 @@ impl SentinelClient {
 
     pub fn epoch(&self) -> Option<u32> {
         self.epoch
+    }
+
+    pub const fn is_offline(&self) -> bool {
+        self.link.is_offline()
     }
 
     pub fn wake_ticket(&self) -> Option<WakeTicket> {
@@ -84,59 +78,55 @@ impl SentinelClient {
     }
 
     /// Protocol version once READY, `0` before, `Etimedout` when the LP
-    /// heartbeat link is offline.
+    /// request/heartbeat link is offline.
     pub fn link_status(&self) -> Result<u32, Errno> {
-        if self.heartbeat_link.offline {
-            Err(Errno::Etimedout)
-        } else if self.ready {
-            Ok(sentinel_wire::VERSION)
-        } else {
-            Ok(0)
-        }
+        self.link
+            .status()
+            .map(|ready| if ready { sentinel_wire::VERSION } else { 0 })
     }
 
-    pub fn request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, Errno> {
-        if !self.ready {
-            return Err(Errno::Eagain);
-        }
-        if self.heartbeat_link.offline {
-            return Err(Errno::Etimedout);
-        }
-        if self.pending {
-            return Err(Errno::Ebusy);
-        }
-        if self.sequence == i32::MAX as u32 {
-            return Err(Errno::Eoverflow);
-        }
-        self.sequence += 1;
-        self.pending = true;
-        self.command = command;
-        self.argument = arg0;
+    pub fn request(
+        &mut self,
+        command: u32,
+        arg0: u32,
+        arg1: u32,
+        now: Ticks,
+    ) -> Result<u32, Errno> {
+        let kind = if command == sentinel_wire::HEARTBEAT {
+            RequestKind::Heartbeat
+        } else {
+            RequestKind::Command(command)
+        };
+        let sequence = self.link.submit(kind, arg0, now)?;
         // SAFETY: hart0 MIE=0, only one pending request until its exact response.
         unsafe {
-            soc::sentinel::request(self.sequence, command, arg0, arg1);
+            soc::sentinel::request(sequence, command, arg0, arg1);
         }
-        Ok(self.sequence)
+        Ok(sequence)
     }
 
     pub fn tick(&mut self, uptime: Ticks) {
-        if self.heartbeat_link.retry_due(uptime) {
-            // Keep the slot and payload stable until the original heartbeat completes.
+        if let Some(retry) = self.link.poll_timeout(uptime) {
+            // Keep the slot and payload stable until the original request completes.
             unsafe {
-                soc::sentinel::retry_heartbeat(self.sequence);
+                match retry {
+                    Retry::Heartbeat(seq) => soc::sentinel::retry_heartbeat(seq),
+                    Retry::Command(cmd) => soc::sentinel::reassert_command(cmd),
+                }
             }
             return;
         }
-        if self.ready
+        if self.link.is_ready()
             && self.heartbeat
             && !self
                 .wake
                 .is_some_and(|t| t.sleep && !matches!(t.phase, WakePhase::Fired(_)))
-            && !self.pending
+            && !self.link.is_pending()
             && uptime >= self.next_beat
-            && self.request(sentinel_wire::HEARTBEAT, 3000, 0).is_ok()
+            && self
+                .request(sentinel_wire::HEARTBEAT, 3000, 0, uptime)
+                .is_ok()
         {
-            self.heartbeat_link.sent(self.sequence, uptime);
             self.next_beat = uptime.saturating_add(100);
         }
     }
@@ -209,7 +199,7 @@ impl SentinelClient {
         self.last_publish = reply.published;
         match reply.event {
             sentinel_wire::READY if reply.result == sentinel_wire::OK => {
-                self.ready = true;
+                self.link.mark_ready();
                 return;
             }
             sentinel_wire::HEARTBEAT_MISSED
@@ -234,10 +224,16 @@ impl SentinelClient {
             }
             _ => (),
         }
-        if !self.pending || reply.request != self.sequence {
+        let Some(inflight) = self.link.in_flight() else {
+            return;
+        };
+        if reply.request != inflight.sequence {
             return;
         }
-        let command = self.command;
+        let command = match inflight.kind {
+            RequestKind::Heartbeat => sentinel_wire::HEARTBEAT,
+            RequestKind::Command(cmd) => cmd,
+        };
         let expected = match command {
             sentinel_wire::GET_STATUS => sentinel_wire::STATUS,
             sentinel_wire::LOG_META => sentinel_wire::LOG_METADATA,
@@ -249,10 +245,7 @@ impl SentinelClient {
         if reply.event != expected && !error {
             return;
         }
-        self.pending = false;
-        if command == sentinel_wire::HEARTBEAT {
-            self.heartbeat_link.acknowledge(reply.request);
-        }
+        self.link.complete(reply.request);
         let error_code = match reply.result {
             sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => Errno::Eoverflow,
             sentinel_wire::LOG_UNKNOWN => Errno::Enoent,
@@ -262,6 +255,7 @@ impl SentinelClient {
         };
         self.settle_wake_ticket(
             command,
+            inflight.argument,
             &reply,
             error.then_some(error_code),
             scheduler,
@@ -269,6 +263,7 @@ impl SentinelClient {
         );
         self.complete_waiter(
             command,
+            inflight.argument,
             &reply,
             error.then_some(error_code),
             scheduler,
@@ -281,6 +276,7 @@ impl SentinelClient {
     fn settle_wake_ticket(
         &mut self,
         command: u32,
+        argument: u32,
         reply: &sentinel_wire::Reply,
         error: Option<Errno>,
         scheduler: &mut Scheduler<arch::TrapFrame>,
@@ -309,7 +305,7 @@ impl SentinelClient {
         ) && error.is_none()
         {
             if let Some(ticket) = self.wake {
-                if ticket.token == self.argument {
+                if ticket.token == argument {
                     Self::finish_wake_waiter(
                         scheduler,
                         processes,
@@ -364,6 +360,7 @@ impl SentinelClient {
     fn complete_waiter(
         &self,
         command: u32,
+        argument: u32,
         reply: &sentinel_wire::Reply,
         error: Option<Errno>,
         scheduler: &mut Scheduler<arch::TrapFrame>,
@@ -392,7 +389,7 @@ impl SentinelClient {
             reply.request
         } else {
             let values = self.payload(command, reply);
-            if command == sentinel_wire::LOG_READ && values[0] != self.argument {
+            if command == sentinel_wire::LOG_READ && values[0] != argument {
                 scheduler.wake_with(thread, Errno::Einval.to_abi());
                 return;
             }

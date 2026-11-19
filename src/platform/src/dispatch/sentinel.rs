@@ -71,6 +71,7 @@ impl Runtime {
             },
             delay_ms,
             0,
+            now,
         )?;
         self.sentinel.set_wake_ticket(Some(WakeTicket {
             token: sequence,
@@ -118,6 +119,9 @@ impl Runtime {
             self.sentinel.set_wake_ticket(None);
             frame.set_return2(elapsed);
             return Ok(ticket.token);
+        }
+        if matches!(ticket.phase, WakePhase::Requested) && self.sentinel.is_offline() {
+            return Err(Errno::Etimedout);
         }
         if self.scheduler.tasks.iter().any(|t| {
             t.state == State::Blocked
@@ -173,6 +177,7 @@ impl Runtime {
         if matches!(ticket.phase, WakePhase::Fired(_)) {
             return Err(Errno::Ealready);
         }
+        let now = self.scheduler.uptime();
         let sequence = self.sentinel.request(
             if ticket.sleep {
                 sentinel_wire::CANCEL_SLEEP
@@ -181,6 +186,7 @@ impl Runtime {
             },
             ticket.token,
             0,
+            now,
         )?;
         self.scheduler.block_until(
             Wait::Device {
@@ -188,7 +194,7 @@ impl Runtime {
                 token: sequence,
                 pointer: 0,
             },
-            self.scheduler.uptime().saturating_add(100),
+            now.saturating_add(100),
         );
         *switch = true;
         Ok(0)
@@ -240,8 +246,9 @@ impl Runtime {
         if data && (size != sentinel_wire::LOG_BYTES || !self.writable(pointer, size)) {
             return Err(Errno::Efault);
         }
-        let sequence = self.sentinel.request(command, arg0, arg1)?;
-        let deadline = self.scheduler.uptime().saturating_add(100);
+        let now = self.scheduler.uptime();
+        let sequence = self.sentinel.request(command, arg0, arg1, now)?;
+        let deadline = now.saturating_add(100);
         self.scheduler.block_until(
             Wait::Device {
                 domain: device_wait::SENTINEL_REQ,
