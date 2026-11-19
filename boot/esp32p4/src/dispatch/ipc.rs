@@ -11,7 +11,7 @@ use vela_kernel::{
 use super::Args;
 use crate::{
     arch,
-    runtime::{Call, Runtime, create_endpoint, grant},
+    runtime::{Runtime, create_endpoint, grant},
     syscall,
     usermem::{copy_from_user, copy_to_user_within},
 };
@@ -61,22 +61,13 @@ impl Runtime {
                 break;
             }
         }
-        if self.calls[thread.index()].generation == 0x7f_ffff {
-            return Err(Errno::Enospc);
-        }
-        let generation = self.calls[thread.index()].generation + 1;
-        let token = (generation << 8) | (thread.index() as u32 + 1);
+        let (generation, token) = self.calls.next_token(thread)?;
         let mut message = Message::EMPTY;
         message.length = length;
         message.reply_token = token;
         copy_from_user(self.memory(), args.a1 as usize, &mut message.data[..length])?;
         self.ipc.send(ep, message)?;
-        self.calls[thread.index()] = Call {
-            generation,
-            active: true,
-            endpoint: ep,
-            server: None,
-        };
+        self.calls.activate(thread, generation, ep);
         let until = if timeout == 0 {
             None
         } else {
@@ -101,13 +92,7 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        let client_idx = (args.a0 & 255).wrapping_sub(1) as usize;
-        let call = self.calls.get(client_idx).copied().ok_or(Errno::Ebadf)?;
-        let client = ThreadSlot(client_idx);
-        if !call.active || call.generation != args.a0 >> 8 {
-            return Err(Errno::Epipe);
-        }
-        let server = call.server.ok_or(Errno::Eperm)?;
+        let (client, server) = self.calls.lookup_for_reply(args.a0)?;
         if self.scheduler.task(server).process != current {
             return Err(Errno::Eperm);
         }
@@ -138,7 +123,7 @@ impl Runtime {
             &message.data[..length],
         )?;
         self.scheduler.task_mut(client).context.registers[8] = args.a2;
-        self.calls[client.index()].active = false;
+        self.calls.deactivate(client);
         self.scheduler.wake(client);
         self.scheduler.inherit();
         self.scheduler.prefer(client);
@@ -199,15 +184,10 @@ impl Runtime {
             .get(Handle(args.a0), cap::CONTROL)?;
         self.invalidate_object(c.object, Some(current));
         if let Object::Endpoint { index, .. } = c.object {
-            for i in 0..TASKS {
-                let thread = ThreadSlot(i);
-                if self.calls[i].active
-                    && self.calls[i].endpoint == index
-                    && self.scheduler.task(thread).process != current
-                {
-                    self.fail_call(thread, Errno::Epipe);
-                }
-            }
+            self.calls
+                .fail_where(&mut self.scheduler, Errno::Epipe, |call, task| {
+                    call.endpoint() == index && task.process != current
+                });
             self.complete_receivers(index, false);
         }
         Ok(0)
@@ -226,11 +206,8 @@ impl Runtime {
         let capability = self.processes.slot(current).capabilities.get(handle, 0)?;
         let ep = self.ipc.resolve(capability.object)?;
         if capability.rights & cap::CONTROL != 0 {
-            for i in 0..TASKS {
-                if self.calls[i].active && self.calls[i].endpoint == ep {
-                    self.fail_call(ThreadSlot(i), Errno::Epipe);
-                }
-            }
+            self.calls
+                .fail_for_endpoint(&mut self.scheduler, ep, Errno::Epipe);
             self.ipc.close(ep);
             self.invalidate_object(capability.object, None);
             self.complete_receivers(ep, true);
@@ -288,7 +265,9 @@ impl Runtime {
         let ep = self.endpoint(current, handle, ipc::RECEIVE)?;
         match self.ipc.receive(ep, capacity)? {
             Some(message) => {
-                self.bind_reply(message.reply_token, self.scheduler.current);
+                let server = self.scheduler.current;
+                self.calls
+                    .bind_reply(&mut self.scheduler, message.reply_token, server);
                 frame.registers[9] = message.reply_token;
                 copy_to_user_within(
                     self.memory(),
@@ -309,8 +288,8 @@ impl Runtime {
                     capacity,
                 });
                 *switch = true;
-                if !self.logged_block {
-                    self.logged_block = true;
+                if !self.logs.block {
+                    self.logs.block = true;
                     let _ = writeln!(
                         self.console,
                         "[ipc] recv blocked task={}",

@@ -7,7 +7,7 @@ use vela_kernel::{
 
 use super::Args;
 use crate::{
-    board, pmp,
+    pmp,
     runtime::{CONSOLE_RX, Runtime},
     soc,
     usermem::{copy_from_user, copy_to_user_within},
@@ -28,29 +28,7 @@ impl Runtime {
         if self.processes.slot(current).id != Pid(2) {
             return Err(Errno::Eperm);
         }
-        if matches!(args.a0, 1..=5) {
-            soc::scanout::stop();
-            self.display_mode = args.a0 as u8;
-            self.display_stage = 0;
-        } else if args.a0 != 0 {
-            return Err(Errno::Einval);
-        }
-        match board::display_step(self.display_stage, self.display_mode) {
-            Ok(delay) => {
-                self.display_stage = if delay == 0 {
-                    u8::MAX
-                } else {
-                    self.display_stage + 1
-                };
-                Ok(delay)
-            }
-            Err(code) => {
-                self.display_stage = u8::MAX;
-                // Display driver returns board-specific diagnostic codes (1..9, 256..511),
-                // encoded as negative integers directly in the DISPLAY_TEST ABI.
-                Ok(0u32.wrapping_sub(code))
-            }
-        }
+        self.display.step(args.a0)
     }
 
     pub(super) fn sys_dma_copy(
@@ -60,7 +38,7 @@ impl Runtime {
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let pid = self.processes.slot(current).id;
-        if self.dma != vela_kernel::dma::Lease::Cpu(pid) {
+        if !self.dma.is_cpu_owner(pid) {
             return Err(Errno::Eperm);
         }
         let len = args.a0 as usize;
@@ -73,9 +51,8 @@ impl Runtime {
         assert!(unsafe { prepared.activate() });
         self.pmp_images[current.index()] = Some((space.revision, prepared));
         self.active_space = Some((current, space.revision));
-        assert!(self.dma.submit(pid));
-        self.dma_length = len;
-        self.dma_deadline = self.scheduler.uptime().saturating_add(100);
+        self.dma
+            .submit(pid, len, self.scheduler.uptime().saturating_add(100));
         self.scheduler.block(Wait::Dma);
         unsafe {
             soc::dma::start(len);

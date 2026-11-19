@@ -1,8 +1,6 @@
 use core::fmt::Write;
 use vela_kernel::{
-    errno::Errno,
     id::{ThreadSlot, Ticks},
-    sched::TASKS,
     task::{State, Wait},
 };
 
@@ -46,50 +44,29 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         }
         let uptime =
             Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER snapshot timeout"));
-        if matches!(
-            runtime.dma,
-            vela_kernel::dma::Lease::Device(_) | vela_kernel::dma::Lease::Detached
-        ) && uptime >= runtime.dma_deadline
-        {
+        if runtime.dma.timed_out(uptime) {
             unsafe {
-                soc::dma::finish(runtime.dma_length);
+                soc::dma::finish(runtime.dma.length());
             }
             runtime.complete_dma(false);
         }
-        if runtime.sentinel_pending {
-            for i in 0..TASKS {
-                let thread = ThreadSlot(i);
-                if matches!(runtime.scheduler.task(thread).wait, Wait::Sentinel { deadline, .. } if uptime >= deadline)
-                {
-                    runtime.scheduler.task_mut(thread).context.registers[8] =
-                        Errno::Etimedout.to_abi();
-                    runtime.scheduler.wake(thread);
-                }
-            }
-        }
-        for i in 0..TASKS {
-            let thread = ThreadSlot(i);
-            if runtime.scheduler.task(thread).state == State::Blocked
-                && matches!(runtime.scheduler.task(thread).wait, Wait::SentinelWake { deadline, .. } if uptime >= deadline)
-            {
-                runtime.scheduler.task_mut(thread).context.registers[8] = Errno::Etimedout.to_abi();
-                runtime.scheduler.task_mut(thread).context.registers[9] = 0;
-                runtime.scheduler.wake(thread);
-                // Keep the LP token reserved: a late event cannot complete a new alarm.
-            }
-        }
+        runtime
+            .sentinel
+            .expire_waiters(&mut runtime.scheduler, uptime);
         soc::scanout::tick();
-        runtime.sentinel_tick(uptime);
-        runtime.expire_calls(uptime);
+        runtime.sentinel.tick(uptime);
+        runtime.calls.expire(&mut runtime.scheduler, uptime);
         runtime.scheduler.tick(uptime);
         switch = true;
     } else if interrupt && cause == soc::sentinel::LINE {
-        if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel_epoch) } {
-            runtime.sentinel_reply(reply);
+        if let Some(reply) = unsafe { soc::sentinel::acknowledge(runtime.sentinel.epoch()) } {
+            runtime
+                .sentinel
+                .handle_reply(reply, &mut runtime.scheduler, &runtime.processes);
         }
         switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::dma::LINE {
-        let ok = unsafe { soc::dma::finish(runtime.dma_length) };
+        let ok = unsafe { soc::dma::finish(runtime.dma.length()) };
         runtime.complete_dma(ok);
         switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::console::RX_LINE {
@@ -133,8 +110,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     if selected.is_none() {
         runtime.in_idle = true;
         runtime.idle_frame.mcause = cause | (3 << 28) | (1 << 27);
-        if !runtime.logged_idle {
-            runtime.logged_idle = true;
+        if !runtime.logs.idle {
+            runtime.logs.idle = true;
             let _ = writeln!(runtime.console, "[idle] wfi (no runnable tasks)");
         }
         return &runtime.idle_frame;

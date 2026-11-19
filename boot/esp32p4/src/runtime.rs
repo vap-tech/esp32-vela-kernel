@@ -2,34 +2,30 @@ use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     capability::{self as cap, Capability, Object},
     errno::Errno,
-    id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks},
+    id::{Handle, Pid, ProcSlot, ThreadSlot},
     ipc::{self, Ipc},
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
-    sentinel::{WakePhase, WakeTicket},
     task::{Region, State, Wait},
 };
 
 use crate::{
-    arch, pmp, sentinel_wire, soc,
-    usermem::{copy_to_user, copy_to_user_within},
+    arch, calls::CallTable, display::DisplayControl, dma::DmaChannel, pmp,
+    sentinel::SentinelClient, soc, usermem::copy_to_user_within,
 };
 
-#[derive(Clone, Copy)]
-pub struct Call {
-    pub generation: u32,
-    pub active: bool,
-    pub endpoint: usize,
-    pub server: Option<ThreadSlot>,
+pub struct BootLogs {
+    pub block: bool,
+    pub wake: bool,
+    pub idle: bool,
 }
 
-impl Call {
+impl BootLogs {
     pub const EMPTY: Self = Self {
-        generation: 0,
-        active: false,
-        endpoint: 0,
-        server: None,
+        block: false,
+        wake: false,
+        idle: false,
     };
 }
 
@@ -41,32 +37,14 @@ pub struct Runtime {
     pub allocator: RegionAllocator,
     pub console: soc::console::Console,
     pub ipc: Ipc,
-    pub calls: [Call; TASKS],
+    pub calls: CallTable,
     pub idle_frame: arch::TrapFrame,
     pub in_idle: bool,
-    pub dma: vela_kernel::dma::Lease,
-    pub dma_length: usize,
-    pub dma_deadline: Ticks,
-    pub sentinel_epoch: Option<u32>,
-    pub sentinel_ready: bool,
-    pub sentinel_wake: Option<WakeTicket>,
-    pub sentinel_sequence: u32,
-    pub sentinel_pending: bool,
-    pub sentinel_command: u32,
-    pub sentinel_argument: u32,
-    pub sentinel_diagnostics: u32,
-    pub sentinel_hz: u32,
-    pub heartbeat_link: vela_kernel::sentinel::Heartbeat,
-    pub display_mode: u8,
-    pub display_stage: u8,
-    pub sentinel_heartbeat: bool,
-    pub sentinel_next_beat: Ticks,
-    pub sentinel_notifications: u32,
-    pub sentinel_last_publish: u32,
+    pub dma: DmaChannel,
+    pub sentinel: SentinelClient,
+    pub display: DisplayControl,
     pub usb_rx_interrupts: u64,
-    pub logged_block: bool,
-    pub logged_wake: bool,
-    pub logged_idle: bool,
+    pub logs: BootLogs,
 }
 
 pub const CONSOLE_RX: Object = Object::Event {
@@ -118,303 +96,6 @@ pub fn grant(
 }
 
 impl Runtime {
-    pub fn finish_wake_waiter(&mut self, ticket: WakeTicket, result: u32, elapsed: u32) -> bool {
-        if let Some(i) = self.scheduler.tasks.iter().position(|t| {
-            t.state == State::Blocked
-                && self.processes.slot(t.process).id == ticket.owner
-                && matches!(t.wait, Wait::SentinelWake { token, .. } if token == ticket.token)
-        }) {
-            let thread = ThreadSlot(i);
-            self.scheduler.task_mut(thread).context.registers[8] = result;
-            self.scheduler.task_mut(thread).context.registers[9] = elapsed;
-            self.scheduler.wake(thread);
-            return true;
-        }
-        false
-    }
-
-    pub fn receive_wake(&mut self, reply: sentinel_wire::Reply) {
-        let Some(mut ticket) = self.sentinel_wake else {
-            return;
-        };
-        if reply.monitor != ticket.token
-            || reply.beats != ticket.delay_ms
-            || reply.age >> 48 != 0
-            || matches!(ticket.phase, WakePhase::Fired(_))
-        {
-            return;
-        }
-        // Read actual SYSTIMER elapsed time, not the requested delay or delivered IRQ count.
-        // SAFETY: MIE=0, hart0 has exclusive ownership of SYSTIMER snapshot.
-        let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER wake snapshot"));
-        let elapsed = now.saturating_sub(ticket.started).min(u64::from(u32::MAX)) as u32;
-        ticket.phase = WakePhase::Fired(elapsed);
-        self.sentinel_wake = Some(ticket);
-        let alive = self.processes.find_alive(ticket.owner).is_some();
-        if !alive || self.finish_wake_waiter(ticket, ticket.token, elapsed) {
-            self.sentinel_wake = None;
-        }
-        // Otherwise retain the event until WAIT. An IRQ between ARM ACK and
-        // userspace WAIT must not turn into a lost wakeup.
-    }
-
-    pub fn sentinel_request(&mut self, command: u32, arg0: u32, arg1: u32) -> Result<u32, Errno> {
-        if !self.sentinel_ready {
-            return Err(Errno::Eagain);
-        }
-        if self.heartbeat_link.offline {
-            return Err(Errno::Etimedout);
-        }
-        if self.sentinel_pending {
-            return Err(Errno::Ebusy);
-        }
-        if self.sentinel_sequence == i32::MAX as u32 {
-            return Err(Errno::Eoverflow);
-        }
-        self.sentinel_sequence += 1;
-        self.sentinel_pending = true;
-        self.sentinel_command = command;
-        self.sentinel_argument = arg0;
-        // SAFETY: hart0 MIE=0, only one pending request until its exact response.
-        unsafe {
-            soc::sentinel::request(self.sentinel_sequence, command, arg0, arg1);
-        }
-        Ok(self.sentinel_sequence)
-    }
-
-    pub fn sentinel_reply(&mut self, reply: sentinel_wire::Reply) {
-        if reply.published <= self.sentinel_last_publish {
-            return;
-        }
-        self.sentinel_last_publish = reply.published;
-        match reply.event {
-            sentinel_wire::READY if reply.result == sentinel_wire::OK => {
-                self.sentinel_ready = true;
-                return;
-            }
-            sentinel_wire::HEARTBEAT_MISSED
-                if reply.request == 0 && reply.result == sentinel_wire::OK =>
-            {
-                self.sentinel_notifications = self.sentinel_notifications.saturating_add(1);
-                return;
-            }
-            sentinel_wire::DIAGNOSTIC_EVENT
-                if reply.request == 0
-                    && reply.result != 0
-                    && (reply.age as u32 >> 16) == u32::from(sentinel_wire::LOG_HP_EVENT) =>
-            {
-                self.sentinel_diagnostics = self.sentinel_diagnostics.saturating_add(1);
-                return;
-            }
-            sentinel_wire::WAKE_EVENT
-                if reply.request == 0 && reply.result == sentinel_wire::OK =>
-            {
-                self.receive_wake(reply);
-                return;
-            }
-            _ => (),
-        }
-        if !self.sentinel_pending || reply.request != self.sentinel_sequence {
-            return;
-        }
-        let command = self.sentinel_command;
-        let expected = match command {
-            sentinel_wire::GET_STATUS => sentinel_wire::STATUS,
-            sentinel_wire::LOG_META => sentinel_wire::LOG_METADATA,
-            sentinel_wire::LOG_READ => sentinel_wire::LOG_ENTRY,
-            _ => sentinel_wire::ACK,
-        };
-        // LOG_ENTRY.result contains record sequence, not a result code.
-        let error = reply.event == sentinel_wire::ACK && reply.result != sentinel_wire::OK;
-        if reply.event != expected && !error {
-            return;
-        }
-        self.sentinel_pending = false;
-        if command == sentinel_wire::HEARTBEAT {
-            self.heartbeat_link.acknowledge(reply.request);
-        }
-        let error_code = match reply.result {
-            sentinel_wire::LOG_GONE | sentinel_wire::LOG_EXHAUSTED => Errno::Eoverflow,
-            sentinel_wire::LOG_UNKNOWN => Errno::Enoent,
-            sentinel_wire::LOG_BUSY => Errno::Ebusy,
-            sentinel_wire::WAKE_ALREADY => Errno::Ealready,
-            _ => Errno::Einval,
-        };
-        if matches!(
-            command,
-            sentinel_wire::SET_WAKEUP | sentinel_wire::PREPARE_SLEEP
-        ) {
-            if let Some(mut ticket) = self.sentinel_wake {
-                if ticket.token == reply.request {
-                    if error {
-                        self.finish_wake_waiter(ticket, error_code.to_abi(), 0);
-                        self.sentinel_wake = None;
-                    } else if matches!(ticket.phase, WakePhase::Requested) {
-                        ticket.phase = WakePhase::Armed;
-                        self.sentinel_wake = Some(ticket);
-                    }
-                }
-            }
-        } else if matches!(
-            command,
-            sentinel_wire::CANCEL_WAKEUP | sentinel_wire::CANCEL_SLEEP
-        ) && !error
-        {
-            if let Some(ticket) = self.sentinel_wake {
-                if ticket.token == self.sentinel_argument {
-                    self.finish_wake_waiter(ticket, Errno::Ecanceled.to_abi(), 0);
-                    self.sentinel_wake = None;
-                }
-            }
-        }
-        let Some(i) = self.scheduler.tasks.iter().position(|t| {
-            t.state == State::Blocked
-                && matches!(t.wait, Wait::Sentinel { sequence, .. } if sequence == reply.request)
-        }) else {
-            return;
-        };
-        let thread = ThreadSlot(i);
-        let Wait::Sentinel { pointer, .. } = self.scheduler.task(thread).wait else {
-            unreachable!()
-        };
-        let result = if error {
-            error_code.to_abi()
-        } else if pointer == 0 {
-            reply.request
-        } else {
-            let values = match command {
-                sentinel_wire::GET_STATUS => {
-                    let age_ms = reply.age * 1000 / u64::from(self.sentinel_hz);
-                    [
-                        reply.monitor & 3,
-                        age_ms as u32,
-                        (age_ms >> 32) as u32,
-                        self.sentinel_hz,
-                        reply.beats,
-                        reply.monitor >> 2,
-                    ]
-                }
-                sentinel_wire::LOG_META => [
-                    self.sentinel_epoch.unwrap_or(0),
-                    reply.monitor,
-                    reply.age as u32,
-                    (reply.age >> 32) as u32,
-                    reply.beats,
-                    self.sentinel_hz,
-                ],
-                sentinel_wire::LOG_READ => [
-                    reply.result,
-                    (reply.age as u32) >> 16,
-                    reply.monitor,
-                    (reply.age as u32) & 0xffff,
-                    (reply.age >> 32) as u32,
-                    reply.beats,
-                ],
-                _ => unreachable!(),
-            };
-            let process = self.scheduler.task(thread).process;
-            if command == sentinel_wire::LOG_READ && values[0] != self.sentinel_argument {
-                self.scheduler.task_mut(thread).context.registers[8] = Errno::Einval.to_abi();
-                self.scheduler.wake(thread);
-                return;
-            }
-            let mut buffer = [0u8; sentinel_wire::LOG_BYTES];
-            for (index, value) in values.into_iter().enumerate() {
-                buffer[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
-            }
-            match copy_to_user(&self.processes.slot(process).memory, pointer, &buffer) {
-                Ok(()) => sentinel_wire::LOG_BYTES as u32,
-                Err(e) => e.to_abi(),
-            }
-        };
-        self.scheduler.task_mut(thread).context.registers[8] = result;
-        self.scheduler.task_mut(thread).context.registers[9] = if command == sentinel_wire::LOG_META
-        {
-            self.sentinel_diagnostics
-        } else {
-            self.sentinel_notifications
-        };
-        self.scheduler.wake(thread);
-    }
-
-    pub fn sentinel_tick(&mut self, uptime: Ticks) {
-        if self.heartbeat_link.retry_due(uptime) {
-            // Keep the slot and payload stable until the original heartbeat completes.
-            unsafe {
-                soc::sentinel::retry_heartbeat(self.sentinel_sequence);
-            }
-            return;
-        }
-        if self.sentinel_ready
-            && self.sentinel_heartbeat
-            && !self
-                .sentinel_wake
-                .is_some_and(|t| t.sleep && !matches!(t.phase, WakePhase::Fired(_)))
-            && !self.sentinel_pending
-            && uptime >= self.sentinel_next_beat
-            && self
-                .sentinel_request(sentinel_wire::HEARTBEAT, 3000, 0)
-                .is_ok()
-        {
-            self.heartbeat_link.sent(self.sentinel_sequence, uptime);
-            self.sentinel_next_beat = uptime.saturating_add(100);
-        }
-    }
-
-    pub fn bind_reply(&mut self, token: u32, server: ThreadSlot) {
-        if token == 0 {
-            return;
-        }
-        let client_idx = (token & 255).wrapping_sub(1) as usize;
-        if let Some(call) = self.calls.get_mut(client_idx) {
-            if call.active && call.generation == token >> 8 {
-                let client = ThreadSlot(client_idx);
-                call.server = Some(server);
-                if let Wait::Reply {
-                    token,
-                    pointer,
-                    capacity,
-                    until,
-                    ..
-                } = self.scheduler.task(client).wait
-                {
-                    self.scheduler.task_mut(client).wait = Wait::Reply {
-                        token,
-                        pointer,
-                        capacity,
-                        until,
-                        server,
-                    };
-                }
-            }
-        }
-    }
-
-    pub fn fail_call(&mut self, client: ThreadSlot, error: Errno) {
-        self.calls[client.index()].active = false;
-        if matches!(self.scheduler.task(client).wait, Wait::Reply { .. }) {
-            self.scheduler.task_mut(client).context.registers[8] = error.to_abi();
-            self.scheduler.wake(client);
-        }
-    }
-
-    pub fn expire_calls(&mut self, uptime: Ticks) {
-        for i in 0..TASKS {
-            let client = ThreadSlot(i);
-            if self.calls[i].active {
-                if let Wait::Reply {
-                    until: Some(deadline),
-                    ..
-                } = self.scheduler.task(client).wait
-                {
-                    if deadline <= uptime {
-                        self.fail_call(client, Errno::Etimedout);
-                    }
-                }
-            }
-        }
-    }
-
     pub fn endpoint(&self, process: ProcSlot, handle: Handle, rights: u16) -> Result<usize, Errno> {
         let capability = self
             .processes
@@ -503,7 +184,8 @@ impl Runtime {
                 let value = match result {
                     Ok(None) => continue,
                     Ok(Some(message)) => {
-                        self.bind_reply(message.reply_token, thread);
+                        self.calls
+                            .bind_reply(&mut self.scheduler, message.reply_token, thread);
                         self.scheduler.task_mut(thread).context.registers[9] = message.reply_token;
                         match copy_to_user_within(
                             &self.processes.slot(task.process).memory,
@@ -524,8 +206,8 @@ impl Runtime {
                 if let Wait::Receive { .. } = task.wait {
                     self.scheduler.prefer(thread);
                 }
-                if !self.logged_wake {
-                    self.logged_wake = true;
+                if !self.logs.wake {
+                    self.logs.wake = true;
                     let _ = writeln!(self.console, "[ipc] receiver woke task={}", task.id.raw());
                 }
             }
@@ -535,12 +217,9 @@ impl Runtime {
     pub fn terminate(&mut self) {
         let process = self.scheduler.current().process;
         let exiting = self.scheduler.current;
-        self.calls[exiting.index()].active = false;
-        for i in 0..TASKS {
-            if self.calls[i].active && self.calls[i].server == Some(exiting) {
-                self.fail_call(ThreadSlot(i), Errno::Epipe);
-            }
-        }
+        self.calls.deactivate(exiting);
+        self.calls
+            .fail_for_server(&mut self.scheduler, exiting, Errno::Epipe);
         self.scheduler.terminate();
         if self
             .scheduler
@@ -551,20 +230,15 @@ impl Runtime {
             return;
         }
         let owner = self.processes.slot(process).id;
-        if self
-            .sentinel_wake
-            .is_some_and(|ticket| ticket.release_on_exit(owner))
-        {
-            self.sentinel_wake = None;
-        }
+        self.sentinel.release_wake_on_exit(owner);
         self.dma.release_process(owner);
         self.processes.slot_mut(process).state = Lifecycle::Dying;
         let objects: [Object; ipc::MAX_ENDPOINTS] = core::array::from_fn(|i| self.ipc.object(i));
-        for i in 0..TASKS {
-            if self.calls[i].active && self.ipc.owner(self.calls[i].endpoint) == Some(process) {
-                self.fail_call(ThreadSlot(i), Errno::Epipe);
-            }
-        }
+        let ipc = &self.ipc;
+        self.calls
+            .fail_where(&mut self.scheduler, Errno::Epipe, |call, _| {
+                ipc.owner(call.endpoint()) == Some(process)
+            });
         let closed = self.ipc.remove_task(process);
         for (i, is_closed) in closed.iter().enumerate() {
             if *is_closed {

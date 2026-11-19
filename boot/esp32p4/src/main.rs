@@ -20,8 +20,12 @@ mod syscall;
 mod users;
 
 mod boot;
+mod calls;
 mod dispatch;
+mod display;
+mod dma;
 mod runtime;
+mod sentinel;
 mod trap;
 mod usermem;
 

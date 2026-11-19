@@ -1,17 +1,22 @@
 use core::fmt::Write;
 use vela_kernel::{
     capability::{self as cap, Capability},
-    id::{ProcSlot, Ticks},
+    id::ProcSlot,
     ipc::Ipc,
     memory::RegionAllocator,
     process::{AddressSpace, EXECUTE, Lifecycle, Processes, READ, WRITE},
-    sched::{Scheduler, TASKS},
+    sched::Scheduler,
     task::Region,
 };
 
 use crate::{
-    arch, board, pmp,
-    runtime::{CONSOLE_RX, Call, RUNTIME, Runtime, create_endpoint, grant},
+    arch, board,
+    calls::CallTable,
+    display::DisplayControl,
+    dma::DmaChannel,
+    pmp,
+    runtime::{BootLogs, CONSOLE_RX, RUNTIME, Runtime, create_endpoint, grant},
+    sentinel::SentinelClient,
     soc, users,
 };
 
@@ -144,32 +149,14 @@ extern "C" fn rust_main() -> ! {
             core::ptr::addr_of!(_dma_page) as usize,
         ),
         ipc,
-        calls: [Call::EMPTY; TASKS],
+        calls: CallTable::new(),
         idle_frame: idle,
         in_idle: false,
-        dma: vela_kernel::dma::Lease::Free,
-        dma_length: 0,
-        dma_deadline: Ticks::ZERO,
-        sentinel_epoch: None,
-        sentinel_ready: false,
-        sentinel_wake: None,
-        sentinel_sequence: 0,
-        sentinel_pending: false,
-        sentinel_command: 0,
-        sentinel_argument: 0,
-        sentinel_diagnostics: 0,
-        sentinel_hz: 0,
-        heartbeat_link: Default::default(),
-        display_mode: 1,
-        display_stage: u8::MAX,
-        sentinel_heartbeat: true,
-        sentinel_next_beat: Ticks::ZERO,
-        sentinel_notifications: 0,
-        sentinel_last_publish: 0,
+        dma: DmaChannel::new(),
+        sentinel: SentinelClient::new(),
+        display: DisplayControl::new(),
         usb_rx_interrupts: 0,
-        logged_block: false,
-        logged_wake: false,
-        logged_idle: false,
+        logs: BootLogs::EMPTY,
     };
     unsafe {
         // SAFETY: once-only initialization. No reference survives assembly entry.
@@ -178,8 +165,7 @@ extern "C" fn rust_main() -> ! {
         soc::timer::start(vela_trap_entry as *const () as usize);
         runtime.console.route_rx_irq();
         if let Some(boot) = soc::sentinel::start() {
-            runtime.sentinel_epoch = Some(boot.epoch);
-            runtime.sentinel_hz = boot.hz;
+            runtime.sentinel.set_boot_info(boot.epoch, boot.hz);
         }
         arch::enter(&runtime.scheduler.current().context);
     }
