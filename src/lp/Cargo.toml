@@ -1,0 +1,17 @@
+[package]
+name = "vela-lp"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+vela-abi = { path = "../abi" }
+
+[lib]
+name = "vela_lp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vela-sentinel"
+path = "src/bin/sentinel.rs"
+test = false
+bench = false

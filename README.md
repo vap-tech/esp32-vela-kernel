@@ -229,7 +229,7 @@ heartbeat observation. A pending diagnostic notice applies backpressure to new
 HP diagnostics rather than replacing it. Replies and DIAGNOSTIC_EVENT use the
 same acknowledged publication slot; no unacknowledged payload is overwritten.
 The additive v2 entry payload packs timestamp_hi16 with type in one word;
-see abi/sentinel.rs. No HP/LP shared RAM queue or pointers are introduced.
+see src/abi/src/sentinel.rs. No HP/LP shared RAM queue or pointers are introduced.
 
 This is volatile LP SRAM, not persistent crash storage. Current HP startup
 resets LP, so an HP reboot also starts a new journal/epoch.

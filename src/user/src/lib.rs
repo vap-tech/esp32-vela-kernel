@@ -1,8 +1,8 @@
+#![no_std]
 //! Fixed-address U-mode services. Shared RX image, private stacks. Every helper
 //! is inlined or placed in .user.text; literals live only in .user.rodata.
 //! No allocation, kernel references, shared writable memory, or core formatting.
-use crate::syscall as abi;
-#[path = "arena.rs"]
+use vela_abi::syscall as abi;
 mod arena;
 use core::mem::MaybeUninit;
 macro_rules! text {

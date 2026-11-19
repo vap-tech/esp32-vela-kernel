@@ -1,8 +1,8 @@
 //! Explicit per-service bump arena. Metadata stays on the caller's stack;
 //! allocations are raw pointers and remain valid only until release/process exit.
 //! Thread sharing requires userspace synchronization. No global allocator.
-use crate::syscall as abi;
 use core::{alloc::Layout, ptr::NonNull};
+use vela_abi::syscall as abi;
 
 pub struct Arena {
     base: usize,

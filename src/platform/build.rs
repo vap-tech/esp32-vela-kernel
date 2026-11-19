@@ -1,6 +1,6 @@
 fn main() {
-    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo:rustc-link-search={dir}");
+    let dir = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rustc-link-search={}", dir.display());
     println!("cargo:rustc-link-arg=-Tlink.x");
     println!("cargo:rerun-if-changed=link.x");
     println!("cargo:rerun-if-changed=entry.S");
@@ -20,12 +20,12 @@ fn main() {
         .status()
         .expect("Python3 and Pillow required for display assets");
     assert!(status.success(), "convert display PNG assets");
-    build_sentinel(&out);
+    build_sentinel(&dir, &out);
     let linker = user_linker();
     for (name, pie) in [("hello", false), ("pic", true), ("dma", true)] {
-        let source = format!("../../userspace/{name}/main.S");
+        let source = format!("../user/apps/{name}/main.S");
         let layout = if pie { "pic" } else { name };
-        let script = format!("../../userspace/{layout}/link.x");
+        let script = format!("../user/apps/{layout}/link.x");
         println!("cargo:rerun-if-changed={source}");
         println!("cargo:rerun-if-changed={script}");
         let status = std::process::Command::new("clang")
@@ -46,44 +46,60 @@ fn main() {
             .arg("-o")
             .arg(out.join(format!("{name}.elf")))
             .status()
-            .expect("clang and ld.lld required for hello.elf");
-        assert!(status.success(), "building hello.elf failed");
+            .expect("clang and ld.lld required for bundled user ELF");
+        assert!(status.success(), "building {name}.elf failed");
     }
 }
 
-fn build_sentinel(out: &std::path::Path) {
-    let source = "../../lp/sentinel/main.rs";
-    let script = "../../lp/sentinel/link.x";
+fn build_sentinel(dir: &std::path::Path, out: &std::path::Path) {
     for path in [
-        source,
-        script,
-        "../../lp/sentinel/watch.rs",
-        "../../lp/sentinel/wakeup.rs",
-        "../../lp/sentinel/journal.rs",
-        "../../soc/esp32p4-v13/lp_counter.rs",
-        "../../abi/sentinel.rs",
-        "../../soc/esp32p4-v13/mailbox.rs",
+        "../lp/Cargo.toml",
+        "../lp/link.x",
+        "../lp/src/lib.rs",
+        "../lp/src/journal.rs",
+        "../lp/src/wakeup.rs",
+        "../lp/src/watch.rs",
+        "../lp/src/hw/mod.rs",
+        "../lp/src/hw/lp_counter.rs",
+        "../lp/src/hw/mailbox.rs",
+        "../lp/src/bin/sentinel.rs",
+        "../abi/Cargo.toml",
+        "../abi/src/lib.rs",
+        "../abi/src/sentinel.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
+    let manifest = dir.join("../lp/Cargo.toml");
+    let script = dir.join("../lp/link.x");
+    let lp_target = out.join("lp-target");
+    let flags = format!(
+        "-Crelocation-model=static\x1f-Clink-arg=--oformat=binary\x1f-Clink-arg=-T{}",
+        script.display()
+    );
     // Link directly to a flat load image. LP initializes its own NOLOAD BSS.
-    let status = std::process::Command::new(std::env::var_os("RUSTC").unwrap())
+    let status = std::process::Command::new(std::env::var_os("CARGO").unwrap())
+        .env_remove("RUSTFLAGS")
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
         .args([
-            "--edition=2024",
-            "--crate-name=vela_sentinel",
-            "--target=riscv32imac-unknown-none-elf",
-            "-Cpanic=abort",
-            "-Copt-level=s",
-            "-Crelocation-model=static",
-            "-Clink-arg=--oformat=binary",
+            "--bin",
+            "vela-sentinel",
+            "--release",
+            "--locked",
+            "--target",
+            "riscv32imac-unknown-none-elf",
+            "--target-dir",
         ])
-        .arg(format!("-Clink-arg=-T{script}"))
-        .arg(source)
-        .arg("-o")
-        .arg(out.join("sentinel.bin"))
+        .arg(&lp_target)
         .status()
-        .expect("run rustc for Sentinel");
+        .expect("run cargo for Sentinel");
     assert!(status.success(), "building LP Sentinel failed");
+    std::fs::copy(
+        lp_target.join("riscv32imac-unknown-none-elf/release/vela-sentinel"),
+        out.join("sentinel.bin"),
+    )
+    .expect("copy sentinel.bin");
 }
 
 // Clang is required for the bundled user assembly; a separately installed LLD

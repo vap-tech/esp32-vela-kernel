@@ -15,4 +15,4 @@ viewport.width = viewport.height = 64
 panel.render_document(cairo.Context(surface), viewport)
 surface.flush()
 assert surface.get_stride() == 64
-(root / "bsp/m5stack-tab5/orbit.a8").write_bytes(bytes(surface.get_data()))
+(root / "src/platform/src/board/orbit.a8").write_bytes(bytes(surface.get_data()))

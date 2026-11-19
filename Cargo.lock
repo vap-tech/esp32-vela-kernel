@@ -3,12 +3,33 @@
 version = 4
 
 [[package]]
+name = "vela-abi"
+version = "0.3.0"
+
+[[package]]
 name = "vela-boot-esp32p4"
 version = "0.3.0"
 dependencies = [
+ "vela-abi",
  "vela-kernel",
+ "vela-lp",
+ "vela-user",
 ]
 
 [[package]]
 name = "vela-kernel"
 version = "0.3.0"
+
+[[package]]
+name = "vela-lp"
+version = "0.3.0"
+dependencies = [
+ "vela-abi",
+]
+
+[[package]]
+name = "vela-user"
+version = "0.3.0"
+dependencies = [
+ "vela-abi",
+]

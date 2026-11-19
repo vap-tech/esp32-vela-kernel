@@ -2,16 +2,22 @@
 //! HP owns snapshots only during stalled LP bootstrap; thereafter LP exclusively.
 pub const BASE: usize = 0x5011_2000;
 pub const MASK: u64 = (1u64 << 48) - 1;
+
+#[cfg(target_arch = "riscv32")]
 unsafe fn read(offset: usize) -> u32 {
     unsafe { ((BASE + offset) as *const u32).read_volatile() }
 }
+
+#[cfg(target_arch = "riscv32")]
 unsafe fn write(offset: usize, value: u32) {
     unsafe {
         ((BASE + offset) as *mut u32).write_volatile(value);
     }
 }
+
 /// # Safety
 /// Exclusive LP timer snapshot owner; do not reset the free-running RTC counter.
+#[cfg(target_arch = "riscv32")]
 pub unsafe fn now() -> u64 {
     unsafe {
         write(0x10, read(0x10) | (1 << 28));
@@ -19,9 +25,10 @@ pub unsafe fn now() -> u64 {
         u64::from(read(0x14)) | (u64::from(read(0x18) & 0xffff) << 32)
     }
 }
+
 /// # Safety
 /// LP held during HP boot, owns target1 and its local interrupt. Target0 untouched.
-#[allow(dead_code)] // HP bootstrap only in this shared HP/LP backend.
+#[cfg(target_arch = "riscv32")]
 pub unsafe fn initialize() {
     unsafe {
         write(0x3fc, read(0x3fc) | (1 << 31));
@@ -35,7 +42,7 @@ pub unsafe fn initialize() {
 /// # Safety
 /// LP-only runtime ownership of target1 and IRQ27. No HP sleep/wakeup routing
 /// is changed: this is an interrupt deadline for a running LP, not sleep support.
-#[allow(dead_code)] // LP runtime only.
+#[cfg(target_arch = "riscv32")]
 pub unsafe fn deadline(target: Option<u64>) {
     unsafe {
         write(0x40, read(0x40) & !(1 << 31));
@@ -49,9 +56,10 @@ pub unsafe fn deadline(target: Option<u64>) {
         core::arch::asm!("fence iorw,iorw", options(nostack));
     }
 }
+
 /// # Safety
 /// LP interrupt handler owns target1. Never acknowledge HP/target0 interrupts.
-#[allow(dead_code)] // LP runtime only.
+#[cfg(target_arch = "riscv32")]
 pub unsafe fn acknowledge() {
     unsafe {
         write(0x44, 1 << 31);

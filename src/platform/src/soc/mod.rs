@@ -1,4 +1,16 @@
+pub mod clock;
 pub mod console;
+pub mod display_io;
+pub mod dma;
+pub mod dsi;
+pub mod flash;
+pub mod psram;
+pub mod scanout;
+pub mod sentinel;
+pub mod timer;
+
+pub use vela_lp::hw::{lp_counter, mailbox};
+
 /// Read back the cache mode configured by the SPM startup.
 /// # Safety
 /// Single boot hart owns cache control, no concurrent reconfiguration.
@@ -10,16 +22,3 @@ pub unsafe fn memory_ready() -> bool {
             && crate::pac::read(crate::pac::CACHE + 0x278) == 0
     }
 }
-
-pub mod dma;
-mod mailbox;
-pub mod sentinel;
-pub mod timer;
-
-pub mod clock;
-pub mod display_io;
-pub mod dsi;
-pub mod flash;
-pub mod lp_counter;
-pub mod psram;
-pub mod scanout;

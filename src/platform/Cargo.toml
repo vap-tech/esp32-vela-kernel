@@ -3,12 +3,15 @@ name = "vela-boot-esp32p4"
 version = "0.3.0"
 edition = "2024"
 build = "build.rs"
+
 [dependencies]
-vela-kernel = { path = "../../kernel" }
+vela-abi = { path = "../abi" }
+vela-kernel = { path = "../kernel" }
+vela-lp = { path = "../lp" }
+vela-user = { path = "../user" }
+
 [[bin]]
 name = "vela-boot-esp32p4"
 path = "src/main.rs"
 test = false
 bench = false
-[features]
-trap-test = []

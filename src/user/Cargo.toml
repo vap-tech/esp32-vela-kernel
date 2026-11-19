@@ -1,0 +1,11 @@
+[package]
+name = "vela-user"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+vela-abi = { path = "../abi" }
+
+[lib]
+test = false
+bench = false

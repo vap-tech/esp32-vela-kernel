@@ -1,7 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["boot/esp32p4", "kernel"]
-default-members = ["boot/esp32p4"]
+members = [
+    "src/abi",
+    "src/kernel",
+    "src/lp",
+    "src/platform",
+    "src/user",
+]
+default-members = ["src/platform"]
 
 [profile.dev]
 panic = "abort"

@@ -1,15 +1,11 @@
 #![no_std]
 #![no_main]
-mod journal;
-#[path = "../../soc/esp32p4-v13/lp_counter.rs"]
-mod lp_counter;
-#[path = "../../soc/esp32p4-v13/mailbox.rs"]
-mod mailbox;
-mod wakeup;
-mod watch;
-#[path = "../../abi/sentinel.rs"]
-mod wire;
 use core::arch::{asm, global_asm};
+use vela_abi::sentinel as wire;
+use vela_lp::{
+    hw::{lp_counter, mailbox},
+    journal, wakeup, watch,
+};
 
 global_asm!(
     r#"
