@@ -243,6 +243,7 @@ impl Runtime {
             Handle(args.a0),
             copy_to_user_within,
         )?;
+        self.shootdown_stale_remote_pmp();
         if let Some(index) = revoked.mask_event {
             self.mask_irq_slot(index);
         }

@@ -158,8 +158,7 @@ boot_enable_icache0:
     fence rw, rw
     li t6, 0x3ff10000
     lw t0, 0(t6)
-    andi t0, t0, -2
-    ori t0, t0, 2
+    andi t0, t0, -4
     sw t0, 0(t6)
     li t0, 0x12
     sw t0, 8(t6)

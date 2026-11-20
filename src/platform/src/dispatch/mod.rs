@@ -43,6 +43,7 @@ impl Runtime {
             syscall::YIELD => self.sys_yield(switch),
             syscall::EXIT => self.sys_exit(switch),
             syscall::THREAD_PRIORITY => self.sys_thread_priority(current, args, switch),
+            syscall::THREAD_AFFINITY => self.sys_thread_affinity(current, args, frame, switch),
             syscall::IPC_CALL => self.sys_ipc_call(current, args, switch),
             syscall::IPC_REPLY => self.sys_ipc_reply(current, args, switch),
             syscall::IPC_REPLY_RECV => self.sys_ipc_reply_recv(current, args, frame, switch),

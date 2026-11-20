@@ -74,6 +74,8 @@ pub struct Thread<C: Copy> {
     pub priority: u8,
     pub effective_priority: u8,
     pub affinity: u8,
+    pub last_hart: u8,
+    pub migrations: u32,
     pub stack: Region,
     pub runtime_ticks: u64,
     pub user_cycles: u64,

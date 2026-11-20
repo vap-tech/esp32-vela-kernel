@@ -285,6 +285,12 @@ impl CycleAccounting {
     /// Flush in-progress trap cycles and capacity up to `now` and return an atomic snapshot.
     pub fn snapshot(&mut self, mcycle: u64, counter_16m: u64) -> CycleSnapshot {
         self.on_trap_exit(mcycle);
+        self.snapshot_remote(counter_16m)
+    }
+
+    /// Flush wall-clock capacity up to `counter_16m` for a remote hart without reading
+    /// that hart's local `mcycle` CSR.
+    pub fn snapshot_remote(&mut self, counter_16m: u64) -> CycleSnapshot {
         self.advance_capacity(counter_16m);
         CycleSnapshot {
             user_cycles: self.user_cycles,

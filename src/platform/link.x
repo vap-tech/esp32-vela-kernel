@@ -41,6 +41,7 @@ SECTIONS {
  ASSERT(_bss_end <= _dma_page, "Runtime overlaps DMA arena")
  _boot_stack_top = ORIGIN(BOOT_STACK) + LENGTH(BOOT_STACK);
  _stack_bottom = ORIGIN(STACK);
+ _hp1_stack_top = ORIGIN(STACK) + LENGTH(STACK) / 2;
  _stack_top = ORIGIN(STACK) + LENGTH(STACK);
  ASSERT(SIZEOF(.entry) <= 8192, "SPM entry exceeds 8KiB")
  ASSERT(_upper_start == 0x4ff40000, "ROM reservation violated")

@@ -17,7 +17,7 @@ use crate::{
     arch, board,
     display::DisplayControl,
     dma::{DMA_CH_DW_GDMA_SCANOUT, DMA_CH_GDMA_AHB_CH1},
-    runtime::{BootLogs, IRQ_SLOT_CONSOLE_RX, RUNTIME, Runtime},
+    runtime::{BootLogs, HartState, IRQ_SLOT_CONSOLE_RX, RUNTIME, Runtime},
     sentinel::SentinelClient,
     soc,
 };
@@ -28,6 +28,7 @@ const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf
 
 unsafe extern "C" {
     static _stack_top: u8;
+    static _hp1_stack_top: u8;
     static _dma_page: u8;
     static _bss_end: u8;
     fn vela_trap_entry();
@@ -50,12 +51,19 @@ extern "C" fn rust_main() -> ! {
         board::NAME
     );
 
-    let mut idle = arch::TrapFrame::user(
+    let mut idle0 = arch::TrapFrame::user(
         arch::vela_idle_entry as *const () as usize,
         core::ptr::addr_of!(_stack_top) as usize,
         0,
     );
-    idle.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
+    idle0.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
+
+    let mut idle1 = arch::TrapFrame::user(
+        arch::vela_idle_entry as *const () as usize,
+        core::ptr::addr_of!(_hp1_stack_top) as usize,
+        0,
+    );
+    idle1.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
 
     let mut events = EventTable::new();
     events
@@ -71,9 +79,26 @@ extern "C" fn rust_main() -> ! {
     // SAFETY: once-only initialization on hart0 with IRQs masked.
     let runtime = unsafe {
         (*RUNTIME.0.get()).write(Runtime {
-            scheduler: Scheduler::empty(idle),
+            scheduler: Scheduler::empty(idle0),
             processes: Processes::new(),
-            active_space: None,
+            harts: [
+                HartState {
+                    active_space: None,
+                    idle_frame: idle0,
+                    in_idle: false,
+                    cycles: CycleAccounting::new(),
+                    ipi_interrupts: 0,
+                    pmp_shootdowns: 0,
+                },
+                HartState {
+                    active_space: None,
+                    idle_frame: idle1,
+                    in_idle: true,
+                    cycles: CycleAccounting::new(),
+                    ipi_interrupts: 0,
+                    pmp_shootdowns: 0,
+                },
+            ],
             pmp_images: [None; PROCESSES],
             allocator: RegionAllocator::new(
                 core::ptr::addr_of!(_bss_end) as usize,
@@ -83,14 +108,11 @@ extern "C" fn rust_main() -> ! {
             ipc: Ipc::new(),
             calls: CallTable::new(),
             events,
-            idle_frame: idle,
-            in_idle: false,
             dma,
             sentinel: SentinelClient::new(),
             display: DisplayControl::new(),
             dma_interrupts: 0,
             sentinel_interrupts: 0,
-            cycles: CycleAccounting::new(),
             freq_mode: FreqMode::Auto,
             active_high_180mhz: false,
             tickless_armed: false,
@@ -219,9 +241,9 @@ extern "C" fn rust_main() -> ! {
     // SAFETY: isolated physical regions, no users executing yet.
     let (revision, initial_pmp, _) = runtime.pmp_images[procfs.slot.index()].unwrap();
     assert!(unsafe { initial_pmp.activate_initial() }, "PMP readback");
-    runtime.pmp_images[procfs.slot.index()] = Some((revision, initial_pmp, true));
-    runtime.active_space = Some((procfs.slot, revision));
-    runtime.scheduler.activate_initial(ThreadSlot(0));
+    runtime.pmp_images[procfs.slot.index()] = Some((revision, initial_pmp, 1));
+    runtime.harts[0].active_space = Some((procfs.slot, revision));
+    runtime.scheduler.activate_initial_on(0, ThreadSlot(0));
 
     let _ = writeln!(
         runtime.console,
@@ -231,14 +253,61 @@ extern "C" fn rust_main() -> ! {
     unsafe {
         // SAFETY: no Rust reference survives assembly entry into U-mode.
         soc::timer::start(vela_trap_entry as *const () as usize);
+        soc::smp::init_hp0_ipi();
         runtime.console.route_rx_irq();
         if let Some(boot) = soc::sentinel::start() {
             runtime.sentinel.set_boot_info(boot.epoch, boot.hz);
         }
         let rates = soc::clock::rates_mhz();
         let now_16m = soc::timer::counter_16mhz().expect("SYSTIMER boot snapshot");
-        runtime.cycles.start(arch::mcycle(), now_16m, rates.cpu);
+        runtime.harts[0]
+            .cycles
+            .start(arch::mcycle(), now_16m, rates.cpu);
+        runtime.harts[1].cycles.start(0, now_16m, rates.cpu);
+        let hp1_ok = soc::smp::start_hp1(arch::vela_hp1_entry);
+        let _ = writeln!(
+            runtime.console,
+            "[smp] HP1 online={} L1-ICache1={}",
+            u8::from(hp1_ok),
+            u8::from(soc::memory_ready())
+        );
         let initial_ctx = &raw const runtime.scheduler.tasks[0].context;
+        soc::smp::mark_hart_in_user(0);
+        // Kick HP1 so it picks up any runnable thread (e.g. console/shell) immediately.
+        soc::smp::send_ipi(1);
         arch::enter(initial_ctx);
     }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn rust_hp1_main() -> ! {
+    assert_eq!(arch::hart_id(), 1);
+    unsafe {
+        arch::init_counters();
+        soc::smp::init_hp1_clic_and_ipi(vela_trap_entry as *const () as usize);
+    }
+    soc::smp::KERNEL_LOCK.lock();
+    let idle_ptr: *const arch::TrapFrame = unsafe {
+        let runtime = (*RUNTIME.0.get()).assume_init_mut();
+        let (_, initial_pmp, mask) = runtime.pmp_images[0].unwrap();
+        assert!(initial_pmp.activate_initial(), "HP1 PMP readback");
+        let rev = runtime
+            .processes
+            .slot(vela_kernel::id::ProcSlot(0))
+            .memory
+            .revision;
+        runtime.pmp_images[0] = Some((rev, initial_pmp, mask | 2));
+        runtime.harts[1].active_space = Some((vela_kernel::id::ProcSlot(0), rev));
+        runtime.harts[1].in_idle = true;
+        let rates = soc::clock::rates_mhz();
+        let now_16m = soc::timer::counter_16mhz().unwrap_or(0);
+        runtime.harts[1]
+            .cycles
+            .start(arch::mcycle(), now_16m, rates.cpu);
+        &raw const runtime.harts[1].idle_frame
+    };
+    soc::smp::mark_hart_in_kernel(1);
+    soc::smp::set_hp1_online();
+    soc::smp::KERNEL_LOCK.unlock();
+    unsafe { arch::enter(idle_ptr) }
 }

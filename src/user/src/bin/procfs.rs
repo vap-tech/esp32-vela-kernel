@@ -29,7 +29,7 @@ fn ticks_16m_to_ns(ticks_16m: u32) -> (u32, u32) {
 
 /// Render a virtual `/proc/*` file into `out`.
 /// Returns `0` on success, `1` on ENOENT, `2` on kernel/device query failure.
-fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
+fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
     match path {
         b"/proc/loadavg" | b"/proc/uptime" => {
             let mut snap = [0u8; abi::STATS_BYTES];
@@ -68,11 +68,11 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             0
         }
         b"/proc/interrupts" => {
-            let mut snap = [0u8; abi::STATS_IRQ_ALL_BYTES];
+            let mut snap = [0u8; abi::STATS_IRQ_SMP_BYTES];
             if sys::call(
                 abi::STATS,
                 snap.as_mut_ptr() as u32,
-                abi::STATS_IRQ_ALL_BYTES as u32,
+                abi::STATS_IRQ_SMP_BYTES as u32,
                 abi::STATS_IRQ,
                 0,
             ) != 0
@@ -80,11 +80,14 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
                 out.append(b"service unavailable\n");
                 return 2;
             }
-            let names: [&[u8]; 4] = [
+            let names: [&[u8]; 7] = [
                 b"systimer0 ",
                 b"usb_serial_jtag_rx ",
                 b"gdma_ahb_ch1 ",
                 b"lp_sentinel ",
+                b"ipi_hp0 ",
+                b"ipi_hp1 ",
+                b"pmp_shootdowns ",
             ];
             for (i, name) in names.into_iter().enumerate() {
                 let (lo, hi) = dword_le(&snap, i * 8);
@@ -95,11 +98,11 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             0
         }
         b"/proc/cpuinfo" => {
-            let mut snap = [0u8; abi::STATS_CPU_BYTES];
+            let mut snap = [0u8; abi::STATS_CPU_SMP_BYTES];
             if sys::call(
                 abi::STATS,
                 snap.as_mut_ptr() as u32,
-                abi::STATS_CPU_BYTES as u32,
+                abi::STATS_CPU_SMP_BYTES as u32,
                 abi::STATS_CPU,
                 0,
             ) != 0
@@ -120,11 +123,23 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             let freq_meta = word_le(&snap, 56);
             let tickless_entries = word_le(&snap, 60);
             let (tl_lo, tl_hi) = dword_le(&snap, 64);
+            let harts_online = word_le(&snap, 72);
+            let hp1_online = word_le(&snap, 76);
+            let (u1_lo, u1_hi) = dword_le(&snap, 80);
+            let (k1_lo, k1_hi) = dword_le(&snap, 88);
+            let (i1_lo, i1_hi) = dword_le(&snap, 96);
+            let (c1_lo, c1_hi) = dword_le(&snap, 104);
+            let (ipi_lo, ipi_hi) = dword_le(&snap, 112);
+            let (sd_lo, sd_hi) = dword_le(&snap, 120);
 
             let user = (u64::from(u_hi) << 32) | u64::from(u_lo);
             let kernel = (u64::from(k_hi) << 32) | u64::from(k_lo);
             let cap = (u64::from(c_hi) << 32) | u64::from(c_lo);
             let busy_bps = ratio_bps(user.saturating_add(kernel), cap);
+            let user1 = (u64::from(u1_hi) << 32) | u64::from(u1_lo);
+            let kernel1 = (u64::from(k1_hi) << 32) | u64::from(k1_lo);
+            let cap1 = (u64::from(c1_hi) << 32) | u64::from(c1_lo);
+            let busy1_bps = ratio_bps(user1.saturating_add(kernel1), cap1);
             let freq_mode: &[u8] = match freq_meta & 0xff {
                 1 => b"pin_40mhz",
                 2 => b"pin_180mhz",
@@ -134,6 +149,8 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
 
             out.append(b"hart ");
             out.decimal(hart);
+            out.append(b"\nharts_online ");
+            out.decimal(harts_online);
             out.append(b"\nisa rv32imac\ncpu_mhz ");
             out.decimal(cpu_mhz);
             out.append(b"\napb_mhz ");
@@ -158,6 +175,20 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             out.decimal64(i_lo, i_hi);
             out.append(b"\ncapacity_cycles ");
             out.decimal64(c_lo, c_hi);
+            out.append(b"\nhp1_online ");
+            out.decimal(hp1_online);
+            out.append(b"\nhp1_busy_pct ");
+            out.hundredths(busy1_bps);
+            out.append(b"\nhp1_user_cycles ");
+            out.decimal64(u1_lo, u1_hi);
+            out.append(b"\nhp1_kernel_cycles ");
+            out.decimal64(k1_lo, k1_hi);
+            out.append(b"\nhp1_idle_cycles ");
+            out.decimal64(i1_lo, i1_hi);
+            out.append(b"\nipi_total ");
+            out.decimal64(ipi_lo, ipi_hi);
+            out.append(b"\npmp_shootdowns ");
+            out.decimal64(sd_lo, sd_hi);
             out.append(b"\nirq_latency_ns ");
             let (last_lo, last_hi) = ticks_16m_to_ns(lat_last);
             out.decimal64(last_lo, last_hi);
@@ -180,7 +211,7 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
                 out.append(b"service unavailable\n");
                 return 2;
             }
-            out.append(b"tid pid state prio ticks user_cycles preempt stack\n");
+            out.append(b"tid pid state prio hart/aff mig ticks user_cycles preempt stack\n");
             let stride = abi::STATS_TASK_WORDS * 4;
             for slot in 0..8 {
                 let base = slot * stride;
@@ -206,6 +237,10 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
                 };
                 let prio = (meta >> 8) & 0xff;
                 let eff_prio = (meta >> 16) & 0xff;
+                let smp_meta = (meta >> 24) & 0xff;
+                let aff = smp_meta & 3;
+                let hart = (smp_meta >> 2) & 1;
+                let mig = (smp_meta >> 4) & 0xf;
 
                 out.decimal(tid);
                 out.push(b' ');
@@ -216,6 +251,12 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
                 out.decimal(prio);
                 out.push(b'/');
                 out.decimal(eff_prio);
+                out.append(b" hp");
+                out.decimal(hart);
+                out.push(b'/');
+                out.decimal(aff);
+                out.push(b' ');
+                out.decimal(mig);
                 out.push(b' ');
                 out.decimal64(t_lo, t_hi);
                 out.push(b' ');
@@ -376,7 +417,7 @@ struct SnapshotCache {
     path: [u8; 32],
     path_len: usize,
     status: u8,
-    text: TextBuf<384>,
+    text: TextBuf<512>,
 }
 
 impl SnapshotCache {

@@ -1,10 +1,10 @@
 use vela_kernel::{
     capability::{self as cap, Authority},
     errno::Errno,
-    id::{Handle, Pid, ProcSlot, Tid},
+    id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
     lifecycle,
     memory::MemoryClass,
-    task::{Region, Wait},
+    task::{Context, Region, Wait},
 };
 
 use super::Args;
@@ -75,6 +75,35 @@ impl Runtime {
         Ok(0)
     }
 
+    pub(super) fn sys_thread_affinity(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        frame: &mut arch::TrapFrame,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        let (thread, affinity) =
+            lifecycle::set_thread_affinity(&mut self.scheduler, current, Tid(args.a0), args.a1)?;
+        let hart = self.scheduler.active_hart;
+        if args.a1 != 0 {
+            if thread == self.scheduler.current && (affinity & (1u8 << hart)) == 0 {
+                *switch = true;
+            } else {
+                *switch = self.scheduler.should_preempt_for(hart);
+            }
+            self.notify_remote_hart(false);
+        }
+        let running_hart = if thread == self.scheduler.current && (affinity & (1u8 << hart)) == 0 {
+            affinity.trailing_zeros() as usize
+        } else {
+            self.scheduler
+                .running_hart(thread)
+                .unwrap_or_else(|| self.scheduler.task(thread).last_hart as usize)
+        };
+        frame.set_return2(running_hart as u32);
+        Ok(u32::from(affinity))
+    }
+
     pub(super) fn sys_thread_create(
         &mut self,
         current: ProcSlot,
@@ -84,7 +113,7 @@ impl Runtime {
             base: args.a1 as usize,
             size: args.a2 as usize,
         };
-        lifecycle::spawn_user_thread(
+        let tid = lifecycle::spawn_user_thread(
             &self.processes,
             &self.allocator,
             &mut self.scheduler,
@@ -94,8 +123,9 @@ impl Runtime {
             args.a4,
             args.a5,
             |entry, sp| arch::TrapFrame::user(entry, sp, args.a3),
-        )
-        .map(Tid::raw)
+        )?;
+        self.notify_remote_hart(false);
+        Ok(tid.raw())
     }
 
     pub(super) fn sys_process_exit(
@@ -158,57 +188,101 @@ impl Runtime {
                 copy_to_user(self.memory(), ptr, &buffer[..len])
             }
             syscall::STATS_CPU => {
-                if len != syscall::STATS_CPU_BYTES {
+                if !matches!(len, syscall::STATS_CPU_BYTES | syscall::STATS_CPU_SMP_BYTES) {
                     return Err(Errno::Einval);
                 }
-                // SAFETY: sole HP0 owner under masked IRQs.
+                // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
                 let rates = unsafe { crate::soc::clock::rates_mhz() };
                 let now_16m =
                     unsafe { crate::soc::timer::counter_16mhz() }.expect("SYSTIMER stats snapshot");
-                self.cycles.sync_clock(now_16m, rates.cpu);
-                let cyc = self.cycles.snapshot(arch::mcycle(), now_16m);
+                let local_hart = arch::hart_id().min(1);
+                let local_mcycle = arch::mcycle();
+                for h in 0..2 {
+                    self.harts[h].cycles.sync_clock(now_16m, rates.cpu);
+                }
+                let cyc0 = if local_hart == 0 {
+                    self.harts[0].cycles.snapshot(local_mcycle, now_16m)
+                } else {
+                    self.harts[0].cycles.snapshot_remote(now_16m)
+                };
+                let cyc1 = if local_hart == 1 {
+                    self.harts[1].cycles.snapshot(local_mcycle, now_16m)
+                } else {
+                    self.harts[1].cycles.snapshot_remote(now_16m)
+                };
+                let online_harts = 1 + u32::from(soc::smp::hp1_online());
+                let ipi_total = self.harts[0]
+                    .ipi_interrupts
+                    .saturating_add(self.harts[1].ipi_interrupts);
+                let shootdowns = self.harts[0]
+                    .pmp_shootdowns
+                    .saturating_add(self.harts[1].pmp_shootdowns);
                 let words = [
                     arch::hart_id() as u32,
                     rates.cpu,
                     rates.apb,
                     self.sentinel.hz(),
-                    cyc.user_cycles as u32,
-                    (cyc.user_cycles >> 32) as u32,
-                    cyc.kernel_cycles as u32,
-                    (cyc.kernel_cycles >> 32) as u32,
-                    cyc.idle_cycles as u32,
-                    (cyc.idle_cycles >> 32) as u32,
-                    cyc.capacity_cycles as u32,
-                    (cyc.capacity_cycles >> 32) as u32,
-                    cyc.irq_latency_last_16m,
-                    cyc.irq_latency_max_16m,
-                    self.freq_mode.to_abi() | (cyc.freq_switches << 8),
-                    cyc.tickless_entries,
-                    cyc.tickless_ticks as u32,
-                    (cyc.tickless_ticks >> 32) as u32,
+                    cyc0.user_cycles as u32,
+                    (cyc0.user_cycles >> 32) as u32,
+                    cyc0.kernel_cycles as u32,
+                    (cyc0.kernel_cycles >> 32) as u32,
+                    cyc0.idle_cycles as u32,
+                    (cyc0.idle_cycles >> 32) as u32,
+                    cyc0.capacity_cycles as u32,
+                    (cyc0.capacity_cycles >> 32) as u32,
+                    cyc0.irq_latency_last_16m,
+                    cyc0.irq_latency_max_16m,
+                    self.freq_mode.to_abi() | (cyc0.freq_switches << 8),
+                    cyc0.tickless_entries,
+                    cyc0.tickless_ticks as u32,
+                    (cyc0.tickless_ticks >> 32) as u32,
+                    // Extended SMP words (words 18..31 = bytes 72..128):
+                    online_harts,
+                    u32::from(soc::smp::hp1_online()),
+                    cyc1.user_cycles as u32,
+                    (cyc1.user_cycles >> 32) as u32,
+                    cyc1.kernel_cycles as u32,
+                    (cyc1.kernel_cycles >> 32) as u32,
+                    cyc1.idle_cycles as u32,
+                    (cyc1.idle_cycles >> 32) as u32,
+                    cyc1.capacity_cycles as u32,
+                    (cyc1.capacity_cycles >> 32) as u32,
+                    ipi_total as u32,
+                    (ipi_total >> 32) as u32,
+                    shootdowns as u32,
+                    (shootdowns >> 32) as u32,
                 ];
-                let mut buffer = [0u8; syscall::STATS_CPU_BYTES];
-                for (i, word) in words.into_iter().enumerate() {
+                let mut buffer = [0u8; syscall::STATS_CPU_SMP_BYTES];
+                for (i, word) in words[..len / 4].iter().enumerate() {
                     buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }
-                copy_to_user(self.memory(), ptr, &buffer)
+                copy_to_user(self.memory(), ptr, &buffer[..len])
             }
             syscall::STATS_IRQ => {
-                if len != syscall::STATS_IRQ_ALL_BYTES {
+                if !matches!(
+                    len,
+                    syscall::STATS_IRQ_ALL_BYTES | syscall::STATS_IRQ_SMP_BYTES
+                ) {
                     return Err(Errno::Einval);
                 }
                 let systimer = self.scheduler.snapshot().scheduler_ticks;
+                let shootdowns = self.harts[0]
+                    .pmp_shootdowns
+                    .saturating_add(self.harts[1].pmp_shootdowns);
                 let counts = [
                     systimer,
                     usb_rx_interrupts,
                     self.dma_interrupts,
                     self.sentinel_interrupts,
+                    self.harts[0].ipi_interrupts,
+                    self.harts[1].ipi_interrupts,
+                    shootdowns,
                 ];
-                let mut buffer = [0u8; syscall::STATS_IRQ_ALL_BYTES];
-                for (i, count) in counts.into_iter().enumerate() {
+                let mut buffer = [0u8; syscall::STATS_IRQ_SMP_BYTES];
+                for (i, count) in counts[..len / 8].iter().enumerate() {
                     buffer[i * 8..i * 8 + 8].copy_from_slice(&count.to_le_bytes());
                 }
-                copy_to_user(self.memory(), ptr, &buffer)
+                copy_to_user(self.memory(), ptr, &buffer[..len])
             }
             syscall::STATS_STREAMS => {
                 if len != syscall::STATS_STREAMS_BYTES {
@@ -245,10 +319,20 @@ impl Runtime {
                         continue;
                     }
                     let pid = self.processes.slot(task.process).id.raw();
+                    let hart = self
+                        .scheduler
+                        .running_hart(ThreadSlot(slot))
+                        .unwrap_or(task.last_hart as usize)
+                        & 1;
+                    // meta[24..26] = affinity (1..3), meta[26] = active/last hart (0 or 1),
+                    // meta[28..32] = migrations & 0xf.
+                    let packed_smp = u32::from(task.affinity & 3)
+                        | ((hart as u32) << 2)
+                        | ((task.migrations.min(15)) << 4);
                     let meta = u32::from(code)
                         | (u32::from(task.priority) << 8)
                         | (u32::from(task.effective_priority) << 16)
-                        | (u32::from(task.affinity) << 24);
+                        | (packed_smp << 24);
                     let words = [
                         task.id.raw(),
                         pid,
@@ -270,7 +354,7 @@ impl Runtime {
                 if len != syscall::STATS_SDCARD_BYTES {
                     return Err(Errno::Einval);
                 }
-                // SAFETY: sole HP0 owner under masked IRQs.
+                // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
                 let sd = unsafe { soc::sdcard::telemetry() };
                 let asset = unsafe { board::images::status() };
                 let flags = u32::from(sd.ready)

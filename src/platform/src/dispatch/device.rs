@@ -40,7 +40,9 @@ impl Runtime {
         )?;
         let before_rates = unsafe { soc::clock::rates_mhz() };
         if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
-            self.cycles.sync_clock(now_16m, before_rates.cpu);
+            for hart in &mut self.harts {
+                hart.cycles.sync_clock(now_16m, before_rates.cpu);
+            }
         }
         let (diag, result) = self
             .display
@@ -48,7 +50,9 @@ impl Runtime {
         let after_rates = unsafe { soc::clock::rates_mhz() };
         if after_rates.cpu != before_rates.cpu {
             if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
-                self.cycles.sync_clock(now_16m, after_rates.cpu);
+                for hart in &mut self.harts {
+                    hart.cycles.sync_clock(now_16m, after_rates.cpu);
+                }
             }
         }
         if after_rates.cpu >= 180 {
@@ -91,8 +95,10 @@ impl Runtime {
         space.dma_access(page, false)?;
         let prepared = pmp::Prepared::new(space).unwrap();
         assert!(unsafe { prepared.activate(true) });
-        self.pmp_images[current.index()] = Some((space.revision, prepared, true));
-        self.active_space = Some((current, space.revision));
+        let hart = self.scheduler.active_hart;
+        self.pmp_images[current.index()] = Some((space.revision, prepared, 1u8 << hart));
+        self.harts[hart].active_space = Some((current, space.revision));
+        self.shootdown_stale_remote_pmp();
         let deadline = self.scheduler.uptime().saturating_add(100);
         prepare_dma_buffer(page, DmaDirection::MemToMem, false);
         self.dma
@@ -248,7 +254,7 @@ impl Runtime {
             return Err(Errno::Efault);
         }
         let mut rx = [0u8; syscall::I2C_MAX_BYTES];
-        // SAFETY: sole HP0 kernel owner of the Tab5 system I2C pins with IRQs masked.
+        // SAFETY: sole kernel owner of the Tab5 system I2C pins with IRQs masked.
         unsafe {
             board::i2c_transfer(addr, &tx[..tx_len], &mut rx[..rx_len])?;
         }

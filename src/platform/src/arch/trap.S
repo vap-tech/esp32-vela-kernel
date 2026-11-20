@@ -76,7 +76,13 @@ vela_resume:
     csrw mstatus, t0
     .option push
     .option norelax
+    csrr t0, mhartid
+    beqz t0, .Lhart0_stack
+    la t0, _hp1_stack_top
+    j .Lcheck_mpp
+.Lhart0_stack:
     la t0, _stack_top
+.Lcheck_mpp:
     .option pop
     lw t1, 136(sp)
     srli t1, t1, 11
@@ -123,3 +129,22 @@ vela_resume:
 vela_idle_entry:
     wfi
     j vela_idle_entry
+
+.section .text.hp1_entry,"ax"
+.balign 4
+.global vela_hp1_entry
+vela_hp1_entry:
+    csrci mstatus, 8
+    csrw mie, zero
+    csrw mscratch, zero
+    .option push
+    .option norelax
+    la sp, _hp1_stack_top
+    la t0, vela_trap_entry
+    .option pop
+    ori t0, t0, 3
+    csrw mtvec, t0
+    fence rw, rw
+    fence.i
+    call rust_hp1_main
+1:  j 1b

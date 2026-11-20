@@ -62,6 +62,7 @@ impl Runtime {
             current,
             region,
         )?;
+        self.shootdown_stale_remote_pmp();
         if class == MemoryClass::Psram {
             let _ = self.display.set_psram_region_mapped(region, false);
         }

@@ -804,6 +804,41 @@ pub fn set_thread_priority<C: Copy>(
     Ok(())
 }
 
+/// Query (`affinity == 0`) or update (`affinity` in `1..=3`: `1 = HP0`, `2 = HP1`, `3 = any`)
+/// the hart affinity mask of a live thread owned by `current` (`target_tid == Tid::NONE`
+/// selects `scheduler.current`).
+pub fn set_thread_affinity<C: Copy>(
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    target_tid: Tid,
+    affinity: u32,
+) -> Result<(ThreadSlot, u8), Errno> {
+    if affinity > 3 {
+        return Err(Errno::Einval);
+    }
+    let thread = if target_tid == Tid::NONE {
+        let cur = scheduler.current;
+        if scheduler.task(cur).process != current || scheduler.task(cur).state == State::Terminated
+        {
+            return Err(Errno::Eperm);
+        }
+        cur
+    } else {
+        scheduler
+            .tasks
+            .iter()
+            .position(|t| {
+                t.id == target_tid && t.process == current && t.state != State::Terminated
+            })
+            .map(ThreadSlot)
+            .ok_or(Errno::Eperm)?
+    };
+    if affinity != 0 {
+        scheduler.task_mut(thread).affinity = affinity as u8;
+    }
+    Ok((thread, scheduler.task(thread).affinity))
+}
+
 /// Validate entry permissions, owned non-overlapping stack region, priority
 /// ceiling, and hart affinity before creating a new thread in `current`.
 #[allow(clippy::too_many_arguments)]
@@ -826,7 +861,8 @@ pub fn spawn_user_thread<C: Copy>(
         || stack.size & 15 != 0
         || !proc.memory.permits(stack.base, stack.size, process::WRITE)
         || priority > u32::from(proc.priority_ceiling)
-        || affinity != 1
+        || affinity == 0
+        || affinity & !3 != 0
         || !allocator.owns(proc.id, stack)
     {
         return Err(Errno::Einval);
@@ -2130,6 +2166,37 @@ mod tests {
         assert_eq!(
             resolve_event(&h.processes, &h.events, p2, rebound, 0),
             Err(Errno::Ebadf)
+        );
+    }
+
+    #[test]
+    fn thread_affinity_query_and_update_enforce_ownership_and_valid_masks() {
+        let mut h = harness();
+        let p0 = ProcSlot(0);
+        let p1 = ProcSlot(1);
+
+        // Query current thread affinity (Tid::NONE -> ThreadSlot(0), default affinity = 1).
+        assert_eq!(
+            set_thread_affinity(&mut h.scheduler, p0, Tid::NONE, 0),
+            Ok((ThreadSlot(0), 1))
+        );
+        // Update to any hart (3 = HP0 | HP1) and then pin to HP1 (2).
+        assert_eq!(
+            set_thread_affinity(&mut h.scheduler, p0, Tid(1), 3),
+            Ok((ThreadSlot(0), 3))
+        );
+        assert_eq!(
+            set_thread_affinity(&mut h.scheduler, p0, Tid(1), 2),
+            Ok((ThreadSlot(0), 2))
+        );
+        // Invalid mask (> 3) and foreign process TID are rejected.
+        assert_eq!(
+            set_thread_affinity(&mut h.scheduler, p0, Tid(1), 4),
+            Err(Errno::Einval)
+        );
+        assert_eq!(
+            set_thread_affinity(&mut h.scheduler, p1, Tid(1), 1),
+            Err(Errno::Eperm)
         );
     }
 }

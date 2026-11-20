@@ -10,7 +10,7 @@ use vela_kernel::{
     lifecycle::{self, ReapedProcess},
     memory::{MemoryClass, RegionAllocator},
     process::{AddressSpace, EXECUTE, Process, Processes, READ, WRITE},
-    sched::{Scheduler, TASKS},
+    sched::{HARTS, Scheduler, TASKS},
     stats::{CycleAccounting, FreqMode, MAX_TICKLESS_TICKS, compute_tickless_ticks},
     task::{Region, State, Wait},
 };
@@ -47,24 +47,32 @@ impl BootLogs {
     };
 }
 
+/// Per-hart runtime state (`HP0` and `HP1`).
+pub struct HartState {
+    pub active_space: Option<(ProcSlot, u32)>,
+    pub idle_frame: arch::TrapFrame,
+    pub in_idle: bool,
+    pub cycles: CycleAccounting,
+    pub ipi_interrupts: u64,
+    pub pmp_shootdowns: u64,
+}
+
 pub struct Runtime {
     pub scheduler: Scheduler<arch::TrapFrame>,
     pub processes: Processes,
-    pub active_space: Option<(ProcSlot, u32)>,
-    pub pmp_images: [Option<(u32, pmp::Prepared, bool)>; vela_kernel::process::PROCESSES],
+    pub harts: [HartState; HARTS],
+    /// Per-process prepared PMP CSR image `(revision, prepared, verified_hart_mask)`.
+    pub pmp_images: [Option<(u32, pmp::Prepared, u8)>; vela_kernel::process::PROCESSES],
     pub allocator: RegionAllocator,
     pub console: soc::console::Console,
     pub ipc: Ipc,
     pub calls: CallTable,
     pub events: EventTable,
-    pub idle_frame: arch::TrapFrame,
-    pub in_idle: bool,
     pub dma: DmaTable,
     pub sentinel: SentinelClient,
     pub display: DisplayControl,
     pub dma_interrupts: u64,
     pub sentinel_interrupts: u64,
-    pub cycles: CycleAccounting,
     pub freq_mode: FreqMode,
     pub active_high_180mhz: bool,
     pub tickless_armed: bool,
@@ -82,9 +90,9 @@ pub mod device_wait {
 pub const IRQ_SLOT_CONSOLE_RX: usize = syscall::IRQ_SLOT_CONSOLE_RX as usize;
 
 pub struct BootCell(pub UnsafeCell<MaybeUninit<Runtime>>);
-// SAFETY: hart0 only, HP1 reset, MIE=0 in every Rust kernel path. The M-mode
-// WFI loop has no Rust references and never accesses this cell. Initialization
-// precedes timer enable; outermost traps are the only later borrowers.
+// SAFETY: Shared access across HP0 and HP1 is serialized by `soc::smp::KERNEL_LOCK`
+// with `MIE = 0` throughout every Rust kernel trap path. The M-mode WFI loop has
+// no Rust references and never accesses this cell.
 unsafe impl Sync for BootCell {}
 pub static RUNTIME: BootCell = BootCell(UnsafeCell::new(MaybeUninit::uninit()));
 
@@ -99,21 +107,75 @@ impl Runtime {
         }
     }
 
-    /// Switch HP0 operating point (`40 MHz` XTAL <-> `180 MHz` CPLL) while
-    /// integrating `mcycle` capacity at the exact `SYSTIMER` transition point.
+    /// Wake the remote hart via `FROM_CPU` IPI if it is idle with a runnable
+    /// compatible thread or if a higher-priority runnable thread can preempt it.
+    pub fn notify_remote_hart(&mut self, timer_tick: bool) {
+        if !soc::smp::hp1_online() {
+            return;
+        }
+        let remote = 1 - self.scheduler.active_hart.min(HARTS - 1);
+        if self.scheduler.needs_reschedule_on(remote, timer_tick) {
+            soc::smp::send_ipi(remote);
+        }
+    }
+
+    /// Deadlock-free synchronous IPI PMP shootdown: if `remote` hart currently has
+    /// a stale `active_space` (its process's `AddressSpace` revision changed or was
+    /// reaped), invalidate `harts[remote].active_space`, send an IPI to `remote`,
+    /// and wait until `remote` has entered M-mode (`is_hart_in_kernel_or_idle(remote)`).
+    ///
+    /// Once `remote` is in M-mode (`vela_trap_entry`), it has stopped all U-mode memory
+    /// accesses and cannot resume U-mode until the caller releases `KERNEL_LOCK` and
+    /// `remote` reloads its hardware PMP CSRs via [`Self::ensure_active_space_on`].
+    pub fn shootdown_stale_remote_pmp(&mut self) {
+        if !soc::smp::hp1_online() {
+            return;
+        }
+        let local = self.scheduler.active_hart.min(HARTS - 1);
+        let remote = 1 - local;
+        let Some((proc_slot, active_rev)) = self.harts[remote].active_space else {
+            return;
+        };
+        let proc = self.processes.slot(proc_slot);
+        let is_alive = proc.state == vela_kernel::process::Lifecycle::Alive;
+        if is_alive && proc.memory.revision == active_rev {
+            return;
+        }
+        self.harts[remote].active_space = None;
+        self.harts[remote].pmp_shootdowns = self.harts[remote].pmp_shootdowns.saturating_add(1);
+        if self.harts[remote].in_idle || soc::smp::is_hart_in_kernel_or_idle(remote) {
+            return;
+        }
+        soc::smp::send_ipi(remote);
+        let mut spins = 1_000_000u32;
+        while !soc::smp::is_hart_in_kernel_or_idle(remote) {
+            core::hint::spin_loop();
+            spins -= 1;
+            if spins == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Switch HP operating point (`40 MHz` XTAL <-> `180 MHz` CPLL) while
+    /// integrating `mcycle` capacity on all harts at the exact `SYSTIMER` transition point.
     pub fn apply_cpu_speed(&mut self, high_180mhz: bool) -> Result<u32, Errno> {
         if !high_180mhz && (self.display.is_active() || self.dma.any_active()) {
             return Err(Errno::Ebusy);
         }
-        // SAFETY: sole HP0 clock/timer owner under masked IRQs.
+        // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
         unsafe {
             let before = soc::clock::rates_mhz();
             if let Some(now_16m) = soc::timer::counter_16mhz() {
-                self.cycles.sync_clock(now_16m, before.cpu);
+                for hart in &mut self.harts {
+                    hart.cycles.sync_clock(now_16m, before.cpu);
+                }
             }
             let after = soc::clock::set_speed(high_180mhz).map_err(|_| Errno::Eio)?;
             if let Some(now_16m) = soc::timer::counter_16mhz() {
-                self.cycles.sync_clock(now_16m, after.cpu);
+                for hart in &mut self.harts {
+                    hart.cycles.sync_clock(now_16m, after.cpu);
+                }
             }
             Ok(after.cpu)
         }
@@ -152,9 +214,12 @@ impl Runtime {
     /// Re-check pending peripheral events, LP mailbox replies, and IRQ slot
     /// generations under `MIE=0` right before entering `wfi`.
     ///
-    /// Returns `true` if any thread was woken (so the caller must select the
-    /// newly runnable thread instead of entering idle).
+    /// Returns `true` if any thread was woken for `self.scheduler.active_hart`.
     pub fn poll_pending_before_idle(&mut self) -> bool {
+        let hart = self.scheduler.active_hart;
+        if hart != 0 {
+            return self.scheduler.has_runnable_for(hart);
+        }
         let gen_before = self.events.table_generation();
         // 1. If a console waiter is blocked on `IRQ_SLOT_CONSOLE_RX` and the
         //    USB Serial/JTAG FIFO already has bytes ready, deliver the event now.
@@ -165,7 +230,8 @@ impl Runtime {
                 .notify(IRQ_SLOT_CONSOLE_RX, &mut self.scheduler)
                 .is_some()
             {
-                return true;
+                self.notify_remote_hart(false);
+                return self.scheduler.has_runnable_for(0);
             }
         }
         // 2. If the LP Sentinel mailbox doorbell is asserted, consume and dispatch it.
@@ -174,35 +240,39 @@ impl Runtime {
             if let Some(reply) = unsafe { soc::sentinel::acknowledge(self.sentinel.epoch()) } {
                 self.sentinel
                     .handle_reply(reply, &mut self.scheduler, &self.processes);
+                self.notify_remote_hart(false);
             }
         }
         // 3. Re-verify if any thread became runnable or if an event/generation changed.
-        self.scheduler.has_runnable()
+        self.scheduler.has_runnable_for(0)
             || self.events.table_generation() != gen_before
-            || (self.events.any_pending() && self.scheduler.has_runnable())
+            || (self.events.any_pending() && self.scheduler.has_runnable_for(0))
     }
 
     /// Program `SYSTIMER` target 0 for the next idle window (`1..=MAX_TICKLESS_TICKS`)
-    /// and apply the DVFS idle operating point (`40 MHz` XTAL when eligible).
+    /// and apply the DVFS idle operating point (`40 MHz` XTAL when both harts are idle).
     pub fn enter_tickless_idle(&mut self) {
         let now = unsafe { soc::timer::uptime_ticks() }
             .map(Ticks)
             .unwrap_or_else(|| self.scheduler.uptime());
         self.sentinel.tick(now);
+        let hp1_busy = soc::smp::hp1_online()
+            && (!self.harts[1].in_idle || self.scheduler.has_runnable_for(1));
         let sleep_ticks = compute_tickless_ticks(
             now,
             self.scheduler.nearest_deadline(),
             self.sentinel.next_deadline(),
             self.scheduler.next_load_sample_at(),
             self.display.is_active(),
-            self.dma.any_active(),
+            self.dma.any_active() || hp1_busy,
             MAX_TICKLESS_TICKS,
         );
         // Downshift to 40 MHz XTAL during tickless sleep (`sleep_ticks >= 2` or
-        // coordinated `PREPARE_SLEEP`) when in Auto or Pin40Mhz mode and no
-        // high-bandwidth peripheral is active.
+        // coordinated `PREPARE_SLEEP`) when in Auto or Pin40Mhz mode, HP1 is also
+        // idle, and no high-bandwidth peripheral is active.
         let can_downshift = !self.display.is_active()
             && !self.dma.any_active()
+            && !hp1_busy
             && matches!(self.freq_mode, FreqMode::Auto | FreqMode::Pin40Mhz)
             && (sleep_ticks >= 2 || self.sentinel.is_sleep_prepared());
         if can_downshift {
@@ -216,18 +286,14 @@ impl Runtime {
                 self.tickless_armed = true;
                 self.tickless_enter_16m = now_16m;
                 self.tickless_period_16m = period_16m;
-                self.cycles.record_tickless_entry();
-                self.cycles.set_expected_irq_16m(expected_16m);
+                self.harts[0].cycles.record_tickless_entry();
+                self.harts[0].cycles.set_expected_irq_16m(expected_16m);
             }
         }
     }
 
     /// Restore periodic 10 ms `SYSTIMER` ticks and the active DVFS operating point
-    /// upon waking from a tickless idle window.
-    ///
-    /// If `timer_irq` is `false` (woken early by an external interrupt such as
-    /// `USB_RX` or `LP_SENTINEL`), also synchronizes `Scheduler` and `SentinelClient`
-    /// to the current `SYSTIMER` epoch so elapsed deadlines are serviced first.
+    /// upon waking `HP0` from a tickless idle window.
     pub fn exit_tickless_idle(&mut self, timer_irq: bool) {
         // SAFETY: sole hart0 SYSTIMER owner under masked IRQs.
         let now_16m =
@@ -235,14 +301,17 @@ impl Runtime {
         if self.tickless_armed {
             let elapsed_ticks =
                 now_16m.saturating_sub(self.tickless_enter_16m) / soc::timer::PERIOD_10MS_16M;
-            self.cycles.record_tickless_wake(elapsed_ticks.max(1));
+            self.harts[0]
+                .cycles
+                .record_tickless_wake(elapsed_ticks.max(1));
             if timer_irq {
                 let live_tick = self.scheduler.snapshot().scheduler_ticks > 0;
-                self.cycles
+                self.harts[0]
+                    .cycles
                     .on_timer_irq(now_16m, self.tickless_period_16m, live_tick);
             }
             let next_periodic_16m = unsafe { soc::timer::restore_periodic_10ms() };
-            self.cycles.set_expected_irq_16m(next_periodic_16m);
+            self.harts[0].cycles.set_expected_irq_16m(next_periodic_16m);
             self.tickless_armed = false;
             self.tickless_period_16m = soc::timer::PERIOD_10MS_16M;
             if !timer_irq {
@@ -258,7 +327,7 @@ impl Runtime {
                 self.active_high_180mhz || self.display.is_active() || self.dma.any_active()
             }
         };
-        if restore_high && self.cycles.cpu_mhz() < 180 {
+        if restore_high && self.harts[0].cycles.cpu_mhz() < 180 {
             let _ = self.apply_cpu_speed(true);
         }
     }
@@ -293,34 +362,36 @@ impl Runtime {
         &self.processes.slot(self.scheduler.current().process).memory
     }
 
-    /// Ensure hardware PMP matches `process`'s current `AddressSpace` revision.
+    /// Ensure hardware PMP on `hart` matches `process`'s current `AddressSpace` revision.
     ///
     /// # Safety
-    /// Local hart M-mode with IRQs masked after `activate_initial` succeeded at boot.
+    /// Must be called on `hart` in M-mode with IRQs masked after `activate_initial`.
     #[inline(always)]
-    pub unsafe fn ensure_active_space(&mut self, process: ProcSlot) -> bool {
+    pub unsafe fn ensure_active_space_on(&mut self, hart: usize, process: ProcSlot) -> bool {
         let revision = self.processes.slot(process).memory.revision;
-        if self.active_space == Some((process, revision)) {
+        if self.harts[hart].active_space == Some((process, revision)) {
             return true;
         }
         let slot = process.index();
-        let (image, verified) = match self.pmp_images[slot] {
-            Some((rev, image, verified)) if rev == revision => (image, verified),
+        let hart_bit = 1u8 << hart;
+        let (image, verified_mask) = match self.pmp_images[slot] {
+            Some((rev, image, mask)) if rev == revision => (image, mask),
             _ => {
                 let memory = &self.processes.slot(process).memory;
                 let Ok(image) = pmp::Prepared::new(memory) else {
                     return false;
                 };
-                (image, false)
+                (image, 0)
             }
         };
-        if !unsafe { image.activate(!verified) } {
+        let verified_on_hart = (verified_mask & hart_bit) != 0;
+        if !unsafe { image.activate(!verified_on_hart) } {
             return false;
         }
-        if !verified {
-            self.pmp_images[slot] = Some((revision, image, true));
+        if !verified_on_hart {
+            self.pmp_images[slot] = Some((revision, image, verified_mask | hart_bit));
         }
-        self.active_space = Some((process, revision));
+        self.harts[hart].active_space = Some((process, revision));
         true
     }
 
@@ -363,6 +434,7 @@ impl Runtime {
         self.sentinel.release_wake_on_exit(reaped.pid);
         self.dma.release_all_for_process(reaped.pid);
         self.pmp_images[reaped.slot.index()] = None;
+        self.shootdown_stale_remote_pmp();
         self.note_woken_receiver(reaped.first_woken);
     }
 
@@ -375,6 +447,9 @@ impl Runtime {
                 && t.state != State::Terminated
         });
         if is_last {
+            // If another thread of this process was somehow active on the remote hart,
+            // shoot down its PMP before unmapping PSRAM/SRAM.
+            self.shootdown_stale_remote_pmp();
             let display = &mut self.display;
             self.allocator.release_psram_owner_with(owner, |region| {
                 let _ = display.set_psram_region_mapped(region, false);
@@ -528,7 +603,7 @@ impl Runtime {
                 core::arch::asm!("fence.i", options(nostack));
             }
             self.processes.slot_mut(process).memory = space;
-            self.pmp_images[process.index()] = Some((space.revision, prepared, false));
+            self.pmp_images[process.index()] = Some((space.revision, prepared, 0));
             Ok((
                 LoadedElf {
                     slot: process,
@@ -560,7 +635,7 @@ impl Runtime {
         let frame =
             arch::TrapFrame::user_args(loaded.entry, loaded.stack.base + loaded.stack.size, args);
         self.scheduler
-            .create_thread(loaded.slot, frame, loaded.stack, loaded.entry, priority, 1)
+            .create_thread(loaded.slot, frame, loaded.stack, loaded.entry, priority, 3)
     }
 
     pub fn abort_loaded(&mut self, loaded: LoadedElf) {
@@ -581,6 +656,7 @@ impl Runtime {
             self.abort_loaded(loaded);
             return Err(e);
         }
+        self.notify_remote_hart(false);
         Ok(loaded.pid)
     }
 
@@ -631,5 +707,6 @@ impl Runtime {
                 self.scheduler.wake_with(thread, result);
             }
         }
+        self.notify_remote_hart(false);
     }
 }

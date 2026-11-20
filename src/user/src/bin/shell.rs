@@ -72,8 +72,10 @@ fn bench_syscall() -> u32 {
 }
 
 fn bench_ctx_switch() -> Option<u32> {
+    let (prev_aff, _) = sys::call6(abi::THREAD_AFFINITY, 0, abi::AFFINITY_HP0, 0, 0, 0, 0);
     let (base, size) = sys::call6(abi::MEM_ALLOC, 4096, 0, 0, 0, 0, 0);
     if (base as i32) < 0 || size < 4096 {
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
         return None;
     }
     sys::sleep();
@@ -84,11 +86,12 @@ fn bench_ctx_switch() -> Option<u32> {
         size,
         64,
         1,
-        1,
+        abi::AFFINITY_HP0,
     )
     .0;
     if (tid as i32) <= 0 {
         let _ = sys::call(abi::MEM_FREE, base, size, 0, 0);
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
         return None;
     }
     let start = sys::rdcycle64();
@@ -96,13 +99,16 @@ fn bench_ctx_switch() -> Option<u32> {
         sys::call(abi::YIELD, 0, 0, 0, 0);
     }
     let elapsed = sys::rdcycle64().wrapping_sub(start);
-    for _ in 0..4 {
+    let mut res = None;
+    for _ in 0..8 {
         sys::call(abi::YIELD, 0, 0, 0, 0);
         if sys::call(abi::MEM_FREE, base, size, 0, 0) == 0 {
-            return Some(((elapsed + 64) >> 7) as u32);
+            res = Some(((elapsed + 64) >> 7) as u32);
+            break;
         }
     }
-    None
+    let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
+    res
 }
 
 fn bench_ipc_rtt(request_handle: u32) -> Option<u32> {
@@ -425,6 +431,156 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
     true
 }
 
+extern "C" fn smp_worker(state_ptr: u32) -> ! {
+    let state = state_ptr as *mut u32;
+    unsafe {
+        let (_, hart0) = sys::call6(abi::THREAD_AFFINITY, 0, 0, 0, 0, 0, 0);
+        state.add(1).write_volatile(hart0);
+        for i in 0..32u32 {
+            state.write_volatile(i + 1);
+            sys::call(abi::YIELD, 0, 0, 0, 0);
+        }
+        // Migrate worker to HP0 and then back to HP1.
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, abi::AFFINITY_HP0, 0, 0, 0, 0);
+        let (_, hart_m0) = sys::call6(abi::THREAD_AFFINITY, 0, 0, 0, 0, 0, 0);
+        state.add(2).write_volatile(hart_m0);
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, abi::AFFINITY_HP1, 0, 0, 0, 0);
+        let (_, hart_m1) = sys::call6(abi::THREAD_AFFINITY, 0, 0, 0, 0, 0, 0);
+        state.add(3).write_volatile(hart_m1);
+        state.add(4).write_volatile(1);
+    }
+    // Stay briefly in U-mode on HP1 so the parent on HP0 can trigger a live IPI PMP shootdown
+    // on a separate shared page while this thread is actively executing on HP1.
+    for _ in 0..16 {
+        sys::call(abi::YIELD, 0, 0, 0, 0);
+    }
+    sys::exit();
+}
+
+fn run_smp_test() {
+    let (prev_aff, _) = sys::call6(abi::THREAD_AFFINITY, 0, abi::AFFINITY_HP0, 0, 0, 0, 0);
+    let (base, size) = sys::call6(abi::MEM_ALLOC, 4096, 0, 0, 0, 0, 0);
+    if (base as i32) < 0 || size < 4096 {
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
+        sys::write(FAILED);
+        return;
+    }
+    let (scratch_base, scratch_size) = sys::call6(abi::MEM_ALLOC, 4096, 0, 0, 0, 0, 0);
+    if (scratch_base as i32) < 0 || scratch_size < 4096 {
+        let _ = sys::call(abi::MEM_FREE, base, size, 0, 0);
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
+        sys::write(FAILED);
+        return;
+    }
+    let state_ptr = base as *mut u32;
+    unsafe {
+        for i in 0..8 {
+            state_ptr.add(i).write_volatile(0);
+        }
+    }
+    let tid = sys::call6(
+        abi::THREAD_CREATE,
+        smp_worker as *const () as usize as u32,
+        base,
+        size,
+        base,
+        1,
+        abi::AFFINITY_HP1,
+    )
+    .0;
+    if (tid as i32) <= 0 {
+        let _ = sys::call(abi::MEM_FREE, scratch_base, scratch_size, 0, 0);
+        let _ = sys::call(abi::MEM_FREE, base, size, 0, 0);
+        let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
+        sys::write(FAILED);
+        return;
+    }
+    // Wait until the worker on HP1 completes its initial loop and migration steps.
+    for _ in 0..128 {
+        if unsafe { state_ptr.add(4).read_volatile() } != 0 {
+            break;
+        }
+        sys::call(abi::YIELD, 0, 0, 0, 0);
+    }
+    // Free scratch_base while worker is active on HP1 -> triggers synchronous IPI PMP shootdown!
+    let _ = sys::call(abi::MEM_FREE, scratch_base, scratch_size, 0, 0);
+    let iters = unsafe { state_ptr.read_volatile() };
+    let start_hart = unsafe { state_ptr.add(1).read_volatile() };
+    let mig_hp0 = unsafe { state_ptr.add(2).read_volatile() };
+    let mig_hp1 = unsafe { state_ptr.add(3).read_volatile() };
+    let mut freed = false;
+    for _ in 0..32 {
+        sys::call(abi::YIELD, 0, 0, 0, 0);
+        if sys::call(abi::MEM_FREE, base, size, 0, 0) == 0 {
+            freed = true;
+            break;
+        }
+    }
+    let _ = sys::call6(abi::THREAD_AFFINITY, 0, prev_aff.clamp(1, 3), 0, 0, 0, 0);
+    let mut cpu = [0u8; abi::STATS_CPU_SMP_BYTES];
+    if !freed
+        || sys::call(
+            abi::STATS,
+            cpu.as_mut_ptr() as u32,
+            abi::STATS_CPU_SMP_BYTES as u32,
+            abi::STATS_CPU,
+            0,
+        ) != 0
+    {
+        sys::write(FAILED);
+        return;
+    }
+    let harts_online = word_le(&cpu, 72);
+    let ipi_total = word_le(&cpu, 112);
+    let shootdowns = word_le(&cpu, 120);
+    let mut out = Buffer::new();
+    out.append(b"smp harts=");
+    out.decimal(harts_online);
+    out.append(b" worker_tid=");
+    out.decimal(tid);
+    out.append(b" iters=");
+    out.decimal(iters);
+    out.append(b" path=hp");
+    out.decimal(start_hart);
+    out.append(b"->hp");
+    out.decimal(mig_hp0);
+    out.append(b"->hp");
+    out.decimal(mig_hp1);
+    out.append(b" ipi=");
+    out.decimal(ipi_total);
+    out.append(b" shootdowns=");
+    out.decimal(shootdowns);
+    out.push(b'\n');
+    sys::write(out.as_slice());
+}
+
+fn smp_command(text: &[u8]) -> bool {
+    if text == b"smp" {
+        run_smp_test();
+        return true;
+    }
+    let mask = match text {
+        b"smp status" => 0,
+        b"smp pin 0" => abi::AFFINITY_HP0,
+        b"smp pin 1" => abi::AFFINITY_HP1,
+        b"smp any" => abi::AFFINITY_ANY,
+        _ => return false,
+    };
+    let (aff, hart) = sys::call6(abi::THREAD_AFFINITY, 0, mask, 0, 0, 0, 0);
+    if (aff as i32) <= 0 {
+        sys::write(FAILED);
+        return true;
+    }
+    let mut out = Buffer::new();
+    out.append(b"shell hart=hp");
+    out.decimal(hart);
+    out.append(b" affinity=");
+    out.decimal(aff);
+    out.push(b'\n');
+    sys::write(out.as_slice());
+    true
+}
+
 fn freq_command(text: &[u8], sentinel_cap: u32) -> bool {
     let mode = match text {
         b"freq" => abi::FREQ_MODE_QUERY,
@@ -462,13 +618,13 @@ fn command(line: &Buffer, caps: Caps) {
     if text.is_empty() {
         return;
     }
-    if wake_command(line, caps.sentinel) || freq_command(text, caps.sentinel) {
+    if wake_command(line, caps.sentinel) || freq_command(text, caps.sentinel) || smp_command(text) {
         return;
     }
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | bench | freq [auto/40/180] | sdcard | run hello/pic/pic-psram/dma | memtest\n",
+                b"help | cat <path> | uptime | bench | smp [status/pin 0/pin 1/any] | freq [auto/40/180] | sdcard | run hello/pic/pic-psram/dma | memtest\n",
             );
             sys::write(
                 b"sentinel [hello/status/pause/resume/log/mark] | sentinel sleep/wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",

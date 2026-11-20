@@ -9,10 +9,12 @@ pub const STATS: u32 = 5; // a0=writable user buffer, a1=byte len, a2=STATS_* se
 pub const STATS_SUMMARY: u32 = 0; // legacy summary (+ optional USB RX count)
 pub const STATS_BYTES: usize = 44; // 4*u32, 2*u64, 3*u32, little-endian
 pub const STATS_IRQ_BYTES: usize = STATS_BYTES + 8; // optional USB RX IRQ count at byte 44
-pub const STATS_CPU: u32 = 1; // hart, clocks, mcycle breakdown, capacity, IRQ latency, DVFS/tickless
-pub const STATS_CPU_BYTES: usize = 72;
-pub const STATS_IRQ: u32 = 2; // u64 counts: systimer0, usb_rx, gdma_ahb_ch1, lp_sentinel
-pub const STATS_IRQ_ALL_BYTES: usize = 32;
+pub const STATS_CPU: u32 = 1; // hart, clocks, mcycle breakdown, capacity, IRQ latency, DVFS/tickless, HP1 SMP
+pub const STATS_CPU_BYTES: usize = 72; // legacy single-hart cpuinfo snapshot
+pub const STATS_CPU_SMP_BYTES: usize = 128; // full 2-hart HP0+HP1 SMP cpuinfo snapshot
+pub const STATS_IRQ: u32 = 2; // u64 counts: systimer0, usb_rx, gdma_ahb_ch1, lp_sentinel (+ ipi_hp0, ipi_hp1, pmp_shootdowns)
+pub const STATS_IRQ_ALL_BYTES: usize = 32; // legacy 4-source IRQ table
+pub const STATS_IRQ_SMP_BYTES: usize = 56; // 7-source SMP IRQ table (+ ipi_hp0, ipi_hp1, pmp_shootdowns)
 pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
 pub const STATS_STREAMS_BYTES: usize = 36;
 pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
@@ -37,7 +39,7 @@ pub const IPC_BYTES: usize = 96;
 pub const NONBLOCK: u32 = 1;
 pub const EAGAIN: u32 = (-11i32) as u32;
 
-pub const THREAD_CREATE: u32 = 12; // a0=entry, a1=stack base, a2=size, a3=arg, a4=priority, a5=affinity
+pub const THREAD_CREATE: u32 = 12; // a0=entry, a1=stack base, a2=size, a3=arg, a4=priority, a5=affinity (1=HP0, 2=HP1, 3=any)
 pub const PROCESS_EXIT: u32 = 13;
 
 pub const MEM_ALLOC: u32 = 14; // a0=requested bytes, a1=MEM_CLASS_* -> a0=base, a1=actual size
@@ -89,6 +91,11 @@ pub const FREQ_MODE_AUTO: u32 = 0; // DVFS idle governor: 180 MHz active, 40 MHz
 pub const FREQ_MODE_40MHZ: u32 = 1; // Pin 40 MHz XTAL (rejected with -EBUSY while display/DMA active)
 pub const FREQ_MODE_180MHZ: u32 = 2; // Pin 180 MHz CPLL
 pub const FREQ_MODE_QUERY: u32 = 3; // Query current cpu_mhz and FREQ_MODE_* without changing policy
+pub const THREAD_AFFINITY: u32 = 43; // a0=own TID (0=current thread), a1=affinity mask (0=query, 1=HP0, 2=HP1, 3=any) -> a0=affinity, a1=active hart
+
+pub const AFFINITY_HP0: u32 = 1; // Pin thread to HP0 (hart 0)
+pub const AFFINITY_HP1: u32 = 2; // Pin thread to HP1 (hart 1)
+pub const AFFINITY_ANY: u32 = 3; // Allow migration/balancing across HP0 and HP1
 
 pub const IRQ_SLOT_CONSOLE_RX: u32 = 0; // USB Serial/JTAG RX packet interrupt slot (CLIC line 18)
 

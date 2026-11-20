@@ -34,10 +34,11 @@ impl TrapFrame {
 }
 unsafe extern "C" {
     pub fn vela_idle_entry();
+    pub fn vela_hp1_entry() -> !;
     fn vela_resume(frame: *const TrapFrame) -> !;
 }
 /// # Safety
-/// Hart0 M-mode, IRQs disabled, valid user mappings and kernel stack, complete
+/// Local HP hart M-mode, IRQs disabled, valid user mappings and kernel stack, complete
 /// integer frame with FS=off; MPP=U or the dedicated M-mode idle continuation.
 pub unsafe fn enter(frame: *const TrapFrame) -> ! {
     unsafe { vela_resume(frame) }
@@ -58,7 +59,7 @@ pub fn halt() -> ! {
 const _: () = assert!(core::mem::size_of::<TrapFrame>() == 144);
 
 /// Enable `mcycle` (`mcountinhibit.CY = 0`) and permit unprivileged `rdcycle`/`rdcycleh`
-/// reads (`mcounteren.CY = 1`) on HP0.
+/// reads (`mcounteren.CY = 1`) on the calling HP hart.
 ///
 /// # Safety
 /// Must be called in M-mode on the active HP hart.

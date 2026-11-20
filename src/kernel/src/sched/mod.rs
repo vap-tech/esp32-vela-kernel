@@ -8,13 +8,18 @@ use crate::{
 
 pub const TASKS: usize = 8;
 pub const BOOT_THREADS: usize = 3;
+pub const HARTS: usize = 2;
 
-/// Static round-robin + priority scheduler. Only accessed by hart0 with machine
-/// interrupts disabled; all context switches happen at the outermost trap boundary.
+/// Static multi-hart round-robin + priority scheduler. Protected by the kernel
+/// spinlock with machine interrupts disabled; all context switches happen at
+/// the outermost trap boundary.
 /// `C` is architecture-owned saved CPU state; this crate has no SoC dependency.
 pub struct Scheduler<C: Copy> {
     pub tasks: [Thread<C>; TASKS],
     pub current: ThreadSlot,
+    pub active_hart: usize,
+    pub hart_current: [Option<ThreadSlot>; HARTS],
+    pub hart_last: [ThreadSlot; HARTS],
     ticks: u64,
     uptime: Ticks,
     sampled_at: Ticks,
@@ -49,6 +54,8 @@ impl<C: Copy> Scheduler<C> {
             priority: 1,
             effective_priority: 1,
             affinity: 1,
+            last_hart: 0,
+            migrations: 0,
             stack: stacks[i.min(BOOT_THREADS - 1)],
             runtime_ticks: 0,
             user_cycles: 0,
@@ -57,6 +64,9 @@ impl<C: Copy> Scheduler<C> {
         Self {
             tasks,
             current: ThreadSlot(0),
+            active_hart: 0,
+            hart_current: [Some(ThreadSlot(0)), None],
+            hart_last: [ThreadSlot(0), ThreadSlot(0)],
             ticks: 0,
             uptime: Ticks::ZERO,
             sampled_at: Ticks::ZERO,
@@ -77,6 +87,8 @@ impl<C: Copy> Scheduler<C> {
             priority: 1,
             effective_priority: 1,
             affinity: 1,
+            last_hart: 0,
+            migrations: 0,
             stack: Region { base: 0, size: 0 },
             runtime_ticks: 0,
             user_cycles: 0,
@@ -85,6 +97,9 @@ impl<C: Copy> Scheduler<C> {
         Self {
             tasks,
             current: ThreadSlot(0),
+            active_hart: 0,
+            hart_current: [None; HARTS],
+            hart_last: [ThreadSlot(0); HARTS],
             ticks: 0,
             uptime: Ticks::ZERO,
             sampled_at: Ticks::ZERO,
@@ -94,9 +109,28 @@ impl<C: Copy> Scheduler<C> {
         }
     }
     pub fn activate_initial(&mut self, slot: ThreadSlot) {
+        self.activate_initial_on(0, slot);
+    }
+    pub fn activate_initial_on(&mut self, hart: usize, slot: ThreadSlot) {
+        assert!(hart < HARTS);
         assert_eq!(self.tasks[slot.index()].state, State::Ready);
         self.tasks[slot.index()].state = State::Running;
+        self.tasks[slot.index()].last_hart = hart as u8;
+        self.hart_current[hart] = Some(slot);
+        self.hart_last[hart] = slot;
+        self.active_hart = hart;
         self.current = slot;
+    }
+    /// Synchronize the active caller hart (`0` or `1`) on kernel entry so
+    /// [`Self::current`] reflects the thread currently executing on `hart`.
+    pub fn enter_hart(&mut self, hart: usize) {
+        assert!(hart < HARTS);
+        self.active_hart = hart;
+        self.current = self.hart_current[hart].unwrap_or(self.hart_last[hart]);
+    }
+    /// Return the hart index (`0..HARTS`) currently executing `slot`, if any.
+    pub fn running_hart(&self, slot: ThreadSlot) -> Option<usize> {
+        self.hart_current.iter().position(|&cur| cur == Some(slot))
     }
     pub fn task(&self, slot: ThreadSlot) -> &Thread<C> {
         &self.tasks[slot.index()]
@@ -107,11 +141,26 @@ impl<C: Copy> Scheduler<C> {
     pub fn uptime(&self) -> Ticks {
         self.uptime
     }
-    /// Return `true` if any thread is currently `Ready` or `Running` on hart 0.
+    /// Return `true` if any thread is currently `Ready` or `Running` for `self.active_hart`.
     pub fn has_runnable(&self) -> bool {
+        self.has_runnable_for(self.active_hart)
+    }
+    /// Return `true` if any thread is currently `Ready` for `hart` or already running on `hart`.
+    pub fn has_runnable_for(&self, hart: usize) -> bool {
+        assert!(hart < HARTS);
+        if self
+            .hart_current
+            .get(hart)
+            .copied()
+            .flatten()
+            .is_some_and(|slot| self.tasks[slot.index()].state == State::Running)
+        {
+            return true;
+        }
+        let mask = 1u8 << hart;
         self.tasks
             .iter()
-            .any(|t| matches!(t.state, State::Ready | State::Running) && t.affinity & 1 != 0)
+            .any(|t| t.state == State::Ready && t.affinity & mask != 0)
     }
     /// Earliest expiration deadline among all `Blocked` threads, if any.
     pub fn nearest_deadline(&self) -> Option<Ticks> {
@@ -143,6 +192,7 @@ impl<C: Copy> Scheduler<C> {
             .position(|t| t.state == State::Terminated)
             .ok_or(Errno::Enospc)?;
         let id = self.last_id.checked_next().ok_or(Errno::Eoverflow)?;
+        let initial_hart = if affinity & 1 != 0 { 0 } else { 1 };
         self.tasks[index] = Thread {
             id,
             process,
@@ -152,6 +202,8 @@ impl<C: Copy> Scheduler<C> {
             priority,
             effective_priority: priority,
             affinity,
+            last_hart: initial_hart,
+            migrations: 0,
             wait: Wait::None,
             deadline: None,
             state: State::Ready,
@@ -169,25 +221,62 @@ impl<C: Copy> Scheduler<C> {
         self.tasks[self.current.index()].context = context;
     }
     pub fn select(&mut self, preemptive: bool) -> Option<ThreadSlot> {
-        let cur = self.current.index();
-        let was_running = self.tasks[cur].state == State::Running;
+        self.select_for(self.active_hart, preemptive)
+    }
+    /// Select the next runnable thread eligible for `hart` (`affinity & (1 << hart) != 0`).
+    ///
+    /// A thread currently `State::Running` on another hart remains `State::Running`
+    /// and is never considered here, guaranteeing a thread context cannot execute
+    /// on two harts simultaneously.
+    pub fn select_for(&mut self, hart: usize, preemptive: bool) -> Option<ThreadSlot> {
+        assert!(hart < HARTS);
+        self.active_hart = hart;
+        let mask = 1u8 << hart;
+        let cur_slot = self.hart_current[hart].unwrap_or_else(|| {
+            if self.current.index() < TASKS
+                && (0..HARTS).all(|h| h == hart || self.hart_current[h] != Some(self.current))
+            {
+                self.current
+            } else {
+                self.hart_last[hart]
+            }
+        });
+        let cur = cur_slot.index();
+        let was_running = self.tasks[cur].state == State::Running
+            && (0..HARTS).all(|h| h == hart || self.hart_current[h] != Some(cur_slot));
         if was_running {
             self.tasks[cur].state = State::Ready;
         }
         self.inherit();
         let mut best: Option<u8> = None;
         for t in &self.tasks {
-            if t.state == State::Ready && t.affinity & 1 != 0 {
+            if t.state == State::Ready && t.affinity & mask != 0 {
                 best = Some(best.map_or(t.effective_priority, |b| b.max(t.effective_priority)));
             }
         }
-        best?;
-        if let Some(preferred) = self.preferred.take() {
+        let Some(best_prio) = best else {
+            self.hart_current[hart] = None;
+            return None;
+        };
+        if let Some(preferred) = self.preferred {
             let idx = preferred.index();
             let t = &self.tasks[idx];
-            if t.state == State::Ready && t.affinity & 1 != 0 && Some(t.effective_priority) == best
+            if t.state == State::Ready
+                && t.affinity & mask != 0
+                && t.effective_priority == best_prio
             {
+                self.preferred = None;
+                if self.tasks[idx].last_hart != hart as u8
+                    && (self.tasks[idx].runtime_ticks > 0
+                        || self.tasks[idx].user_cycles > 0
+                        || self.tasks[idx].preemptions > 0)
+                {
+                    self.tasks[idx].migrations = self.tasks[idx].migrations.saturating_add(1);
+                }
+                self.tasks[idx].last_hart = hart as u8;
                 self.tasks[idx].state = State::Running;
+                self.hart_current[hart] = Some(preferred);
+                self.hart_last[hart] = preferred;
                 self.current = preferred;
                 return Some(preferred);
             }
@@ -195,27 +284,75 @@ impl<C: Copy> Scheduler<C> {
         for offset in 1..=self.tasks.len() {
             let next = (cur + offset) % self.tasks.len();
             if self.tasks[next].state == State::Ready
-                && self.tasks[next].affinity & 1 != 0
-                && Some(self.tasks[next].effective_priority) == best
+                && self.tasks[next].affinity & mask != 0
+                && self.tasks[next].effective_priority == best_prio
             {
                 if preemptive && was_running && next != cur {
                     self.tasks[cur].preemptions += 1;
                 }
+                if self.tasks[next].last_hart != hart as u8
+                    && (self.tasks[next].runtime_ticks > 0
+                        || self.tasks[next].user_cycles > 0
+                        || self.tasks[next].preemptions > 0)
+                {
+                    self.tasks[next].migrations = self.tasks[next].migrations.saturating_add(1);
+                }
+                self.tasks[next].last_hart = hart as u8;
                 self.tasks[next].state = State::Running;
-                self.current = ThreadSlot(next);
-                return Some(ThreadSlot(next));
+                let slot = ThreadSlot(next);
+                self.hart_current[hart] = Some(slot);
+                self.hart_last[hart] = slot;
+                self.current = slot;
+                return Some(slot);
             }
         }
+        self.hart_current[hart] = None;
         None
     }
     pub fn prefer(&mut self, thread: ThreadSlot) {
         self.preferred = Some(thread);
     }
     pub fn should_preempt(&self) -> bool {
+        self.should_preempt_for(self.active_hart)
+    }
+    pub fn should_preempt_for(&self, hart: usize) -> bool {
+        assert!(hart < HARTS);
+        let mask = 1u8 << hart;
+        let cur_slot = self.hart_current[hart].unwrap_or(self.current);
+        let cur_task = &self.tasks[cur_slot.index()];
+        if cur_task.state != State::Running || cur_task.affinity & mask == 0 {
+            return self
+                .tasks
+                .iter()
+                .any(|t| t.state == State::Ready && t.affinity & mask != 0);
+        }
         self.tasks.iter().any(|t| {
             t.state == State::Ready
-                && t.affinity & 1 != 0
-                && t.effective_priority > self.current().effective_priority
+                && t.affinity & mask != 0
+                && t.effective_priority > cur_task.effective_priority
+        })
+    }
+    /// Return `true` if `hart` is currently idle while a compatible `Ready` thread
+    /// exists, or if a higher-priority `Ready` thread can preempt `hart` (or round-robin
+    /// on a timer tick when `timer_tick` is true).
+    pub fn needs_reschedule_on(&self, hart: usize, timer_tick: bool) -> bool {
+        assert!(hart < HARTS);
+        let mask = 1u8 << hart;
+        let Some(cur_slot) = self.hart_current[hart] else {
+            return self
+                .tasks
+                .iter()
+                .any(|t| t.state == State::Ready && t.affinity & mask != 0);
+        };
+        let cur_task = &self.tasks[cur_slot.index()];
+        if cur_task.state != State::Running || cur_task.affinity & mask == 0 {
+            return true;
+        }
+        self.tasks.iter().any(|t| {
+            t.state == State::Ready
+                && t.affinity & mask != 0
+                && (t.effective_priority > cur_task.effective_priority
+                    || (timer_tick && t.effective_priority == cur_task.effective_priority))
         })
     }
     pub fn inherit(&mut self) {
@@ -264,6 +401,11 @@ impl<C: Copy> Scheduler<C> {
         self.tasks[cur].wait = wait;
         self.tasks[cur].deadline = deadline;
         self.tasks[cur].state = State::Blocked;
+        for slot in &mut self.hart_current {
+            if *slot == Some(ThreadSlot(cur)) {
+                *slot = None;
+            }
+        }
     }
     pub fn wake(&mut self, task: ThreadSlot) {
         let idx = task.index();
@@ -278,6 +420,11 @@ impl<C: Copy> Scheduler<C> {
         self.tasks[cur].wait = Wait::None;
         self.tasks[cur].deadline = None;
         self.tasks[cur].state = State::Terminated;
+        for slot in &mut self.hart_current {
+            if *slot == Some(ThreadSlot(cur)) {
+                *slot = None;
+            }
+        }
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
@@ -332,9 +479,19 @@ impl<C: Context> Scheduler<C> {
     }
 
     fn advance_uptime(&mut self, uptime: Ticks, calls: &mut CallTable) {
-        let cur = self.current.index();
-        if self.tasks[cur].state == State::Running {
-            self.tasks[cur].runtime_ticks += uptime.saturating_sub(self.uptime);
+        let delta = uptime.saturating_sub(self.uptime);
+        let mut accounted_any = false;
+        for slot in self.hart_current.into_iter().flatten() {
+            if self.tasks[slot.index()].state == State::Running {
+                self.tasks[slot.index()].runtime_ticks += delta;
+                accounted_any = true;
+            }
+        }
+        if !accounted_any {
+            let cur = self.current.index();
+            if self.tasks[cur].state == State::Running {
+                self.tasks[cur].runtime_ticks += delta;
+            }
         }
         for i in 0..TASKS {
             let slot = ThreadSlot(i);
@@ -581,5 +738,40 @@ mod tests {
             s.create_thread(ProcSlot(0), TestCtx::default(), stack, 0x400, 1, 1),
             Err(Errno::Enospc)
         );
+    }
+
+    #[test]
+    fn smp_multi_hart_selection_prevents_concurrent_execution_and_tracks_migration() {
+        let mut s = test_scheduler();
+        // Make thread 1 eligible for any hart (3 = HP0 | HP1) and thread 2 pinned to HP1 (2).
+        s.tasks[1].affinity = 3;
+        s.tasks[2].affinity = 2;
+
+        // Thread 0 is Running on HP0; HP1 selects highest-priority eligible thread (1 or 2).
+        assert_eq!(s.hart_current[0], Some(ThreadSlot(0)));
+        assert!(s.needs_reschedule_on(1, false));
+        assert_eq!(s.select_for(1, false), Some(ThreadSlot(1)));
+        assert_eq!(s.running_hart(ThreadSlot(0)), Some(0));
+        assert_eq!(s.running_hart(ThreadSlot(1)), Some(1));
+        assert_eq!(s.snapshot().running_tasks, 2);
+
+        // While thread 1 is Running on HP1, HP0 cannot select thread 1 or HP1-pinned thread 2!
+        assert_eq!(s.select_for(0, true), Some(ThreadSlot(0)));
+
+        // Advance uptime: both Running threads (0 on HP0 and 1 on HP1) accumulate runtime_ticks.
+        let mut calls = CallTable::new();
+        s.tick(Ticks(4), &mut calls);
+        assert_eq!(s.tasks[0].runtime_ticks, 4);
+        assert_eq!(s.tasks[1].runtime_ticks, 4);
+
+        // Now HP1 switches to thread 2 (making thread 1 Ready), and HP0 blocks thread 0.
+        assert_eq!(s.select_for(1, false), Some(ThreadSlot(2)));
+        assert_eq!(s.tasks[1].state, State::Ready);
+        s.enter_hart(0);
+        s.block(Wait::Sleep);
+        // HP0 now picks thread 1 (migrating it from HP1 -> HP0!).
+        assert_eq!(s.select_for(0, false), Some(ThreadSlot(1)));
+        assert_eq!(s.tasks[1].last_hart, 0);
+        assert_eq!(s.tasks[1].migrations, 1);
     }
 }
