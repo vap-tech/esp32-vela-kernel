@@ -14,6 +14,12 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     let interrupt = frame.mcause >> 31 != 0;
     let cause = frame.mcause & 0xfff;
     let from_idle = frame.mstatus & (3 << 11) != 0;
+    // Save live PIE enable state (CSR 0x7f2) and disable PIE during M-mode execution.
+    let saved_pie_state = if !from_idle {
+        unsafe { arch::enter_kernel_pie_off() }
+    } else {
+        arch::PIE_STATE_OFF
+    };
     // A kernel fault during boot may happen before RUNTIME is initialized.
     // Reject all M-mode entries except the known assembly idle IRQ first.
     if from_idle {
@@ -62,6 +68,11 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         let rates = unsafe { soc::clock::rates_mhz() };
         runtime.harts[hart].cycles.sync_clock(now_16m, rates.cpu);
     }
+    let outgoing_thread = if !from_idle {
+        runtime.scheduler.hart_current[hart]
+    } else {
+        None
+    };
     let mut switch = false;
     if interrupt && cause == 17 && hart == 0 {
         // SAFETY: sole timer owner under masked IRQs and KERNEL_LOCK. Only bounded O(TASKS)
@@ -157,12 +168,25 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             fatal(frame);
         }
         frame.mcause = cause;
+        if (frame.mstatus & arch::MSTATUS_FS_MASK) == 0 {
+            frame.mstatus |= arch::MSTATUS_FS_CLEAN;
+        }
+        unsafe { arch::exit_kernel_pie_restore(saved_pie_state) };
         runtime.harts[hart].cycles.on_trap_exit(arch::mcycle());
         soc::smp::mark_hart_in_user(hart);
         soc::smp::KERNEL_LOCK.unlock();
         return frame;
     }
     if !from_idle {
+        if let Some(out_slot) = outgoing_thread {
+            unsafe {
+                arch::save_extended_context(
+                    &mut runtime.ext_contexts[out_slot.index()],
+                    saved_pie_state,
+                );
+            }
+        }
+        frame.mstatus = (frame.mstatus & !arch::MSTATUS_FS_MASK) | arch::MSTATUS_FS_CLEAN;
         runtime.scheduler.save(*frame);
     }
     let mut selected = runtime.scheduler.select_for(hart, interrupt);
@@ -179,6 +203,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             runtime.logs.idle = true;
             let _ = writeln!(runtime.console, "[idle] wfi (no runnable tasks)");
         }
+        unsafe { arch::disable_pie() };
         let idle_ptr: *const arch::TrapFrame = &raw const runtime.harts[hart].idle_frame;
         runtime.harts[hart].cycles.on_trap_exit(arch::mcycle());
         soc::smp::KERNEL_LOCK.unlock();
@@ -186,8 +211,12 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     }
     runtime.harts[hart].in_idle = false;
     let current_thread = runtime.scheduler.current;
+    unsafe {
+        arch::restore_extended_context(&runtime.ext_contexts[current_thread.index()]);
+    }
     let task = runtime.scheduler.task_mut(current_thread);
     task.context.mcause = cause;
+    task.context.mstatus = (task.context.mstatus & !arch::MSTATUS_FS_MASK) | arch::MSTATUS_FS_CLEAN;
     let process = task.process;
     // SAFETY: activate only selected task's RX code / RW stack before mret.
     if !unsafe { runtime.ensure_active_space_on(hart, process) } {

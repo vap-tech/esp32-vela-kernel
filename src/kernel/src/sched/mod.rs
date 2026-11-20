@@ -135,6 +135,12 @@ impl<C: Copy> Scheduler<C> {
     pub fn task(&self, slot: ThreadSlot) -> &Thread<C> {
         &self.tasks[slot.index()]
     }
+    pub fn find_by_id(&self, id: Tid) -> Option<ThreadSlot> {
+        self.tasks
+            .iter()
+            .position(|t| t.state != State::Terminated && t.id == id)
+            .map(ThreadSlot)
+    }
     pub fn task_mut(&mut self, slot: ThreadSlot) -> &mut Thread<C> {
         &mut self.tasks[slot.index()]
     }

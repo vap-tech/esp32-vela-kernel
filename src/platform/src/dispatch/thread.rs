@@ -124,6 +124,9 @@ impl Runtime {
             args.a5,
             |entry, sp| arch::TrapFrame::user(entry, sp, args.a3),
         )?;
+        if let Some(slot) = self.scheduler.find_by_id(tid) {
+            self.ext_contexts[slot.index()] = arch::ExtendedContext::ZERO;
+        }
         self.notify_remote_hart(false);
         Ok(tid.raw())
     }

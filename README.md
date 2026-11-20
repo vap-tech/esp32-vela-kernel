@@ -3,7 +3,7 @@
 # Vela
 
 Bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
-Hart0 M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks.
+Dual-core HP0+HP1 SMP M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks with full RV32F FPU + ESP32-P4 v1.3 PIE (`Xespv2p1`) context switching.
 100 Hz priority round robin, bounded process/thread pools, no global heap or async runtime.
 LP Sentinel independently observes HP heartbeats, keeps a diagnostic journal
 and delivers one-shot timer events through the hardware mailbox.
@@ -30,13 +30,14 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `help` | List shell commands. |
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
-| `cat /proc/interrupts` | Read 64-bit hart0 interrupt counts (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`). |
-| `cat /proc/cpuinfo` | Read live hart0/APB/LP clocks, DVFS policy/switch counts, tickless sleep counters, frequency-aware `mcycle` utilization (`user`/`kernel`/`idle`/`capacity`) and measured SYSTIMER IRQ latency. |
-| `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, ticks, measured `user_cycles`, preemptions and stack size. |
+| `cat /proc/interrupts` | Read interrupt and SMP counters (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`, `ipi_hp0`, `ipi_hp1`, `pmp_shootdowns`). |
+| `cat /proc/cpuinfo` | Read live HP0+HP1/APB/LP clocks, `rv32imafc_xesppie` ISA, DVFS policy/switch counts, tickless sleep counters, per-hart `mcycle` utilization, IPI/PMP shootdown counters and SYSTIMER IRQ latency. |
+| `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, `hart/aff` (`hp0`/`hp1` and affinity mask `1..3`), migrations, ticks, `user_cycles`, preemptions and stack size. |
 | `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
 | `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
 | `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
+| `smp [status/pin 0/pin 1/any]` | Verify dual-hart HP0+HP1 SMP execution, `HP1 -> HP0 -> HP1` thread migration, synchronous IPI PMP shootdown, and concurrent `RV32F` FPU + `Xespv2p1` PIE (`q0..q7`, `QACC`, `UA_STATE`, `XACC`) context preservation (`fpu_pie=ok`), or query/set shell hart affinity. |
 | `freq [auto/40/180]` | Query or set the HP0 DVFS operating-point policy (`auto` idle governor, `pin_40mhz` XTAL or `pin_180mhz` CPLL; `40 MHz` is rejected with `-EBUSY` while display or DMA is active). |
 | `display diag` | Stream the full-screen diagnostic image from microSD into PSRAM, in keyboard-down landscape. |
 | `display boot` | Stream the Vela boot artwork from microSD into the PSRAM framebuffer. |
@@ -94,9 +95,9 @@ Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 
 | Available | Current limit |
 | --- | --- |
-| Process/thread pools, priority scheduling, PMP and capabilities | Hart0 only; no HP SMP or enabled userspace FPU/DSP/PIE state. |
+| Dual-core HP0+HP1 SMP, priority scheduling, thread affinity/migration, synchronous IPI PMP shootdown, capabilities, and per-thread `RV32F` FPU + `ESP32-P4 v1.3` PIE (`Xespv2p1`) extended context | Static 8-process / 8-thread pools; eager FPU+PIE save/restore on thread switch (`vela_ext_save`/`vela_ext_restore`). |
 | ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled images selected by index; no general filesystem loader or dynamic linker. |
-| Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` is enabled). |
+| Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` and `L1-ICache1` are enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Userspace `INA226` power driver (`I2C_TRANSFER`, `/proc/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
 | Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Raw LBA block access (`SD_ASSET_LBA = 2048` for `VELAIMG1` RLE streams); no FAT/VFS layer. |
@@ -171,7 +172,7 @@ whole-region release. Raw pointers expire at release; sharing requires userspace
 synchronization. No global allocator or individual free. `memtest` exercises
 alignment, writable allocations, exhaustion and release in U-mode across both SRAM and PSRAM.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
-No SMP, POSIX or kernel VFS.
+Dual-core HP0+HP1 SMP with synchronous IPI PMP shootdowns and full FPU+PIE context switching is active; no POSIX or kernel VFS.
 
 ## ELF and DMA
 
@@ -446,8 +447,8 @@ Both full-screen images and their orientation were confirmed on Tab5 with an
 passed 40 frames without recurring underrun, followed by `/proc/sdcard`, `/proc/streams`,
 `/proc/power` and healthy Sentinel with missed=0.
 
-Current SRAM payload is 137456 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 15776 bytes (including the 4 KiB aligned microSD stream chunk buffer).
+Current SRAM payload is 148080 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1372 bytes, and kernel BSS is 19216 bytes (including per-thread 384-byte 16-byte-aligned `ExtendedContext` frames and the 4 KiB aligned microSD stream chunk buffer).
 The artwork is selected through the shell; startup still enters the USB shell.
 
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,

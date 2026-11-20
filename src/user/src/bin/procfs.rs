@@ -151,7 +151,7 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             out.decimal(hart);
             out.append(b"\nharts_online ");
             out.decimal(harts_online);
-            out.append(b"\nisa rv32imac\ncpu_mhz ");
+            out.append(b"\nisa rv32imafc_xesppie\ncpu_mhz ");
             out.decimal(cpu_mhz);
             out.append(b"\napb_mhz ");
             out.decimal(apb_mhz);

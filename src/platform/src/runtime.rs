@@ -59,6 +59,9 @@ pub struct HartState {
 
 pub struct Runtime {
     pub scheduler: Scheduler<arch::TrapFrame>,
+    /// Per-thread extended hardware context (`RV32F` FPU + `ESP32-P4 v1.3` `PIE`),
+    /// indexed by `ThreadSlot` and 16-byte aligned in internal L2MEM SRAM.
+    pub ext_contexts: [arch::ExtendedContext; TASKS],
     pub processes: Processes,
     pub harts: [HartState; HARTS],
     /// Per-process prepared PMP CSR image `(revision, prepared, verified_hart_mask)`.
@@ -634,8 +637,18 @@ impl Runtime {
         self.processes.slot_mut(loaded.slot).priority_ceiling = priority_ceiling;
         let frame =
             arch::TrapFrame::user_args(loaded.entry, loaded.stack.base + loaded.stack.size, args);
-        self.scheduler
-            .create_thread(loaded.slot, frame, loaded.stack, loaded.entry, priority, 3)
+        let tid = self.scheduler.create_thread(
+            loaded.slot,
+            frame,
+            loaded.stack,
+            loaded.entry,
+            priority,
+            3,
+        )?;
+        if let Some(slot) = self.scheduler.find_by_id(tid) {
+            self.ext_contexts[slot.index()] = arch::ExtendedContext::ZERO;
+        }
+        Ok(tid)
     }
 
     pub fn abort_loaded(&mut self, loaded: LoadedElf) {

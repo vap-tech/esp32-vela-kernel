@@ -431,22 +431,112 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
     true
 }
 
+/// Load `f0 = base`, `f1 = step`, `q0 = [a; 8]`, `q1 = [b; 8]`, and `XACC = 0`.
+/// Requires `scratch` to be a 16-byte aligned 32-byte buffer in internal L2MEM SRAM.
+#[inline(never)]
+unsafe fn fpu_pie_seed(scratch: *mut u32, f_base_bits: u32, f_step_bits: u32, q_a: i16, q_b: i16) {
+    let pack = |v: i16| -> u32 { (v as u16 as u32) | ((v as u16 as u32) << 16) };
+    unsafe {
+        for i in 0..4 {
+            scratch.add(i).write_volatile(pack(q_a));
+            scratch.add(4 + i).write_volatile(pack(q_b));
+        }
+        let p = scratch as usize;
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +f",
+            "fmv.w.x f0, a1",
+            "fmv.w.x f1, a2",
+            ".option pop",
+            ".word 0x0201223b", // esp.vld.128.ip q0, a0, 16
+            ".word 0x0201263b", // esp.vld.128.ip q1, a0, 16
+            ".word 0x0000005b", // esp.zero.xacc
+            inout("a0") p => _,
+            in("a1") f_base_bits,
+            in("a2") f_step_bits,
+            options(nostack)
+        );
+    }
+}
+
+/// Execute one step of in-register `FPU` (`f0 += f1`) and `PIE` (`q0 += q1`, `XACC += dot(q1, q1)`).
+#[inline(never)]
+unsafe fn fpu_pie_step() {
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +f",
+            "fadd.s f0, f0, f1",
+            ".option pop",
+            ".word 0x0684065f", // esp.vadd.s16 q0, q0, q1
+            ".word 0x26c3005f", // esp.vmulas.s16.xacc q1, q1
+            options(nomem, nostack)
+        );
+    }
+}
+
+/// Read back live `f0` bits, `q0` first word (`s16x2`), and `XACC_L` after context switches / migrations.
+#[inline(never)]
+unsafe fn fpu_pie_readout(scratch: *mut u32) -> (u32, u32, u32) {
+    unsafe {
+        let p = scratch as usize;
+        let f0_bits: u32;
+        let xacc_lo: u32;
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +f",
+            "fmv.x.w a2, f0",
+            ".option pop",
+            ".word 0x8201223b", // esp.vst.128.ip q0, a0, 16
+            ".word 0x84b001df", // esp.movx.r.xacc.l a1
+            "fence rw, rw",
+            inout("a0") p => _,
+            out("a1") xacc_lo,
+            out("a2") f0_bits,
+            options(nostack)
+        );
+        (f0_bits, scratch.read_volatile(), xacc_lo)
+    }
+}
+
 extern "C" fn smp_worker(state_ptr: u32) -> ! {
     let state = state_ptr as *mut u32;
+    let worker_scratch = (state_ptr + 64) as *mut u32;
     unsafe {
         let (_, hart0) = sys::call6(abi::THREAD_AFFINITY, 0, 0, 0, 0, 0, 0);
         state.add(1).write_volatile(hart0);
-        for i in 0..32u32 {
+        // Seed live FPU (f0=10.0, f1=0.5) and PIE (q0=[10;8], q1=[2;8], XACC=0) on HP1.
+        fpu_pie_seed(worker_scratch, 0x4120_0000, 0x3f00_0000, 10, 2);
+        for i in 0..16u32 {
+            fpu_pie_step();
             state.write_volatile(i + 1);
             sys::call(abi::YIELD, 0, 0, 0, 0);
         }
-        // Migrate worker to HP0 and then back to HP1.
+        // Migrate worker HP1 -> HP0 while keeping FPU (f0, f1) and PIE (q0, q1, XACC) live!
         let _ = sys::call6(abi::THREAD_AFFINITY, 0, abi::AFFINITY_HP0, 0, 0, 0, 0);
         let (_, hart_m0) = sys::call6(abi::THREAD_AFFINITY, 0, 0, 0, 0, 0, 0);
         state.add(2).write_volatile(hart_m0);
+        for i in 16..24u32 {
+            fpu_pie_step();
+            state.write_volatile(i + 1);
+            sys::call(abi::YIELD, 0, 0, 0, 0);
+        }
+        // Migrate worker HP0 -> HP1 and finish the remaining 8 FPU + PIE iterations!
         let _ = sys::call6(abi::THREAD_AFFINITY, 0, abi::AFFINITY_HP1, 0, 0, 0, 0);
         let (_, hart_m1) = sys::call6(abi::THREAD_AFFINITY, 0, 0, 0, 0, 0, 0);
         state.add(3).write_volatile(hart_m1);
+        for i in 24..32u32 {
+            fpu_pie_step();
+            state.write_volatile(i + 1);
+            sys::call(abi::YIELD, 0, 0, 0, 0);
+        }
+        // After 32 steps across HP1 -> HP0 -> HP1:
+        // f0 = 10.0 + 32 * 0.5 = 26.0 (0x41d0_0000)
+        // q0 = [10 + 32 * 2; 8] = [74; 8] (word0 = 0x004a_004a)
+        // XACC = 32 * (8 * 2 * 2) = 1024
+        let (f0_bits, q0_word, xacc_lo) = fpu_pie_readout(worker_scratch);
+        let ok = f0_bits == 0x41d0_0000 && q0_word == 0x004a_004a && xacc_lo == 1024;
+        state.add(5).write_volatile(u32::from(ok));
         state.add(4).write_volatile(1);
     }
     // Stay briefly in U-mode on HP1 so the parent on HP0 can trigger a live IPI PMP shootdown
@@ -473,8 +563,9 @@ fn run_smp_test() {
         return;
     }
     let state_ptr = base as *mut u32;
+    let parent_scratch = (base + 128) as *mut u32;
     unsafe {
-        for i in 0..8 {
+        for i in 0..16 {
             state_ptr.add(i).write_volatile(0);
         }
     }
@@ -495,19 +586,37 @@ fn run_smp_test() {
         sys::write(FAILED);
         return;
     }
-    // Wait until the worker on HP1 completes its initial loop and migration steps.
+    // Concurrently exercise FPU (f0=100.0, f1=1.25) and PIE (q0=[100;8], q1=[3;8]) on HP0
+    // while the worker thread migrates HP1 -> HP0 -> HP1 and preempts/interleaves on HP0!
+    let mut parent_steps = 0u32;
+    unsafe {
+        fpu_pie_seed(parent_scratch, 0x42c8_0000, 0x3fa0_0000, 100, 3);
+    }
     for _ in 0..128 {
-        if unsafe { state_ptr.add(4).read_volatile() } != 0 {
+        if parent_steps < 16 {
+            unsafe { fpu_pie_step() };
+            parent_steps += 1;
+        }
+        if unsafe { state_ptr.add(4).read_volatile() } != 0 && parent_steps == 16 {
             break;
         }
         sys::call(abi::YIELD, 0, 0, 0, 0);
     }
+    while parent_steps < 16 {
+        unsafe { fpu_pie_step() };
+        parent_steps += 1;
+    }
+    let (p_f0, p_q0, p_xacc) = unsafe { fpu_pie_readout(parent_scratch) };
+    // Parent after 16 steps: f0 = 100.0 + 16 * 1.25 = 120.0 (0x42f0_0000),
+    // q0 = [100 + 16 * 3; 8] = [148; 8] (0x0094_0094), XACC = 16 * (8 * 3 * 3) = 1152.
+    let parent_ext_ok = p_f0 == 0x42f0_0000 && p_q0 == 0x0094_0094 && p_xacc == 1152;
     // Free scratch_base while worker is active on HP1 -> triggers synchronous IPI PMP shootdown!
     let _ = sys::call(abi::MEM_FREE, scratch_base, scratch_size, 0, 0);
     let iters = unsafe { state_ptr.read_volatile() };
     let start_hart = unsafe { state_ptr.add(1).read_volatile() };
     let mig_hp0 = unsafe { state_ptr.add(2).read_volatile() };
     let mig_hp1 = unsafe { state_ptr.add(3).read_volatile() };
+    let worker_ext_ok = unsafe { state_ptr.add(5).read_volatile() } == 1;
     let mut freed = false;
     for _ in 0..32 {
         sys::call(abi::YIELD, 0, 0, 0, 0);
@@ -550,7 +659,11 @@ fn run_smp_test() {
     out.decimal(ipi_total);
     out.append(b" shootdowns=");
     out.decimal(shootdowns);
-    out.push(b'\n');
+    if parent_ext_ok && worker_ext_ok {
+        out.append(b" fpu_pie=ok\n");
+    } else {
+        out.append(b" fpu_pie=FAIL\n");
+    }
     sys::write(out.as_slice());
 }
 

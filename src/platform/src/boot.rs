@@ -80,6 +80,7 @@ extern "C" fn rust_main() -> ! {
     let runtime = unsafe {
         (*RUNTIME.0.get()).write(Runtime {
             scheduler: Scheduler::empty(idle0),
+            ext_contexts: [arch::ExtendedContext::ZERO; vela_kernel::sched::TASKS],
             processes: Processes::new(),
             harts: [
                 HartState {
@@ -271,6 +272,7 @@ extern "C" fn rust_main() -> ! {
             u8::from(hp1_ok),
             u8::from(soc::memory_ready())
         );
+        arch::restore_extended_context(&runtime.ext_contexts[0]);
         let initial_ctx = &raw const runtime.scheduler.tasks[0].context;
         soc::smp::mark_hart_in_user(0);
         // Kick HP1 so it picks up any runnable thread (e.g. console/shell) immediately.
@@ -284,6 +286,7 @@ extern "C" fn rust_hp1_main() -> ! {
     assert_eq!(arch::hart_id(), 1);
     unsafe {
         arch::init_counters();
+        arch::disable_pie();
         soc::smp::init_hp1_clic_and_ipi(vela_trap_entry as *const () as usize);
     }
     soc::smp::KERNEL_LOCK.lock();
