@@ -1,4 +1,3 @@
-import hashlib
 import struct
 import unittest
 import zlib
