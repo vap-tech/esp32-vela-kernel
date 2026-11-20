@@ -6,11 +6,12 @@ use vela_kernel::{
     task::Region,
 };
 
-use crate::{board, dma::DMA_CH_DW_GDMA_SCANOUT, soc};
+use crate::{board, dma::DMA_CH_DW_GDMA_SCANOUT, soc, syscall};
 
 pub struct DisplayControl {
     mode: u8,
     stage: u8,
+    active: bool,
     framebuffer: Option<Region>,
     psram: soc::psram::Controller,
     scanout: soc::scanout::Scanout,
@@ -26,8 +27,9 @@ impl DisplayControl {
     /// invoke methods with machine interrupts masked.
     pub const unsafe fn new() -> Self {
         Self {
-            mode: 1,
+            mode: 0,
             stage: u8::MAX,
+            active: false,
             framebuffer: None,
             psram: soc::psram::Controller::new(),
             scanout: soc::scanout::Scanout::new(),
@@ -36,6 +38,13 @@ impl DisplayControl {
 
     pub const fn psram_ready(&self) -> bool {
         self.psram.is_ready()
+    }
+
+    /// Return `true` when the display pipeline is active (bring-up in flight,
+    /// hardware DSI bars enabled, or DW-GDMA scanout running).
+    /// Sleep (`SENTINEL_PREPARE_SLEEP`) and clock changes must not proceed while active.
+    pub const fn is_active(&self) -> bool {
+        self.active || self.stage != u8::MAX || self.scanout.is_running()
     }
 
     /// Ensure MSPI2/3 AP HEX PSRAM is initialized so the full 32 MiB pool
@@ -61,7 +70,11 @@ impl DisplayControl {
 
     pub fn telemetry(&self) -> soc::scanout::StreamTelemetry {
         // SAFETY: DisplayControl owns DSI bridge registers under MIE=0.
-        unsafe { self.scanout.telemetry() }
+        let mut t = unsafe { self.scanout.telemetry() };
+        if self.active && t.mode == 0 {
+            t.mode = self.mode;
+        }
+        t
     }
 
     fn stop_scanout_and_release_dma(
@@ -88,6 +101,21 @@ impl DisplayControl {
             let _ = self.set_psram_region_mapped(fb, false);
             let _ = allocator.free(Pid::KERNEL, fb);
         }
+    }
+
+    /// Stop active DW-GDMA / MIPI-DSI video scanout, turn off the display backlight,
+    /// release the `InFlight` DMA hold, and return the 2 MiB PSRAM framebuffer to the
+    /// unified 32 MiB PSRAM pool.
+    pub fn power_off(&mut self, allocator: &mut RegionAllocator, dma: &mut DmaTable) {
+        self.release_framebuffer(allocator, dma);
+        // SAFETY: DisplayControl owns GPIO22 backlight and MIPI-DSI host on HP0 with MIE=0.
+        unsafe {
+            board::display_off();
+        }
+        self.scanout.set_mode(0);
+        self.mode = 0;
+        self.stage = u8::MAX;
+        self.active = false;
     }
 
     fn ensure_framebuffer(
@@ -132,7 +160,7 @@ impl DisplayControl {
         allocator: &mut RegionAllocator,
         dma: &mut DmaTable,
     ) -> (Option<board::Diagnostic>, Result<u32, Errno>) {
-        if arg == 6 {
+        if arg == syscall::DISPLAY_MODE_SDCARD_PROBE {
             // SAFETY: DisplayControl is owned by Runtime on HP0 with MIE=0.
             let (diag, res) = unsafe { board::sdcard_probe() };
             return match res {
@@ -140,32 +168,43 @@ impl DisplayControl {
                 Err(code) => (diag, Ok(0u32.wrapping_sub(code))),
             };
         }
-        if matches!(arg, 1..=5) {
-            self.stop_scanout_and_release_dma(allocator, dma);
-            if arg < 4 {
-                self.release_framebuffer(allocator, dma);
-            }
+        if arg == syscall::DISPLAY_MODE_OFF {
+            self.power_off(allocator, dma);
+            return (None, Ok(0));
+        }
+        if matches!(arg, syscall::DISPLAY_MODE_BARS..=syscall::DISPLAY_MODE_BOOT) {
+            // Always release any prior scanout and 2 MiB PSRAM framebuffer before starting
+            // a new display mode so PSRAM MMU pages and framebuffer memory are freshly
+            // mapped after CPLL 180 MHz lock in stage 2.
+            self.release_framebuffer(allocator, dma);
+            self.active = false;
+            self.scanout.set_mode(0);
             self.mode = arg as u8;
             self.stage = 0;
-        } else if arg != 0 {
+        } else if arg != syscall::DISPLAY_MODE_STEP {
             return (None, Err(Errno::Einval));
         }
 
-        let mut early_diag = None;
-        if self.mode >= 4 && self.stage == 2 {
-            let (diag, fb_res) = self.ensure_framebuffer(allocator);
-            early_diag = diag;
-            if let Err(code) = fb_res {
-                self.stage = u8::MAX;
-                return (early_diag, Ok(0u32.wrapping_sub(code)));
-            }
-        }
         let fb_base = self.framebuffer.map_or(0, |r| r.base);
         let was_running = self.scanout.is_running();
         // SAFETY: DisplayControl owns the display/PSRAM/scanout hardware under MIE=0.
-        let (step_diag, step) =
+        let (step_diag, mut step) =
             unsafe { board::display_step(self.stage, self.mode, fb_base, &mut self.scanout) };
-        let diag = early_diag.or(step_diag);
+        let mut diag = step_diag;
+
+        // Allocate and map the 2 MiB PSRAM framebuffer in stage 2 AFTER `board::display_step`
+        // has locked CPLL 180 MHz (`clock::display_speed()`), matching the original hardware
+        // bring-up sequence.
+        if self.mode >= 4 && self.stage == 2 && step.is_ok() {
+            let (fb_diag, fb_res) = self.ensure_framebuffer(allocator);
+            if diag.is_none() {
+                diag = fb_diag;
+            }
+            if let Err(code) = fb_res {
+                step = Err(code);
+            }
+        }
+
         match step {
             Ok(delay) => {
                 if !was_running && self.scanout.is_running() {
@@ -191,12 +230,16 @@ impl DisplayControl {
                         );
                     }
                 }
-                self.stage = if delay == 0 { u8::MAX } else { self.stage + 1 };
+                if delay == 0 {
+                    self.stage = u8::MAX;
+                    self.active = true;
+                } else {
+                    self.stage += 1;
+                }
                 (diag, Ok(delay))
             }
             Err(code) => {
-                self.stage = u8::MAX;
-                self.release_framebuffer(allocator, dma);
+                self.power_off(allocator, dma);
                 // Display driver returns board-specific diagnostic codes (1..22, 256..511),
                 // encoded as negative integers directly in the DISPLAY_TEST ABI.
                 (diag, Ok(0u32.wrapping_sub(code)))

@@ -41,6 +41,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `display boot` | Stream the Vela boot artwork from microSD into the PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
 | `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
+| `display off` | Stop active DW-GDMA / MIPI-DSI scanout, disable backlight (`GPIO22`), release `InFlight` DMA and return the 2 MiB PSRAM framebuffer to the 32 MiB pool. |
 | `memtest` | Check aligned userspace allocation, bounds, capability lookup and release across both internal SRAM and external PSRAM. |
 | `run hello`, `run pic`, `run pic-psram` | Launch the bundled fixed-address ELF (SRAM) and static PIE (SRAM or external PSRAM), respectively. |
 | `run dma` | Copy and verify 2048 bytes of SRAM using GDMA-AHB. |
@@ -298,7 +299,10 @@ Log: target/sentinel-wakeup-smoke.log.
 A healthy observer accepts PREPARE_SLEEP after reserving the one-shot timer.
 Its ACK carries the wake token. HP suppresses automatic heartbeats for that
 ticket, and STATUS reports `prepared` with the age of the last real heartbeat.
-Cancellation before the deadline disarms the timer. At or after the deadline
+`SENTINEL_PREPARE_SLEEP` rejects sleep preparation with `-EBUSY` while any DMA
+channel (`GDMA-AHB CH1` or `DW-GDMA CH0` scanout) or the MIPI-DSI display
+pipeline is active; run `display off` first to stop scanout and release the
+framebuffer. Cancellation before the deadline disarms the timer. At or after the deadline
 expiry wins, and WAIT consumes one WAKE_EVENT. Either outcome opens a fresh
 heartbeat timeout window. HP remains active throughout this protocol check.
 
@@ -399,13 +403,14 @@ initializes at SPLL/12 = 40 MHz and uses SPLL/6 = 80 MHz for HEX x16 DDR.
 All 32 MiB (`0x88000000..0x8a000000`, `pages 0..512`) are managed as a unified
 64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM` and `run pic-psram`).
 When `display diag` or `display boot` starts, the display driver dynamically
-allocates a 2 MiB region from `RegionAllocator`, identity-maps its 32 MMU pages,
-streams 4 KiB (8-sector) RLE chunks from the microSD card into the 1843200-byte
-framebuffer via the uncached `0x88xx_xxxx` alias with full `CRC32` and pixel-count
-verification plus PSRAM readback, and binds `DW-GDMA CH0` (`InFlight`) reading
-the corresponding `0x48xx_xxxx` bus alias with one descriptor per frame and a
-four-frame ring. Switching back to `display test`, `display pixel` or `display orbit`
-stops scanout, releases the `InFlight` DMA hold and unmaps/frees the 2 MiB region
+allocates a 2 MiB region from `RegionAllocator` after locking CPLL 180 MHz in stage 2,
+identity-maps its 32 MMU pages, streams 4 KiB (8-sector) RLE chunks from the microSD
+card into the 1843200-byte framebuffer via the uncached `0x88xx_xxxx` alias across
+stages 3..43 **before** ST7121 panel initialization (`0x11` / `0x29`), and then starts
+MIPI-DSI video and `DW-GDMA CH0` (`InFlight`) reading the `0x48xx_xxxx` bus alias with
+one descriptor per frame and a four-frame ring. Running `display off` (or switching back
+to `display test`, `display pixel` or `display orbit`) stops scanout, turns off backlight
+on `display off`, releases the `InFlight` DMA hold and unmaps/frees the 2 MiB region
 so the full 32 MiB of PSRAM are available when full-screen PSRAM scanout is not active.
 
 The raster is expanded and read back in batches of 32 rows, yielding between
@@ -415,7 +420,7 @@ Both full-screen images and their orientation were confirmed on Tab5 with an
 passed 40 frames without recurring underrun, followed by `/proc/sdcard`, `/proc/streams`,
 `/proc/power` and healthy Sentinel with missed=0.
 
-Current SRAM payload is 131624 bytes (including bundled service and test ELFs),
+Current SRAM payload is 131952 bytes (including bundled service and test ELFs),
 SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 15712 bytes (including the 4 KiB aligned microSD stream chunk buffer).
 The artwork is selected through the shell; startup still enters the USB shell.
 

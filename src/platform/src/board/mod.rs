@@ -90,10 +90,27 @@ unsafe fn backlight(on: bool) {
     }
 }
 
+/// Disable the Tab5 display backlight (`GPIO22`) and return the MIPI-DSI host to
+/// low-power Command Mode with the high-speed lane clock gated.
+///
+/// # Safety
+/// Exclusive HP0 ownership of `GPIO22` and MIPI-DSI host registers with IRQs masked.
+pub unsafe fn display_off() {
+    unsafe {
+        backlight(false);
+        dsi::stop_stream();
+    }
+}
+
 /// Sequential trusted display bring-up steps. Positive result is a minimum delay
 /// in 10ms ticks before the next stage; the shell sleeps between stages.
 /// When `mode >= 4`, `frame_direct_base` is the direct uncached address of the
 /// allocated 2 MiB PSRAM framebuffer (`0x8800_0000 + offset`).
+///
+/// For `mode >= 4` (`DIAG` / `BOOT`), stages `3..43` stream and verify the 40 row
+/// batches from microSD into the PSRAM framebuffer **before** ST7121 `start()` /
+/// `Sleep Out (0x11)` / `Display On (0x29)`, so the panel never sits in `0x29`
+/// waiting for a video clock during microSD I/O.
 ///
 /// # Safety
 /// Exclusive HP0 ownership of the Tab5 display I2C bus, backlight GPIO/LEDC,
@@ -106,17 +123,17 @@ pub unsafe fn display_step(
     scanout: &mut Scanout,
 ) -> (Option<Diagnostic>, Result<u32, u32>) {
     let orbit = mode != 1;
-    if mode >= 4 && (5..45).contains(&stage) {
+    if mode >= 4 && (3..43).contains(&stage) {
         let image = if mode == 4 {
             &images::DIAGNOSTIC
         } else {
             &images::BOOT
         };
         let (sd_probe, res) =
-            unsafe { images::draw_rows(image, frame_direct_base, usize::from(stage - 5) * 32, 32) };
+            unsafe { images::draw_rows(image, frame_direct_base, usize::from(stage - 3) * 32, 32) };
         return (sd_probe.map(Diagnostic::Sdcard), res.map(|()| 1));
     }
-    let stage = if mode >= 4 && stage >= 45 {
+    let stage = if mode >= 4 && stage >= 43 {
         stage - 40
     } else {
         stage
@@ -192,6 +209,7 @@ pub unsafe fn display_step(
                         );
                         return Ok(12);
                     }
+                    scanout.set_mode(1);
                     Ok(0)
                 })();
                 (None, res)

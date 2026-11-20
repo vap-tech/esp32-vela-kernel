@@ -107,6 +107,10 @@ impl Scanout {
         self.running
     }
 
+    pub const fn set_mode(&mut self, mode: u8) {
+        self.mode = mode;
+    }
+
     /// Read live scanout counters and (while active) DSI bridge FIFO occupancy.
     ///
     /// # Safety

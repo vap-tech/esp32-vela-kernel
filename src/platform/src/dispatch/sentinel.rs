@@ -57,6 +57,11 @@ impl Runtime {
         if !(1..=60_000).contains(&delay_ms) {
             return Err(Errno::Einval);
         }
+        // Sleep preparation requires all active DMA channels (GDMA-AHB CH1 and
+        // DW-GDMA CH0 scanout) and the MIPI-DSI display pipeline to be stopped first.
+        if sleep && (self.display.is_active() || self.dma.any_active()) {
+            return Err(Errno::Ebusy);
+        }
         if self.sentinel.wake_ticket().is_some() {
             return Err(Errno::Ebusy);
         }

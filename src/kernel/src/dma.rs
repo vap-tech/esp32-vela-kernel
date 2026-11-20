@@ -450,6 +450,61 @@ mod tests {
         assert_ne!(next_cap, cap0);
         assert_eq!(dma.resolve(cap0, Pid(2)), Err(Errno::Ebadf));
     }
+
+    #[test]
+    fn dw_gdma_scanout_lifecycle_releases_psram_framebuffer_to_32_mib_pool() {
+        use crate::memory::{PSRAM_MMU_PAGE, RegionAllocator};
+
+        let mut alloc = RegionAllocator::new(0x4ff6_0000, 0x4ff7_0000);
+        alloc.configure_psram(0x8800_0000, 0x8a00_0000, PSRAM_MMU_PAGE);
+
+        let mut dma = DmaTable::new();
+        dma.register(1, DmaController::DwGdmaAxi).unwrap();
+        assert!(!dma.any_active());
+
+        // Allocate the 2 MiB PSRAM display framebuffer and submit DW-GDMA CH0 scanout.
+        let fb = alloc
+            .allocate_in(MemoryClass::Psram, Pid::KERNEL, 720 * 1280 * 2)
+            .unwrap();
+        assert_eq!(fb.size, 2 * 1024 * 1024);
+
+        let _cap = dma.acquire(1, Pid::KERNEL).unwrap();
+        dma.submit(
+            1,
+            Pid::KERNEL,
+            MemoryClass::Psram,
+            fb,
+            DmaDirection::ToDevice,
+            720 * 1280 * 2,
+            None,
+            false,
+        )
+        .unwrap();
+        alloc.set_in_flight(Pid::KERNEL, fb, Some(1)).unwrap();
+
+        assert!(dma.is_active(1));
+        assert!(dma.any_active());
+        assert_eq!(alloc.free(Pid::KERNEL, fb), Err(Errno::Ebusy));
+
+        // Stop scanout (`display off`): finish DMA, release in-flight hold, and free 2 MiB FB.
+        let (owner, region) = dma.finish(1, true);
+        assert_eq!(owner, Some(Pid::KERNEL));
+        assert_eq!(region, Some(fb));
+        dma.release_process(1, Pid::KERNEL);
+        assert!(!dma.any_active());
+
+        assert_eq!(
+            alloc.finish_in_flight(fb, 1, true, true),
+            Ok((MemoryClass::Psram, false))
+        );
+        assert_eq!(alloc.free(Pid::KERNEL, fb), Ok(MemoryClass::Psram));
+
+        // Full 32 MiB PSRAM pool is now available again.
+        let full = alloc
+            .allocate_in(MemoryClass::Psram, Pid(2), 32 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(full.size, 32 * 1024 * 1024);
+    }
 }
 
 #[cfg(test)]

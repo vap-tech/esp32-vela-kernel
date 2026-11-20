@@ -389,6 +389,7 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
     }
     if (result.0 as i32) <= 0 {
         let message: &[u8] = match result.0 as i32 {
+            -16 if prepare => b"sleep busy; stop active display/DMA or cancel prior alarm\n",
             -16 => b"wake busy; collect or cancel prior alarm\n",
             -2 => b"no pending wake\n",
             -114 => b"wake already fired; use sentinel wait\n",
@@ -432,11 +433,17 @@ fn command(line: &Buffer, caps: Caps) {
                 b"help | cat <path> | uptime | bench | sdcard | run hello/pic/pic-psram/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
             );
             sys::write(
-                b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot\n",
+                b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",
             );
         }
         b"sdcard" => {
-            let rc = sys::call(abi::DISPLAY_TEST, caps.display, 6, 0, 0);
+            let rc = sys::call(
+                abi::DISPLAY_TEST,
+                caps.display,
+                abi::DISPLAY_MODE_SDCARD_PROBE,
+                0,
+                0,
+            );
             if rc == 0 {
                 sys::write(b"microSD assets verified\n");
             } else {
@@ -447,19 +454,33 @@ fn command(line: &Buffer, caps: Caps) {
                 sys::write(out.as_slice());
             }
         }
+        b"display off" => {
+            let rc = sys::call(abi::DISPLAY_TEST, caps.display, abi::DISPLAY_MODE_OFF, 0, 0);
+            if rc == 0 {
+                sys::write(b"Display scanout stopped and framebuffer released\n");
+            } else {
+                sys::write(FAILED);
+            }
+        }
         b"display test" | b"display orbit" | b"display pixel" | b"display diag"
         | b"display boot" => {
             let (mode, ok_msg): (u32, &[u8]) = match text {
-                b"display orbit" => (2, b"Orbit scanout active\n"),
-                b"display pixel" => (3, b"Pixel scanout active (360,640)\n"),
-                b"display diag" => (4, b"Diagnostic scanout active\n"),
-                b"display boot" => (5, b"Boot image scanout active\n"),
-                _ => (1, b"ST7121 DSI bars enabled\n"),
+                b"display orbit" => (abi::DISPLAY_MODE_ORBIT, b"Orbit scanout active\n"),
+                b"display pixel" => (abi::DISPLAY_MODE_PIXEL, b"Pixel scanout active (360,640)\n"),
+                b"display diag" => (abi::DISPLAY_MODE_DIAG, b"Diagnostic scanout active\n"),
+                b"display boot" => (abi::DISPLAY_MODE_BOOT, b"Boot image scanout active\n"),
+                _ => (abi::DISPLAY_MODE_BARS, b"ST7121 DSI bars enabled\n"),
             };
             let mut rc = sys::call(abi::DISPLAY_TEST, caps.display, mode, 0, 0);
             while (rc as i32) > 0 {
                 sys::sleep_ticks(rc);
-                rc = sys::call(abi::DISPLAY_TEST, caps.display, 0, 0, 0);
+                rc = sys::call(
+                    abi::DISPLAY_TEST,
+                    caps.display,
+                    abi::DISPLAY_MODE_STEP,
+                    0,
+                    0,
+                );
             }
             if rc == 0 {
                 sys::write(ok_msg);

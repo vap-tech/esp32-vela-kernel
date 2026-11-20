@@ -189,3 +189,16 @@ pub unsafe fn start_stream() {
         set(LANE_CLOCK, 3);
     }
 }
+
+/// Return the MIPI-DSI host to low-power Command Mode and gate the HS clock lane.
+///
+/// # Safety
+/// Exclusive ownership of the MIPI-DSI host registers on HP0 with IRQs masked.
+pub unsafe fn stop_stream() {
+    unsafe {
+        if read(CLK + 0x18) & (1 << 12) != 0 {
+            set(MODE, 1);
+            set(LANE_CLOCK, 0);
+        }
+    }
+}
