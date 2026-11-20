@@ -227,17 +227,27 @@ impl Runtime {
         .map(Handle::raw)
     }
 
-    pub(super) fn sys_cap_revoke(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        let woken = lifecycle::revoke_capability(
+    pub(super) fn sys_cap_revoke(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        let revoked = lifecycle::revoke_capability(
             &mut self.processes,
             &mut self.ipc,
             &mut self.calls,
+            &mut self.events,
             &mut self.scheduler,
             current,
             Handle(args.a0),
             copy_to_user_within,
         )?;
-        self.note_woken_receiver(woken);
+        if let Some(index) = revoked.mask_event {
+            self.mask_irq_slot(index);
+        }
+        self.note_woken_receiver(revoked.first_woken);
+        *switch = self.scheduler.should_preempt();
         Ok(0)
     }
 

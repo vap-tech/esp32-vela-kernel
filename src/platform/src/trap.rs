@@ -1,14 +1,7 @@
 use core::fmt::Write;
-use vela_kernel::{
-    id::{ThreadSlot, Ticks},
-    task::{Context, State, Wait},
-};
+use vela_kernel::{id::Ticks, task::Context};
 
-use crate::{
-    arch,
-    runtime::{CONSOLE_RX, RUNTIME},
-    soc,
-};
+use crate::{arch, runtime::RUNTIME, soc};
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
@@ -80,13 +73,13 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         let ok = unsafe { soc::dma::finish(runtime.dma.length()) };
         runtime.complete_dma(ok);
         switch = from_idle || runtime.scheduler.should_preempt();
-    } else if interrupt && cause == soc::console::RX_LINE {
-        runtime.usb_rx_interrupts += 1;
-        runtime.console.mask_rx_irq();
-        if let Some(i) = runtime.scheduler.tasks.iter().position(|t| {
-            t.state == State::Blocked && matches!(t.wait, Wait::Event { object: CONSOLE_RX })
-        }) {
-            runtime.scheduler.wake(ThreadSlot(i));
+    } else if interrupt && let Some(index) = runtime.events.index_by_line(cause) {
+        runtime.mask_irq_slot(index);
+        if runtime
+            .events
+            .notify(index, &mut runtime.scheduler)
+            .is_some()
+        {
             switch = from_idle || runtime.scheduler.should_preempt();
         } else {
             switch = from_idle;

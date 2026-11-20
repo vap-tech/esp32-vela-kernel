@@ -22,6 +22,7 @@ pub const STATS_TASKS_BYTES: usize = 8 * STATS_TASK_WORDS * 4;
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EINVAL: u32 = (-22i32) as u32;
 pub const ENOSYS: u32 = (-38i32) as u32;
+pub const ETIMEDOUT: u32 = (-110i32) as u32;
 
 pub const ENDPOINT_CREATE: u32 = 6;
 pub const SEND: u32 = 7; // a0=endpoint handle (SEND), a1=buffer, a2=len; full => EAGAIN
@@ -48,7 +49,7 @@ pub const IPC_CALL: u32 = 20; // a0=endpoint handle (SEND), a1=req, a2=len, a3=r
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
 pub const THREAD_PRIORITY: u32 = 22; // a0=own TID, a1=priority 0..ceiling
 pub const SPAWN_HELLO: u32 = 23; // a0=ProcessSpawn handle (EXECUTE), a1=selector (0=hello, 1=pic, 2=dma) -> PID
-pub const EVENT_WAIT: u32 = 24; // a0=event handle (WAIT | ACK); acknowledge, rearm, and block
+pub const EVENT_WAIT: u32 = 24; // a0=event handle (WAIT | ACK), a1=timeout ticks (0=infinite, 1..=6000)
 pub const DMA_COPY: u32 = 25; // owning DMA driver: copy a0 bytes between private page halves, block until IRQ
 pub const SENTINEL_STATUS: u32 = 26; // a0=Sentinel handle (READ) -> a0=version (0 until READY), a1=epoch
 pub const SENTINEL_HELLO: u32 = 27; // a0=Sentinel handle (READ); blocks for ACK, returns sequence
@@ -65,3 +66,8 @@ pub const SENTINEL_CANCEL_WAKE: u32 = 34; // a0=Sentinel handle (WAIT), a1=token
 pub const SENTINEL_PREPARE_SLEEP: u32 = 35; // a0=Sentinel handle (WAIT | CONTROL), a1=ms -> wake token
 pub const DISPLAY_TEST: u32 = 36; // a0=Display handle (CONTROL), a1=mode (1..5 start, 0 step) -> delay ticks / 0 / -errno
 pub const IPC_REPLY_RECV: u32 = 37; // a0=reply token (0=skip), a1=reply buf, a2=reply len, a3=recv handle, a4=recv buf, a5=recv cap -> a0=len, a1=next token
+pub const IRQ_ACK: u32 = 38; // a0=event handle (ACK); clear pending notification and re-arm hardware IRQ source
+pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot index -> bound event handle
+pub const IRQ_UNBIND: u32 = 40; // a0=bound event handle (CONTROL); mask line, wake waiters with -EPIPE, release slot
+
+pub const IRQ_SLOT_CONSOLE_RX: u32 = 0; // USB Serial/JTAG RX packet interrupt slot (CLIC line 18)

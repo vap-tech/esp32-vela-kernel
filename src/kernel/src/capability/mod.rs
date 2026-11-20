@@ -19,6 +19,7 @@ pub enum Authority {
     ProcessSpawn,
     Display,
     Sentinel,
+    IrqControl,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -89,7 +89,7 @@ Neither command enters PMU light/deep sleep.
 | Process/thread pools, priority scheduling, PMP and capabilities | Hart0 only; no HP SMP or enabled userspace FPU/DSP/PIE state. |
 | ELF32 and static PIE loading | Bundled images selected by index; no general filesystem loader or dynamic linker. |
 | SRAM allocation and controlled DMA copy | PSRAM/XIP and general cached DMA are not enabled. |
-| USB RX event delivery | Boot-bound console event; no dynamic IRQ registration. |
+| Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
 
@@ -106,7 +106,7 @@ gives owner send+receive rights. Boot assignments and explicit capability grants
 peers; global endpoint IDs are not user handles. Receiving requires an explicit
 process-local RECEIVE capability; handle values alone confer no authority.
 Privileged operations (process spawning, display scanout control, Sentinel
-supervision and console RX) likewise require explicit process-local capability
+supervision and IRQ slot binding/consumption) likewise require explicit process-local capability
 handles granted by boot policy rather than ambient PID checks.
 Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
 retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
@@ -127,11 +127,16 @@ idle entry, and M-mode traps are resumable only from that assembly idle loop.
 CLIC return keeps the active trap's bookkeeping and target privilege.
 
 The console service drains USB Serial/JTAG RX in batches of up to 32 bytes.
-Boot binds the RX event capability to the console process. EVENT_WAIT rearms
-the packet interrupt and checks FIFO availability under masked hart interrupts
-before blocking. CLIC line 18 wakes the driver on hart0. The handler masks and
-acknowledges the packet source until the driver rearms it. On Tab5 v1.3 the shell accepted
-help and procfs reads with one serial write per command.
+Boot registers CLIC line 18 in `EventTable` (`IRQ_SLOT_CONSOLE_RX = 0`) and binds
+its event capability to the console process. `EVENT_WAIT(handle, timeout_ticks)`
+supports bounded deadlines (`0` = infinite, `1..=6000` ticks -> `-ETIMEDOUT`),
+rearms the packet interrupt and checks FIFO availability under masked hart interrupts
+before blocking. CLIC line 18 wakes the driver on hart0: the handler masks and
+acknowledges the hardware source at CLIC + peripheral `INT_ENA`/`INT_CLR` until
+the driver rearms it via `EVENT_WAIT` or `IRQ_ACK(handle)`. Driver exit, `IRQ_UNBIND`
+or `CAP_REVOKE` automatically masks the hardware line and wakes blocked waiters
+with `-EPIPE`, preventing interrupt storms from abandoned level sources.
+On Tab5 v1.3 the shell accepted help and procfs reads with one serial write per command.
 
 STATS accepts the original 44-byte little-endian snapshot and a 52-byte
 version with a trailing USB RX interrupt count. Total counts live
@@ -154,7 +159,7 @@ whole-region release. Raw pointers expire at release; sharing requires userspace
 synchronization. No global allocator or individual free. `memtest` exercises
 alignment, writable allocations, exhaustion and release in U-mode.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
-No SMP, POSIX, kernel VFS or dynamic IRQ registration.
+No SMP, POSIX or kernel VFS.
 
 ## ELF and DMA
 
@@ -392,9 +397,9 @@ CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
 for expansion and framebuffer readback. A separate validation reader also
 uses 4 KiB during the first row batch.
 
-Current SRAM payload is 111636 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 10448 bytes, leaving 304 KiB before the separate AHB DMA
-reservation. This frees 264 KiB compared with
+Current SRAM payload is 114388 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 10704 bytes, leaving 301 KiB before the separate AHB DMA
+reservation. This frees 261 KiB compared with
 embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
 reserved for mode switching. The artwork is selected through the shell;
 startup still enters the USB shell.

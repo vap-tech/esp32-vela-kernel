@@ -2,9 +2,10 @@ use core::fmt::Write;
 use vela_kernel::{
     call::CallTable,
     capability::{self as cap, Authority, Capability, Object},
+    event::EventTable,
     id::ThreadSlot,
     ipc::Ipc,
-    lifecycle::{create_endpoint, grant},
+    lifecycle::{bind_event, create_endpoint, grant},
     memory::RegionAllocator,
     process::{PROCESSES, Processes},
     sched::Scheduler,
@@ -15,7 +16,7 @@ use crate::{
     arch, board,
     display::DisplayControl,
     dma::DmaChannel,
-    runtime::{BootLogs, CONSOLE_RX, RUNTIME, Runtime},
+    runtime::{BootLogs, IRQ_SLOT_CONSOLE_RX, RUNTIME, Runtime},
     sentinel::SentinelClient,
     soc,
 };
@@ -54,6 +55,11 @@ extern "C" fn rust_main() -> ! {
     );
     idle.mstatus = (3 << 11) | (1 << 7); // MPP=M, MPIE=1, FS=off
 
+    let mut events = EventTable::new();
+    events
+        .register(IRQ_SLOT_CONSOLE_RX, soc::console::RX_LINE)
+        .expect("register console RX IRQ slot");
+
     // SAFETY: once-only initialization on hart0 with IRQs masked.
     let runtime = unsafe {
         (*RUNTIME.0.get()).write(Runtime {
@@ -68,12 +74,12 @@ extern "C" fn rust_main() -> ! {
             console,
             ipc: Ipc::new(),
             calls: CallTable::new(),
+            events,
             idle_frame: idle,
             in_idle: false,
             dma: DmaChannel::new(),
             sentinel: SentinelClient::new(),
             display: DisplayControl::new(),
-            usb_rx_interrupts: 0,
             dma_interrupts: 0,
             sentinel_interrupts: 0,
             cycles: CycleAccounting::new(),
@@ -86,7 +92,7 @@ extern "C" fn rust_main() -> ! {
     let (shell, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
     let (console_proc, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
 
-    // Explicit boot policy: IPC endpoints, hardware RX event, and service authorities.
+    // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();
     let reply = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
     let input = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
@@ -114,15 +120,15 @@ extern "C" fn rust_main() -> ! {
         cap::SEND,
     )
     .unwrap();
-    let rx_event = runtime
-        .processes
-        .slot_mut(console_proc.slot)
-        .capabilities
-        .install(Capability {
-            object: CONSOLE_RX,
-            rights: cap::READ | cap::WAIT | cap::ACK,
-        })
-        .unwrap();
+    let rx_event = bind_event(
+        &mut runtime.events,
+        &mut runtime.processes,
+        &mut runtime.scheduler,
+        console_proc.slot,
+        IRQ_SLOT_CONSOLE_RX,
+        cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
+    )
+    .unwrap();
     let shell_caps = &mut runtime.processes.slot_mut(shell.slot).capabilities;
     let spawn_cap = shell_caps
         .install(Capability {
@@ -140,6 +146,12 @@ extern "C" fn rust_main() -> ! {
         .install(Capability {
             object: Object::Authority(Authority::Sentinel),
             rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL | cap::GRANT,
+        })
+        .unwrap();
+    let _irq_cap = shell_caps
+        .install(Capability {
+            object: Object::Authority(Authority::IrqControl),
+            rights: cap::CONTROL | cap::GRANT,
         })
         .unwrap();
 

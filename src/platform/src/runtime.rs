@@ -1,8 +1,8 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     call::CallTable,
-    capability::Object,
     errno::Errno,
+    event::EventTable,
     id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
     ipc::Ipc,
     lifecycle::{self, ReapedProcess},
@@ -14,7 +14,7 @@ use vela_kernel::{
 };
 
 use crate::{
-    arch, display::DisplayControl, dma::DmaChannel, pmp, sentinel::SentinelClient, soc,
+    arch, display::DisplayControl, dma::DmaChannel, pmp, sentinel::SentinelClient, soc, syscall,
     usermem::copy_to_user_within,
 };
 
@@ -49,12 +49,12 @@ pub struct Runtime {
     pub console: soc::console::Console,
     pub ipc: Ipc,
     pub calls: CallTable,
+    pub events: EventTable,
     pub idle_frame: arch::TrapFrame,
     pub in_idle: bool,
     pub dma: DmaChannel,
     pub sentinel: SentinelClient,
     pub display: DisplayControl,
-    pub usb_rx_interrupts: u64,
     pub dma_interrupts: u64,
     pub sentinel_interrupts: u64,
     pub cycles: CycleAccounting,
@@ -67,10 +67,7 @@ pub mod device_wait {
     pub const SENTINEL_WAKE: u8 = 3;
 }
 
-pub const CONSOLE_RX: Object = Object::Event {
-    index: 0,
-    generation: 1,
-};
+pub const IRQ_SLOT_CONSOLE_RX: usize = syscall::IRQ_SLOT_CONSOLE_RX as usize;
 
 pub struct BootCell(pub UnsafeCell<MaybeUninit<Runtime>>);
 // SAFETY: hart0 only, HP1 reset, MIE=0 in every Rust kernel path. The M-mode
@@ -82,6 +79,12 @@ pub static RUNTIME: BootCell = BootCell(UnsafeCell::new(MaybeUninit::uninit()));
 impl Runtime {
     pub fn endpoint(&self, process: ProcSlot, handle: Handle, rights: u16) -> Result<usize, Errno> {
         lifecycle::resolve_endpoint(&self.processes, &self.ipc, process, handle, rights)
+    }
+
+    pub fn mask_irq_slot(&mut self, index: usize) {
+        if index == IRQ_SLOT_CONSOLE_RX {
+            self.console.mask_rx_irq();
+        }
     }
 
     pub fn memory(&self) -> &AddressSpace {
@@ -150,6 +153,11 @@ impl Runtime {
     }
 
     pub fn finish_reaped_process(&mut self, reaped: ReapedProcess) {
+        for (index, unbound) in reaped.unbound_events.into_iter().enumerate() {
+            if unbound {
+                self.mask_irq_slot(index);
+            }
+        }
         self.sentinel.release_wake_on_exit(reaped.pid);
         self.dma.release_process(reaped.pid);
         self.pmp_images[reaped.slot.index()] = None;
@@ -161,6 +169,7 @@ impl Runtime {
             &mut self.processes,
             &mut self.ipc,
             &mut self.calls,
+            &mut self.events,
             &mut self.allocator,
             &mut self.scheduler,
             copy_to_user_within,

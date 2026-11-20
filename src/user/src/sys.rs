@@ -46,6 +46,26 @@ pub fn sleep() {
 }
 
 #[inline(always)]
+pub fn event_wait(handle: u32, timeout_ticks: u32) -> u32 {
+    call(abi::EVENT_WAIT, handle, timeout_ticks, 0, 0)
+}
+
+#[inline(always)]
+pub fn irq_ack(handle: u32) -> u32 {
+    call(abi::IRQ_ACK, handle, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn irq_bind(irq_ctl_handle: u32, slot: u32) -> u32 {
+    call(abi::IRQ_BIND, irq_ctl_handle, slot, 0, 0)
+}
+
+#[inline(always)]
+pub fn irq_unbind(event_handle: u32) -> u32 {
+    call(abi::IRQ_UNBIND, event_handle, 0, 0, 0)
+}
+
+#[inline(always)]
 pub fn exit() -> ! {
     call(abi::EXIT, 0, 0, 0, 0);
     loop {

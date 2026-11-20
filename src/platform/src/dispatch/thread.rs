@@ -9,7 +9,7 @@ use vela_kernel::{
 use super::Args;
 use crate::{
     arch,
-    runtime::Runtime,
+    runtime::{IRQ_SLOT_CONSOLE_RX, Runtime},
     syscall,
     usermem::{copy_to_user, copy_to_user_within},
 };
@@ -92,6 +92,7 @@ impl Runtime {
             &mut self.processes,
             &mut self.ipc,
             &mut self.calls,
+            &mut self.events,
             &mut self.allocator,
             &mut self.scheduler,
             copy_to_user_within,
@@ -108,6 +109,7 @@ impl Runtime {
     pub(super) fn sys_stats(&mut self, args: Args) -> Result<u32, Errno> {
         let ptr = args.a0 as usize;
         let len = args.a1 as usize;
+        let usb_rx_interrupts = self.events.interrupts(IRQ_SLOT_CONSOLE_RX);
         match args.a2 {
             syscall::STATS_SUMMARY => {
                 if !matches!(len, syscall::STATS_BYTES | syscall::STATS_IRQ_BYTES) {
@@ -126,8 +128,8 @@ impl Runtime {
                     s.load_q16[0],
                     s.load_q16[1],
                     s.load_q16[2],
-                    self.usb_rx_interrupts as u32,
-                    (self.usb_rx_interrupts >> 32) as u32,
+                    usb_rx_interrupts as u32,
+                    (usb_rx_interrupts >> 32) as u32,
                 ];
                 let mut buffer = [0u8; syscall::STATS_IRQ_BYTES];
                 for (i, word) in words[..len / 4].iter().enumerate() {
@@ -174,7 +176,7 @@ impl Runtime {
                 let systimer = self.scheduler.snapshot().scheduler_ticks;
                 let counts = [
                     systimer,
-                    self.usb_rx_interrupts,
+                    usb_rx_interrupts,
                     self.dma_interrupts,
                     self.sentinel_interrupts,
                 ];

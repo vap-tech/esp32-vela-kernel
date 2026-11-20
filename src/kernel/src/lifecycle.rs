@@ -1,15 +1,16 @@
-//! Cross-subsystem object lifecycle and IPC/capability/memory orchestration.
+//! Cross-subsystem object lifecycle and IPC/capability/memory/event orchestration.
 //!
-//! Individual tables (`Processes`, `Ipc`, `CallTable`, `RegionAllocator`,
-//! `Scheduler`) stay self-contained; multi-table state transitions live here so
-//! revocation, endpoint teardown, RPC cycle checks, shared-memory unmapping,
-//! and process reaping are enforced and host-tested without SoC or raw user
-//! pointer dependencies.
+//! Individual tables (`Processes`, `Ipc`, `CallTable`, `EventTable`,
+//! `RegionAllocator`, `Scheduler`) stay self-contained; multi-table state
+//! transitions live here so revocation, endpoint/event teardown, RPC cycle
+//! checks, shared-memory unmapping, and process reaping are enforced and
+//! host-tested without SoC or raw user pointer dependencies.
 
 use crate::{
     call::CallTable,
     capability::{self as cap, Authority, Capability, Object},
     errno::Errno,
+    event::{EventTable, MAX_EVENTS},
     id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks, Tid},
     ipc::{self, Ipc, Message},
     memory::RegionAllocator,
@@ -31,6 +32,13 @@ pub struct ReapedProcess {
     pub slot: ProcSlot,
     pub pid: Pid,
     pub first_woken: Option<Tid>,
+    pub unbound_events: [bool; MAX_EVENTS],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevokedCapability {
+    pub first_woken: Option<Tid>,
+    pub mask_event: Option<usize>,
 }
 
 /// Create an IPC endpoint owned by `owner` and install its root capability,
@@ -52,6 +60,103 @@ pub fn create_endpoint(
             Err(e)
         }
     }
+}
+
+/// Bind hardware IRQ/event slot `index` to `owner` and install its root capability,
+/// rolling back the binding if the process capability table is full.
+pub fn bind_event<C: Context>(
+    events: &mut EventTable,
+    processes: &mut Processes,
+    scheduler: &mut Scheduler<C>,
+    owner: ProcSlot,
+    index: usize,
+    rights: u16,
+) -> Result<Handle, Errno> {
+    let object = events.bind(index, owner)?;
+    match processes
+        .slot_mut(owner)
+        .capabilities
+        .install(Capability { object, rights })
+    {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            events.unbind(index, scheduler);
+            Err(e)
+        }
+    }
+}
+
+/// Unbind a bound event capability (`CONTROL` required) or drop a delegated
+/// event handle. Returns `Ok(Some(index))` when the root binding was destroyed
+/// (or the last waiter on a delegated handle was woken) so the platform can mask
+/// the hardware line, or `Ok(None)` when another waiter remains active.
+pub fn unbind_event<C: Context>(
+    processes: &mut Processes,
+    events: &mut EventTable,
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    handle: Handle,
+) -> Result<Option<usize>, Errno> {
+    let capability = processes.slot(current).capabilities.get(handle, 0)?;
+    let index = events.resolve(capability.object)?;
+    if capability.rights & cap::CONTROL != 0 {
+        let object = events.unbind(index, scheduler);
+        invalidate_object(processes, scheduler, object, None);
+        Ok(Some(index))
+    } else {
+        processes
+            .slot_mut(current)
+            .capabilities
+            .close(handle)
+            .unwrap();
+        let has_remaining = processes
+            .slot(current)
+            .capabilities
+            .find(capability.object, cap::WAIT)
+            .is_some();
+        if !has_remaining {
+            for i in 0..TASKS {
+                let thread = ThreadSlot(i);
+                let t = scheduler.task(thread);
+                if t.process == current
+                    && t.state == State::Blocked
+                    && t.wait
+                        == (Wait::Event {
+                            object: capability.object,
+                        })
+                {
+                    scheduler.wake_with(thread, Errno::Epipe.to_abi());
+                }
+            }
+        }
+        let any_waiter = (0..TASKS).any(|i| {
+            let t = scheduler.task(ThreadSlot(i));
+            t.state == State::Blocked
+                && t.wait
+                    == (Wait::Event {
+                        object: capability.object,
+                    })
+        });
+        let should_mask = if !any_waiter {
+            events.fail_waiters(capability.object, scheduler, None, Errno::Epipe)
+        } else {
+            false
+        };
+        Ok(should_mask.then_some(index))
+    }
+}
+
+/// Validate `handle` and `rights` in `process` and resolve the live event slot index.
+pub fn resolve_event(
+    processes: &Processes,
+    events: &EventTable,
+    process: ProcSlot,
+    handle: Handle,
+    rights: u16,
+) -> Result<(usize, Object), Errno> {
+    let capability = processes.slot(process).capabilities.get(handle, rights)?;
+    let index = events.resolve(capability.object)?;
+    Ok((index, capability.object))
 }
 
 /// Grant a one-level delegated capability from `owner` to `peer`.
@@ -488,24 +593,38 @@ pub fn revoke_capability<C: Context>(
     processes: &mut Processes,
     ipc: &mut Ipc,
     calls: &mut CallTable,
+    events: &mut EventTable,
     scheduler: &mut Scheduler<C>,
     current: ProcSlot,
     handle: Handle,
     deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
-) -> Result<Option<Tid>, Errno> {
+) -> Result<RevokedCapability, Errno> {
     let c = processes
         .slot(current)
         .capabilities
         .get(handle, cap::CONTROL)?;
     invalidate_object(processes, scheduler, c.object, Some(current));
-    let mut woken = None;
-    if let Object::Endpoint { index, .. } = c.object {
-        calls.fail_where(scheduler, Errno::Epipe, |call, task| {
-            call.endpoint() == index && task.process != current
-        });
-        woken = complete_receivers(processes, ipc, calls, scheduler, index, false, deliver);
+    let mut first_woken = None;
+    let mut mask_event = None;
+    match c.object {
+        Object::Endpoint { index, .. } => {
+            calls.fail_where(scheduler, Errno::Epipe, |call, task| {
+                call.endpoint() == index && task.process != current
+            });
+            first_woken =
+                complete_receivers(processes, ipc, calls, scheduler, index, false, deliver);
+        }
+        Object::Event { index, .. } => {
+            if events.fail_waiters(c.object, scheduler, Some(current), Errno::Epipe) {
+                mask_event = Some(index);
+            }
+        }
+        _ => {}
     }
-    Ok(woken)
+    Ok(RevokedCapability {
+        first_woken,
+        mask_event,
+    })
 }
 
 /// Close `handle` on an endpoint. Closing a `CONTROL` capability destroys the
@@ -699,18 +818,21 @@ pub fn spawn_user_thread<C: Copy>(
 }
 
 /// Terminate `scheduler.current`. If it was the last live thread of its process,
-/// reap all process-owned endpoints, shared-memory grants, capabilities, and
-/// physical allocations, returning `Some(ReapedProcess)` for platform cleanup.
+/// reap all process-owned endpoints, event bindings, shared-memory grants,
+/// capabilities, and physical allocations, returning `Some(ReapedProcess)` for
+/// platform cleanup.
 pub fn terminate_current_thread<C: Context>(
     processes: &mut Processes,
     ipc: &mut Ipc,
     calls: &mut CallTable,
+    events: &mut EventTable,
     allocator: &mut RegionAllocator,
     scheduler: &mut Scheduler<C>,
     mut deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
 ) -> Option<ReapedProcess> {
     let process = scheduler.current().process;
     let exiting = scheduler.current;
+    let exiting_wait = scheduler.task(exiting).wait;
     calls.deactivate(exiting);
     calls.fail_for_server(scheduler, exiting, Errno::Epipe);
     scheduler.terminate();
@@ -732,6 +854,22 @@ pub fn terminate_current_thread<C: Context>(
         if *is_closed {
             invalidate_object(processes, scheduler, objects[i], None);
         }
+    }
+    let removed_events = events.remove_process(process, scheduler);
+    let mut unbound_events = [false; MAX_EVENTS];
+    for (index, removed) in removed_events.into_iter().enumerate() {
+        if let Some(event_object) = removed {
+            unbound_events[index] = true;
+            invalidate_object(processes, scheduler, event_object, None);
+        }
+    }
+    if let Wait::Event {
+        object: event_object,
+    } = exiting_wait
+        && let Object::Event { index, .. } = event_object
+        && events.fail_waiters(event_object, scheduler, None, Errno::Epipe)
+    {
+        unbound_events[index] = true;
     }
     for capability in processes
         .slot(process)
@@ -766,6 +904,7 @@ pub fn terminate_current_thread<C: Context>(
         slot: process,
         pid: owner,
         first_woken,
+        unbound_events,
     })
 }
 
@@ -775,14 +914,17 @@ pub fn terminate_process<C: Context>(
     processes: &mut Processes,
     ipc: &mut Ipc,
     calls: &mut CallTable,
+    events: &mut EventTable,
     allocator: &mut RegionAllocator,
     scheduler: &mut Scheduler<C>,
     deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
 ) -> ReapedProcess {
     let current = scheduler.current().process;
-    for i in 0..TASKS {
+    let mut sibling_waits = [Wait::None; TASKS];
+    for (i, saved_wait) in sibling_waits.iter_mut().enumerate() {
         let slot = ThreadSlot(i);
         if scheduler.task(slot).process == current && slot != scheduler.current {
+            *saved_wait = scheduler.task(slot).wait;
             calls.deactivate(slot);
             calls.fail_for_server(scheduler, slot, Errno::Epipe);
             let task = scheduler.task_mut(slot);
@@ -791,14 +933,26 @@ pub fn terminate_process<C: Context>(
             task.deadline = None;
         }
     }
-    terminate_current_thread(processes, ipc, calls, allocator, scheduler, deliver)
-        .expect("process has no remaining live threads")
+    let mut reaped =
+        terminate_current_thread(processes, ipc, calls, events, allocator, scheduler, deliver)
+            .expect("process has no remaining live threads");
+    for wait in sibling_waits {
+        if let Wait::Event {
+            object: event_object,
+        } = wait
+            && let Object::Event { index, .. } = event_object
+            && events.fail_waiters(event_object, scheduler, None, Errno::Epipe)
+        {
+            reaped.unbound_events[index] = true;
+        }
+    }
+    reaped
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::PAGE;
+    use crate::{event::WaitOutcome, memory::PAGE};
 
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
     struct TestCtx {
@@ -819,6 +973,7 @@ mod tests {
         processes: Processes,
         ipc: Ipc,
         calls: CallTable,
+        events: EventTable,
         allocator: RegionAllocator,
         scheduler: Scheduler<TestCtx>,
     }
@@ -852,10 +1007,13 @@ mod tests {
             space.insert(stack, process::READ | process::WRITE).unwrap();
             processes.create(space).unwrap();
         }
+        let mut events = EventTable::new();
+        events.register(0, 18).unwrap();
         Harness {
             processes,
             ipc: Ipc::new(),
             calls: CallTable::new(),
+            events,
             allocator: RegionAllocator::new(0x4ff4_0000, 0x4ff4_0000 + 32 * PAGE),
             scheduler: Scheduler::new([TestCtx::default(); 3], [CODE.base; 3], stacks),
         }
@@ -1166,6 +1324,7 @@ mod tests {
             &mut h.processes,
             &mut h.ipc,
             &mut h.calls,
+            &mut h.events,
             &mut h.scheduler,
             owner,
             cap_handle,
@@ -1254,6 +1413,7 @@ mod tests {
                 &mut h.processes,
                 &mut h.ipc,
                 &mut h.calls,
+                &mut h.events,
                 &mut h.allocator,
                 &mut h.scheduler,
                 deliver_checked,
@@ -1349,6 +1509,7 @@ mod tests {
             &mut h.processes,
             &mut h.ipc,
             &mut h.calls,
+            &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
             deliver_checked,
@@ -1449,6 +1610,7 @@ mod tests {
             &mut h.processes,
             &mut h.ipc,
             &mut h.calls,
+            &mut h.events,
             &mut h.scheduler,
             shell,
             sentinel_root,
@@ -1531,6 +1693,7 @@ mod tests {
             &mut h.processes,
             &mut h.ipc,
             &mut h.calls,
+            &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
             deliver_checked,
@@ -1636,6 +1799,152 @@ mod tests {
                 |_, _, _, _, _, _| Ok(()),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn event_bind_delegate_revoke_unbind_and_driver_exit_auto_mask_and_wake_waiters() {
+        let mut h = harness();
+        let owner = ProcSlot(0);
+        let peer = ProcSlot(1);
+        let peer_pid = h.processes.slot(peer).id;
+
+        let root_ev = bind_event(
+            &mut h.events,
+            &mut h.processes,
+            &mut h.scheduler,
+            owner,
+            0,
+            cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
+        )
+        .unwrap();
+        let (_, ev_obj) =
+            resolve_event(&h.processes, &h.events, owner, root_ev, cap::WAIT).unwrap();
+
+        // Delegate WAIT | ACK to peer; peer blocks on EVENT_WAIT.
+        let peer_ev = grant_or_map(
+            &mut h.processes,
+            owner,
+            root_ev,
+            peer_pid,
+            cap::WAIT | cap::ACK,
+            false,
+        )
+        .unwrap();
+        h.scheduler.current = ThreadSlot(1);
+        h.scheduler.task_mut(ThreadSlot(1)).state = State::Running;
+        assert_eq!(
+            h.events
+                .wait(ev_obj, &mut h.scheduler, Some(Ticks(100)), |_| true),
+            Ok(WaitOutcome::Blocked)
+        );
+        assert!(!h.events.is_masked(0));
+
+        // Owner revokes capability -> peer handle invalidated, peer waiter woken with -EPIPE, slot masked.
+        let revoked = revoke_capability(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.scheduler,
+            owner,
+            root_ev,
+            deliver_checked,
+        )
+        .unwrap();
+        assert_eq!(revoked.mask_event, Some(0));
+        assert!(h.events.is_masked(0));
+        assert_eq!(
+            resolve_event(&h.processes, &h.events, peer, peer_ev, cap::WAIT),
+            Err(Errno::Ebadf)
+        );
+        assert_eq!(h.scheduler.task(ThreadSlot(1)).state, State::Ready);
+        assert_eq!(
+            h.scheduler.task(ThreadSlot(1)).context.a0,
+            Errno::Epipe.to_abi()
+        );
+
+        // Re-grant to peer; peer blocks on EVENT_WAIT, then peer exits -> slot is masked even though owner lives.
+        let _peer_ev2 = grant_or_map(
+            &mut h.processes,
+            owner,
+            root_ev,
+            peer_pid,
+            cap::WAIT | cap::ACK,
+            false,
+        )
+        .unwrap();
+        h.scheduler.current = ThreadSlot(1);
+        h.scheduler.task_mut(ThreadSlot(1)).state = State::Running;
+        assert_eq!(
+            h.events.wait(ev_obj, &mut h.scheduler, None, |_| true),
+            Ok(WaitOutcome::Blocked)
+        );
+        assert!(!h.events.is_masked(0));
+        let peer_reaped = terminate_current_thread(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.allocator,
+            &mut h.scheduler,
+            deliver_checked,
+        )
+        .unwrap();
+        assert!(peer_reaped.unbound_events[0]);
+        assert!(h.events.is_masked(0));
+        assert_eq!(h.events.owner(0), Some(owner));
+
+        // Owner itself blocks on EVENT_WAIT, then exits -> slot is automatically unbound & masked.
+        h.scheduler.current = ThreadSlot(0);
+        h.scheduler.task_mut(ThreadSlot(0)).state = State::Running;
+        assert_eq!(
+            h.events.wait(ev_obj, &mut h.scheduler, None, |_| true),
+            Ok(WaitOutcome::Blocked)
+        );
+        assert!(!h.events.is_masked(0));
+        let reaped = terminate_current_thread(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.allocator,
+            &mut h.scheduler,
+            deliver_checked,
+        )
+        .unwrap();
+        assert!(reaped.unbound_events[0]);
+        assert!(h.events.is_masked(0));
+        assert_eq!(h.events.owner(0), None);
+
+        // Slot 0 can now be freshly bound by ProcSlot(2) with a new generation and later explicitly unbound.
+        let p2 = ProcSlot(2);
+        let rebound = bind_event(
+            &mut h.events,
+            &mut h.processes,
+            &mut h.scheduler,
+            p2,
+            0,
+            cap::WAIT | cap::ACK | cap::CONTROL,
+        )
+        .unwrap();
+        let (_, rebound_obj) =
+            resolve_event(&h.processes, &h.events, p2, rebound, cap::CONTROL).unwrap();
+        assert_ne!(rebound_obj, ev_obj);
+        assert_eq!(
+            unbind_event(
+                &mut h.processes,
+                &mut h.events,
+                &mut h.scheduler,
+                p2,
+                rebound
+            ),
+            Ok(Some(0))
+        );
+        assert_eq!(h.events.owner(0), None);
+        assert_eq!(
+            resolve_event(&h.processes, &h.events, p2, rebound, 0),
+            Err(Errno::Ebadf)
         );
     }
 }

@@ -1,6 +1,7 @@
 use vela_kernel::{
     capability::{self as cap, Authority},
     errno::Errno,
+    event::WaitOutcome,
     id::{Handle, ProcSlot},
     lifecycle,
     task::Wait,
@@ -9,7 +10,7 @@ use vela_kernel::{
 use super::Args;
 use crate::{
     pmp,
-    runtime::{CONSOLE_RX, Runtime, device_wait},
+    runtime::{IRQ_SLOT_CONSOLE_RX, Runtime, device_wait},
     soc,
     usermem::{copy_from_user, copy_to_user_within},
 };
@@ -91,36 +92,106 @@ impl Runtime {
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        lifecycle::require_event(
+        let timeout = args.a1;
+        if timeout > 6000 {
+            return Err(Errno::Einval);
+        }
+        let (_, object) = lifecycle::resolve_event(
             &self.processes,
+            &self.events,
             current,
             Handle(args.a0),
-            CONSOLE_RX,
             cap::WAIT | cap::ACK,
         )?;
-        if self
-            .scheduler
-            .tasks
-            .iter()
-            .any(|t| matches!(t.wait, Wait::Event { object: CONSOLE_RX }))
-        {
-            return Err(Errno::Ebusy);
-        }
-        if self.console.arm_rx_irq() {
-            self.scheduler.block(Wait::Event { object: CONSOLE_RX });
+        let deadline = if timeout == 0 {
+            None
+        } else {
+            Some(self.scheduler.uptime().saturating_add(u64::from(timeout)))
+        };
+        let console = &mut self.console;
+        let outcome = self
+            .events
+            .wait(object, &mut self.scheduler, deadline, |index| {
+                if index == IRQ_SLOT_CONSOLE_RX {
+                    console.arm_rx_irq()
+                } else {
+                    true
+                }
+            })?;
+        if outcome == WaitOutcome::Blocked {
             *switch = true;
         }
         Ok(0)
     }
 
-    pub(super) fn sys_console_read(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        lifecycle::require_event(
+    pub(super) fn sys_irq_ack(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        let (_, object) = lifecycle::resolve_event(
+            &self.processes,
+            &self.events,
+            current,
+            Handle(args.a0),
+            cap::ACK,
+        )?;
+        let console = &mut self.console;
+        self.events.ack(object, |index| {
+            if index == IRQ_SLOT_CONSOLE_RX {
+                let _ = console.arm_rx_irq();
+            }
+        })?;
+        Ok(0)
+    }
+
+    pub(super) fn sys_irq_bind(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        lifecycle::require_authority(
             &self.processes,
             current,
             Handle(args.a0),
-            CONSOLE_RX,
+            Authority::IrqControl,
+            cap::CONTROL,
+        )?;
+        let index = usize::try_from(args.a1).map_err(|_| Errno::Einval)?;
+        let handle = lifecycle::bind_event(
+            &mut self.events,
+            &mut self.processes,
+            &mut self.scheduler,
+            current,
+            index,
+            cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
+        )?;
+        self.mask_irq_slot(index);
+        Ok(handle.raw())
+    }
+
+    pub(super) fn sys_irq_unbind(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        if let Some(index) = lifecycle::unbind_event(
+            &mut self.processes,
+            &mut self.events,
+            &mut self.scheduler,
+            current,
+            Handle(args.a0),
+        )? {
+            self.mask_irq_slot(index);
+        }
+        *switch = self.scheduler.should_preempt();
+        Ok(0)
+    }
+
+    pub(super) fn sys_console_read(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        let (index, _) = lifecycle::resolve_event(
+            &self.processes,
+            &self.events,
+            current,
+            Handle(args.a0),
             cap::READ,
         )?;
+        if index != IRQ_SLOT_CONSOLE_RX {
+            return Err(Errno::Ebadf);
+        }
         let pointer = args.a1 as usize;
         let capacity = args.a2 as usize;
         if capacity == 0 || capacity > 32 {
