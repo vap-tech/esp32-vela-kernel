@@ -1,14 +1,17 @@
 use vela_kernel::{
     capability::{self as cap, Authority},
+    dma::DmaDirection,
     errno::Errno,
     event::WaitOutcome,
     id::{Handle, ProcSlot},
     lifecycle,
+    memory::MemoryClass,
     task::Wait,
 };
 
 use super::Args;
 use crate::{
+    dma::{DMA_CH_GDMA_AHB_CH1, prepare_dma_buffer},
     pmp,
     runtime::{IRQ_SLOT_CONSOLE_RX, Runtime, device_wait},
     soc,
@@ -38,7 +41,9 @@ impl Runtime {
         if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
             self.cycles.sync_clock(now_16m, before_rates.cpu);
         }
-        let (diag, result) = self.display.step(args.a1);
+        let (diag, result) = self
+            .display
+            .step(args.a1, &mut self.allocator, &mut self.dma);
         let after_rates = unsafe { soc::clock::rates_mhz() };
         if after_rates.cpu != before_rates.cpu {
             if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
@@ -59,25 +64,49 @@ impl Runtime {
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let pid = self.processes.slot(current).id;
-        if !self.dma.is_cpu_owner(pid) {
+        let (channel, len) = if args.a1 != 0 {
+            let (idx, _) = lifecycle::resolve_dma_channel(
+                &self.processes,
+                &self.dma,
+                current,
+                Handle(args.a0),
+                cap::READ | cap::WRITE | cap::WAIT,
+            )?;
+            (idx, args.a1 as usize)
+        } else {
+            (DMA_CH_GDMA_AHB_CH1, args.a0 as usize)
+        };
+        if channel != DMA_CH_GDMA_AHB_CH1 || !self.dma.is_cpu_owner(channel, pid) {
             return Err(Errno::Eperm);
         }
-        let len = args.a0 as usize;
         if len == 0 || len > soc::dma::HALF || len % 4 != 0 {
             return Err(Errno::Einval);
         }
+        let page = soc::dma::page();
         let space = &mut self.processes.slot_mut(current).memory;
-        space.dma_access(soc::dma::page(), false)?;
+        space.dma_access(page, false)?;
         let prepared = pmp::Prepared::new(space).unwrap();
         assert!(unsafe { prepared.activate(true) });
         self.pmp_images[current.index()] = Some((space.revision, prepared, true));
         self.active_space = Some((current, space.revision));
+        let deadline = self.scheduler.uptime().saturating_add(100);
+        prepare_dma_buffer(page, DmaDirection::MemToMem, false);
         self.dma
-            .submit(pid, len, self.scheduler.uptime().saturating_add(100));
+            .submit(
+                channel,
+                pid,
+                MemoryClass::Sram,
+                page,
+                DmaDirection::MemToMem,
+                len,
+                Some(deadline),
+                false,
+            )
+            .unwrap();
         self.scheduler.block(Wait::Device {
             domain: device_wait::DMA,
-            token: 0,
-            pointer: 0,
+            token: channel as u32,
+            pointer: page.base,
         });
         unsafe {
             soc::dma::start(len);

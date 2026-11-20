@@ -1,7 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{id::Ticks, task::Context};
 
-use crate::{arch, runtime::RUNTIME, soc};
+use crate::{arch, dma::DMA_CH_GDMA_AHB_CH1, runtime::RUNTIME, soc};
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
@@ -50,9 +50,9 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         let live_tick = runtime.scheduler.snapshot().scheduler_ticks > 0;
         runtime.cycles.on_timer_irq(raw_16m, 160_000, live_tick);
         let uptime = Ticks(raw_16m / 160_000);
-        if runtime.dma.timed_out(uptime) {
+        if runtime.dma.timed_out(DMA_CH_GDMA_AHB_CH1, uptime) {
             unsafe {
-                soc::dma::finish(runtime.dma.length());
+                soc::dma::finish(runtime.dma.length(DMA_CH_GDMA_AHB_CH1));
             }
             runtime.complete_dma(false);
         }
@@ -70,7 +70,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && cause == soc::dma::LINE {
         runtime.dma_interrupts += 1;
-        let ok = unsafe { soc::dma::finish(runtime.dma.length()) };
+        let ok = unsafe { soc::dma::finish(runtime.dma.length(DMA_CH_GDMA_AHB_CH1)) };
         runtime.complete_dma(ok);
         switch = from_idle || runtime.scheduler.should_preempt();
     } else if interrupt && let Some(index) = runtime.events.index_by_line(cause) {

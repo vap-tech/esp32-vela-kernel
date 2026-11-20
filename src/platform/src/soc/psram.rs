@@ -13,11 +13,16 @@ pub const FRAME: usize = 0x48000000;
 pub const DIRECT: usize = 0x88000000;
 pub const FRAME_BYTES: usize = 720 * 1280 * 2;
 pub const MMU_PAGE_BYTES: usize = 64 * 1024;
-pub const TOTAL_PAGES: usize = 512; // 32 MiB AP HEX PSRAM
-pub const DISPLAY_PAGES: usize = 32; // first 2 MiB reserved for display framebuffer
-pub const POOL_START: usize = DIRECT + DISPLAY_PAGES * MMU_PAGE_BYTES; // 0x8820_0000
+pub const TOTAL_PAGES: usize = 512; // 32 MiB AP HEX PSRAM (512 * 64 KiB MMU pages)
+pub const POOL_START: usize = DIRECT; // 0x8800_0000
 pub const POOL_END: usize = DIRECT + TOTAL_PAGES * MMU_PAGE_BYTES; // 0x8a00_0000
 const MMU_VALID_READ_WRITE: u32 = (1 << 11) | (1 << 10);
+
+/// Translate a direct uncached PSRAM address (`0x8800_0000..0x8a00_0000`) into
+/// its AXI/DMA bus alias (`0x4800_0000..0x4a00_0000`).
+pub const fn bus_address(direct_addr: usize) -> usize {
+    FRAME + (direct_addr - DIRECT)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Probe {
@@ -44,7 +49,8 @@ impl Controller {
         self.ready
     }
 
-    /// Initialize MSPI2/3 AP HEX PSRAM and map the initial 2 MiB framebuffer window.
+    /// Initialize MSPI2/3 AP HEX PSRAM, verify the first 64 KiB MMU page, and leave
+    /// all 512 MMU entries unmapped for dynamic allocation from the 32 MiB pool.
     ///
     /// # Safety
     /// Exclusive HP0 ownership of MSPI2/3, LDO VO2, PSRAM IO_MUX, and the direct
@@ -62,8 +68,7 @@ impl Controller {
     }
 
     /// Identity-map or unmap 64 KiB PSRAM MMU pages covering `region` in the managed
-    /// user pool (`0x8820_0000..0x8a00_0000`), verifying sparse word access when mapping.
-    /// Never modifies the reserved 2 MiB display framebuffer window (`pages 0..32`).
+    /// 32 MiB pool (`0x8800_0000..0x8a00_0000`), verifying sparse word access when mapping.
     ///
     /// # Safety
     /// Exclusive HP0 ownership of MSPI2/3 MMU and `region` with machine interrupts masked.
@@ -271,25 +276,30 @@ unsafe fn init_once(probe_out: &mut Option<Probe>) -> Result<(), u32> {
         update(CTRL + 0x0c, (1 << 25) | (1 << 26), (1 << 25) | (1 << 26));
         update(CTRL + 0x3c, (1 << 31) | 1, 1); // AXI requests enabled
         bus_div(6); // SPLL / 6 = 80 MHz DDR AXI access
-        // Map the first 2 MiB for the display framebuffer and clear the remaining 30 MiB MMU entries.
-        for page in 0..DISPLAY_PAGES as u32 {
-            put(CTRL + 0x380, page);
-            put(CTRL + 0x37c, page | MMU_VALID_READ_WRITE);
-        }
-        for page in DISPLAY_PAGES as u32..TOTAL_PAGES as u32 {
+        // Temporarily map page 0 to probe the AXI DDR link, then unmap all 512 MMU entries
+        // so the full 32 MiB PSRAM pool starts clean and unallocated.
+        put(CTRL + 0x380, 0);
+        put(CTRL + 0x37c, MMU_VALID_READ_WRITE);
+        for page in 1..TOTAL_PAGES as u32 {
             put(CTRL + 0x380, page);
             put(CTRL + 0x37c, 0);
         }
         core::arch::asm!("fence iorw, iorw", options(nostack));
-        // Distinct sparse addresses catch disconnected lines and address aliasing.
-        for off in (0..FRAME_BYTES).step_by(4096) {
+        for off in (0..MMU_PAGE_BYTES).step_by(4096) {
             put(DIRECT + off, 0x5a6b7c8d ^ (off as u32));
         }
-        for off in (0..FRAME_BYTES).step_by(4096) {
+        for off in (0..MMU_PAGE_BYTES).step_by(4096) {
             if get(DIRECT + off) != 0x5a6b7c8d ^ (off as u32) {
+                put(CTRL + 0x380, 0);
+                put(CTRL + 0x37c, 0);
+                core::arch::asm!("fence iorw, iorw", options(nostack));
                 return Err(12);
             }
+            put(DIRECT + off, 0);
         }
+        put(CTRL + 0x380, 0);
+        put(CTRL + 0x37c, 0);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
         Ok(())
     }
 }

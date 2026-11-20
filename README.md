@@ -88,7 +88,7 @@ Neither command enters PMU light/deep sleep.
 | --- | --- |
 | Process/thread pools, priority scheduling, PMP and capabilities | Hart0 only; no HP SMP or enabled userspace FPU/DSP/PIE state. |
 | ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled images selected by index; no general filesystem loader or dynamic linker. |
-| Managed SRAM (4 KiB) and PSRAM (64 KiB MMU, 30 MiB pool) allocation + controlled DMA copy | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` is enabled). |
+| Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` is enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
@@ -106,7 +106,7 @@ gives owner send+receive rights. Boot assignments and explicit capability grants
 peers; global endpoint IDs are not user handles. Receiving requires an explicit
 process-local RECEIVE capability; handle values alone confer no authority.
 Privileged operations (process spawning, display scanout control, Sentinel
-supervision and IRQ slot binding/consumption) likewise require explicit process-local capability
+supervision, IRQ slot binding/consumption and DMA channel transfers) likewise require explicit process-local capability
 handles granted by boot policy rather than ambient PID checks.
 Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
 retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
@@ -150,8 +150,8 @@ contribute even when the CPU spends most time in WFI.
 Processes own address spaces, cached PMP images and capability tables; threads
 own saved contexts, stacks and priority/affinity. `MEM_ALLOC(bytes, class)` reserves zeroed,
 NAPOT-compatible owned internal SRAM (`MEM_CLASS_SRAM = 0`, 4 KiB pages) or external PSRAM
-(`MEM_CLASS_PSRAM = 1`, 64 KiB MMU pages in `0x8820_0000..0x8a00_0000` beyond the 2 MiB display
-framebuffer window); `MEM_FREE` revokes aliases and unmaps PSRAM MMU pages before reuse. Endpoint
+(`MEM_CLASS_PSRAM = 1`, 64 KiB MMU pages across the full 32 MiB pool `0x8800_0000..0x8a00_0000`);
+`MEM_FREE` rejects regions with active `InFlight` DMA (`-EBUSY`), revokes aliases and unmaps PSRAM MMU pages before reuse. Endpoint
 and memory grants cannot forward authority. IPC call/reply (`IPC_CALL`, `IPC_REPLY`, `IPC_REPLY_RECV`) uses single-use reply
 tokens, bounded priority donation, direct client-to-server handoff when a receiver is already waiting, and optional deadlines.
 
@@ -172,13 +172,15 @@ separate PMP mappings for its segments. The supported relocation is symbol-free
 R_RISCV_RELATIVE with an aligned RW destination and an in-image addend.
 The spawn ABI selects a bundled executable by index.
 
-On Tab5 v1.3, `run dma` launches an isolated driver that checks a 2048-byte
-SRAM copy byte by byte. GDMA-AHB channel 1 uses kernel-owned descriptors and
-a linker-reserved page split into source and destination halves. The syscall
-accepts only a word-aligned length of 4–2048 bytes from the owning PID.
+On Tab5 v1.3, `run dma` launches an isolated driver granted a process-local
+`Object::DmaChannel` capability (`DMA_CHANNEL_GDMA_AHB_CH1 = 0`) that checks a
+2048-byte SRAM copy byte by byte. `DmaTable` unifies `GDMA-AHB CH1` (memory copy)
+and `DW-GDMA CH0` (MIPI-DSI scanout), validating controller-specific `MemoryClass`
+compatibility (`GdmaAhb` -> `Sram`, `DwGdmaAxi` -> `Sram | Psram`), 64-byte
+cache-line alignment, and per-channel `InFlight` region holds in `RegionAllocator`.
 Data accesses keep `L1-DCache` bypassed for direct uncached DMA coherency, while HP0's 16 KiB `L1-ICache0` accelerates instruction fetch and is invalidated across newly loaded ELF segments. Before starting
-the transfer the kernel disables the user PMP mapping. The RX completion IRQ
-checks descriptor ownership and length before restoring access and waking
+the transfer the kernel disables the user PMP mapping and marks the region `InFlight`. The RX completion IRQ
+checks descriptor ownership and length before restoring access, clearing `InFlight` and waking
 the caller. Exit defers page reuse until completion. Failure or a one-second
 timeout quarantines the page until reboot. The buffer supports internal SRAM
 on this channel; PSRAM and cached user mappings require separate cache handling.
@@ -377,13 +379,15 @@ lengths, CRCs and expected header as small metadata.
 The trusted driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
 mode registers and verifies the selected chip's 32 MiB density. The link
 initializes at SPLL/12 = 40 MHz and uses SPLL/6 = 80 MHz for HEX x16 DDR.
-The first 2 MiB (`pages 0..32`) are identity-mapped through the PSRAM controller MMU.
-A single framebuffer occupies 1843200 bytes at physical 0x48000000.
-CPU rendering and verification use the uncached 0x88000000 alias.
-DW-GDMA reads the bus alias with one descriptor per frame and a four-frame
-ring. The display driver exclusively owns this 2 MiB window (`0x88000000..0x88200000`), while the
-remaining 30 MiB (`0x88200000..0x8a000000`, `pages 32..512`) are managed as a 64 KiB-page NAPOT
-PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM` and `run pic-psram`).
+All 32 MiB (`0x88000000..0x8a000000`, `pages 0..512`) are managed as a unified
+64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM` and `run pic-psram`).
+When `display diag` or `display boot` starts, the display driver dynamically
+allocates a 2 MiB region from `RegionAllocator`, identity-maps its 32 MMU pages,
+renders the 1843200-byte framebuffer via the uncached `0x88xx_xxxx` alias, and
+binds `DW-GDMA CH0` (`InFlight`) reading the corresponding `0x48xx_xxxx` bus alias
+with one descriptor per frame and a four-frame ring. Switching back to `display test`,
+`display pixel` or `display orbit` stops scanout, releases the `InFlight` DMA hold
+and unmaps/frees the 2 MiB region so the full 32 MiB of PSRAM are available when full-screen PSRAM scanout is not active.
 
 The raster is expanded and read back in batches of 32 rows, yielding between
 batches. The framebuffer is written only after the previous scanout stops.
@@ -401,9 +405,9 @@ CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
 for expansion and framebuffer readback. A separate validation reader also
 uses 4 KiB during the first row batch.
 
-Current SRAM payload is 117416 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 11136 bytes, leaving 298 KiB before the separate AHB DMA
-reservation. This frees 258 KiB compared with
+Current SRAM payload is 121248 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 11552 bytes, leaving 293 KiB before the separate AHB DMA
+reservation. This frees 254 KiB compared with
 embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
 reserved for mode switching. The artwork is selected through the shell;
 startup still enters the USB shell.

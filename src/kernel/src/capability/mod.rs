@@ -27,6 +27,7 @@ pub enum Object {
     Endpoint { index: usize, generation: u32 },
     Memory { owner: Pid, region: Region },
     Event { index: usize, generation: u32 },
+    DmaChannel { index: usize, generation: u32 },
     Authority(Authority),
 }
 #[derive(Clone, Copy)]

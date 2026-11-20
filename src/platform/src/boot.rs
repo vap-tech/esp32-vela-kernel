@@ -2,6 +2,7 @@ use core::fmt::Write;
 use vela_kernel::{
     call::CallTable,
     capability::{self as cap, Authority, Capability, Object},
+    dma::{DmaController, DmaTable},
     event::EventTable,
     id::ThreadSlot,
     ipc::Ipc,
@@ -15,7 +16,7 @@ use vela_kernel::{
 use crate::{
     arch, board,
     display::DisplayControl,
-    dma::DmaChannel,
+    dma::{DMA_CH_DW_GDMA_SCANOUT, DMA_CH_GDMA_AHB_CH1},
     runtime::{BootLogs, IRQ_SLOT_CONSOLE_RX, RUNTIME, Runtime},
     sentinel::SentinelClient,
     soc,
@@ -60,6 +61,12 @@ extern "C" fn rust_main() -> ! {
         .register(IRQ_SLOT_CONSOLE_RX, soc::console::RX_LINE)
         .expect("register console RX IRQ slot");
 
+    let mut dma = DmaTable::new();
+    dma.register(DMA_CH_GDMA_AHB_CH1, DmaController::GdmaAhb)
+        .expect("register GDMA-AHB CH1 slot");
+    dma.register(DMA_CH_DW_GDMA_SCANOUT, DmaController::DwGdmaAxi)
+        .expect("register DW-GDMA CH0 scanout slot");
+
     // SAFETY: once-only initialization on hart0 with IRQs masked.
     let runtime = unsafe {
         (*RUNTIME.0.get()).write(Runtime {
@@ -77,7 +84,7 @@ extern "C" fn rust_main() -> ! {
             events,
             idle_frame: idle,
             in_idle: false,
-            dma: DmaChannel::new(),
+            dma,
             sentinel: SentinelClient::new(),
             display: DisplayControl::new(),
             dma_interrupts: 0,
@@ -88,9 +95,9 @@ extern "C" fn rust_main() -> ! {
     };
 
     // Load isolated standalone user ELF services into private SRAM allocations.
-    let (procfs, _) = runtime.load_elf(PROCFS_ELF, false).expect("procfs ELF");
-    let (shell, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
-    let (console_proc, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
+    let (procfs, _, _) = runtime.load_elf(PROCFS_ELF, false).expect("procfs ELF");
+    let (shell, _, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
+    let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
 
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();

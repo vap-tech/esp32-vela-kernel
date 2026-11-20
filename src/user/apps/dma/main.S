@@ -2,6 +2,7 @@
 .globl _start
 _start:
     mv s0, a0
+    mv s2, a1
     li t3, 2048
     add s1, s0, t3
     li t0, 0
@@ -14,7 +15,8 @@ fill:
     sb t1, 0(t2)
     addi t0, t0, 1
     bltu t0, t3, fill
-    mv a0, t3
+    mv a0, s2
+    mv a1, t3
     li a7, 25
     ecall
     bnez a0, fail

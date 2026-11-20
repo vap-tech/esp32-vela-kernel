@@ -1,6 +1,8 @@
 use core::{cell::UnsafeCell, fmt::Write, mem::MaybeUninit};
 use vela_kernel::{
     call::CallTable,
+    capability::{self as cap, Capability, Object},
+    dma::{DmaDirection, DmaTable},
     errno::Errno,
     event::EventTable,
     id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
@@ -14,7 +16,12 @@ use vela_kernel::{
 };
 
 use crate::{
-    arch, display::DisplayControl, dma::DmaChannel, pmp, sentinel::SentinelClient, soc, syscall,
+    arch,
+    display::DisplayControl,
+    dma::{DMA_CH_GDMA_AHB_CH1, finish_dma_buffer},
+    pmp,
+    sentinel::SentinelClient,
+    soc, syscall,
     usermem::copy_to_user_within,
 };
 
@@ -52,7 +59,7 @@ pub struct Runtime {
     pub events: EventTable,
     pub idle_frame: arch::TrapFrame,
     pub in_idle: bool,
-    pub dma: DmaChannel,
+    pub dma: DmaTable,
     pub sentinel: SentinelClient,
     pub display: DisplayControl,
     pub dma_interrupts: u64,
@@ -185,7 +192,7 @@ impl Runtime {
             }
         }
         self.sentinel.release_wake_on_exit(reaped.pid);
-        self.dma.release_process(reaped.pid);
+        self.dma.release_all_for_process(reaped.pid);
         self.pmp_images[reaped.slot.index()] = None;
         self.note_woken_receiver(reaped.first_woken);
     }
@@ -217,7 +224,11 @@ impl Runtime {
         }
     }
 
-    pub fn load_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<(LoadedElf, u32), Errno> {
+    pub fn load_elf(
+        &mut self,
+        bytes: &[u8],
+        dma_driver: bool,
+    ) -> Result<(LoadedElf, u32, u32), Errno> {
         self.load_elf_in(bytes, MemoryClass::Sram, dma_driver)
     }
 
@@ -226,7 +237,7 @@ impl Runtime {
         bytes: &[u8],
         code_class: MemoryClass,
         dma_driver: bool,
-    ) -> Result<(LoadedElf, u32), Errno> {
+    ) -> Result<(LoadedElf, u32, u32), Errno> {
         let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| Errno::Enoexec)?;
         if code_class == MemoryClass::Psram {
             if !image.pic {
@@ -304,18 +315,35 @@ impl Runtime {
             let entry = bias + image.entry;
             let stack = self.allocator.allocate(owner, 4096)?;
             space.insert(stack, READ | WRITE)?;
-            let arg = if dma_driver {
-                if !self.dma.acquire(owner) {
-                    return Err(Errno::Ebusy);
-                }
+            let (arg0, arg1) = if dma_driver {
+                let dma_obj = self.dma.acquire(DMA_CH_GDMA_AHB_CH1, owner)?;
+                let dma_handle =
+                    self.processes
+                        .slot_mut(process)
+                        .capabilities
+                        .install(Capability {
+                            object: dma_obj,
+                            rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL,
+                        })?;
                 let page = soc::dma::page();
                 space.insert(page, READ | WRITE)?;
+                let _ = self
+                    .processes
+                    .slot_mut(process)
+                    .capabilities
+                    .install(Capability {
+                        object: Object::Memory {
+                            owner,
+                            region: page,
+                        },
+                        rights: cap::READ | cap::WRITE | cap::CONTROL,
+                    })?;
                 unsafe {
                     core::ptr::write_bytes(page.base as *mut u8, 0, page.size);
                 }
-                page.base as u32
+                (page.base as u32, dma_handle.raw())
             } else {
-                0
+                (0, 0)
             };
             let prepared = pmp::Prepared::new(&space)?;
             unsafe {
@@ -339,11 +367,12 @@ impl Runtime {
                     entry,
                     stack,
                 },
-                arg,
+                arg0,
+                arg1,
             ))
         })();
         if result.is_err() {
-            self.dma.release_process(owner);
+            self.dma.release_all_for_process(owner);
             self.release_owner_memory(owner);
             self.pmp_images[process.index()] = None;
             *self.processes.slot_mut(process) = Process::EMPTY;
@@ -366,7 +395,7 @@ impl Runtime {
     }
 
     pub fn abort_loaded(&mut self, loaded: LoadedElf) {
-        self.dma.release_process(loaded.pid);
+        self.dma.release_all_for_process(loaded.pid);
         self.release_owner_memory(loaded.pid);
         self.pmp_images[loaded.slot.index()] = None;
         *self.processes.slot_mut(loaded.slot) = Process::EMPTY;
@@ -378,8 +407,8 @@ impl Runtime {
         code_class: MemoryClass,
         dma_driver: bool,
     ) -> Result<Pid, Errno> {
-        let (loaded, arg0) = self.load_elf_in(bytes, code_class, dma_driver)?;
-        if let Err(e) = self.start_loaded(loaded, [arg0, 0, 0, 0, 0, 0], 1, 1) {
+        let (loaded, arg0, arg1) = self.load_elf_in(bytes, code_class, dma_driver)?;
+        if let Err(e) = self.start_loaded(loaded, [arg0, arg1, 0, 0, 0, 0], 1, 1) {
             self.abort_loaded(loaded);
             return Err(e);
         }
@@ -387,17 +416,32 @@ impl Runtime {
     }
 
     pub fn complete_dma(&mut self, success: bool) {
-        let Some(owner) = self.dma.finish(success) else {
-            return;
-        };
-        let Some(process) = self.processes.find_alive(owner) else {
+        let (owner_opt, region_opt) = self.dma.finish(DMA_CH_GDMA_AHB_CH1, success);
+        let alive_proc = owner_opt.and_then(|owner| self.processes.find_alive(owner));
+        if let Some(region) = region_opt {
+            if success {
+                finish_dma_buffer(region, DmaDirection::MemToMem, false);
+            }
+            if let Ok((class, freed)) = self.allocator.finish_in_flight(
+                region,
+                DMA_CH_GDMA_AHB_CH1 as u8,
+                alive_proc.is_some(),
+                success,
+            ) && freed
+                && class == MemoryClass::Psram
+            {
+                let _ = self.display.set_psram_region_mapped(region, false);
+            }
+        }
+        let Some(process) = alive_proc else {
             return;
         };
         if success {
+            let region = region_opt.unwrap_or_else(soc::dma::page);
             self.processes
                 .slot_mut(process)
                 .memory
-                .dma_access(soc::dma::page(), true)
+                .dma_access(region, true)
                 .unwrap();
         }
         for i in 0..TASKS {
@@ -409,8 +453,9 @@ impl Runtime {
                     t.wait,
                     Wait::Device {
                         domain: device_wait::DMA,
+                        token,
                         ..
-                    }
+                    } if token == DMA_CH_GDMA_AHB_CH1 as u32
                 )
             {
                 let result = if success { 0 } else { Errno::Eio.to_abi() };

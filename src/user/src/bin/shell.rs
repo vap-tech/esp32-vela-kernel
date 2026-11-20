@@ -212,7 +212,7 @@ fn psram_probe() -> bool {
     let Ok(mut arena) = Arena::new_psram(128 * 1024) else {
         return false;
     };
-    let in_pool = arena.base() >= 0x8820_0000
+    let in_pool = (0x8800_0000..0x8a00_0000).contains(&arena.base())
         && arena.size() == 128 * 1024
         && arena.base() % arena.size() == 0;
     let layout = core::alloc::Layout::from_size_align(64 * 1024, 64).unwrap();

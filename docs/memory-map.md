@@ -1,7 +1,6 @@
 # Memory map (L1-ICache0 enabled, L1-DCache bypass, L2=0)
 
-All ranges are half open. The display driver owns the first 2 MiB PSRAM window;
-the kernel `RegionAllocator` manages upper internal SRAM and the remaining 30 MiB PSRAM pool.
+All ranges are half open. `RegionAllocator` manages upper internal SRAM and the full 32 MiB external PSRAM pool (`0x88000000..0x8a000000`); when full-screen PSRAM display modes (`display diag`, `display boot`) are active, the display dynamically allocates and maps a 2 MiB NAPOT region from this pool and returns it when switching to internal-SRAM display modes.
 
 | Range | Role |
 |---|---|
@@ -12,9 +11,8 @@ the kernel `RegionAllocator` manages upper internal SRAM and the remaining 30 Mi
 | 0x4ff28000..0x4ff40000 | ROM reservation, untouched |
 | 0x4ff40000..0x4ffac000 | .upper text/rodata/data then NOLOAD BSS + SRAM `RegionAllocator` pool, 432 KiB |
 | 0x4ffac000..0x4ffc0000 | 80 KiB runtime stack (+ reserved 4 KiB AHB DMA page) |
-| 0x48000000..0x48200000 | kernel display PSRAM window (2 MiB, MMU pages 0..32), bus address |
-| 0x88000000..0x88200000 | uncached CPU alias of the 2 MiB display framebuffer window |
-| 0x88200000..0x8a000000 | managed user PSRAM pool (30 MiB, MMU pages 32..512, 64 KiB granularity) |
+| 0x48000000..0x4a000000 | external PSRAM bus window (32 MiB, MMU pages 0..512), DW-GDMA AXI address |
+| 0x88000000..0x8a000000 | managed uncached CPU PSRAM pool (32 MiB, MMU pages 0..512, 64 KiB granularity) |
 
 Linker asserts entry and payload bounds, BSS vs stack, and ROM reservation.
 The packer independently checks segment ranges and Flash capacity (16 MiB).

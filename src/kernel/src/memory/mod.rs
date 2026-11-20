@@ -1,6 +1,8 @@
 //! Fixed physical memory arenas (internal SRAM and external PSRAM).
 //! All regions are NAPOT-compatible; no page tables.
-//! Owner is a monotonic process ID, never a recyclable process slot.
+//! Owner is a monotonic process ID (or `Pid::KERNEL` for trusted kernel subsystems),
+//! never a recyclable process slot. Regions actively bound to a DMA channel are
+//! marked `in_flight_channel` and cannot be freed or reused until DMA completes.
 use crate::{errno::Errno, id::Pid, task::Region};
 
 pub const PAGE: usize = 4096;
@@ -30,12 +32,14 @@ impl MemoryClass {
 struct Allocation {
     owner: Pid,
     region: Region,
+    in_flight_channel: Option<u8>,
 }
 
 impl Allocation {
     const EMPTY: Self = Self {
         owner: Pid::NONE,
         region: Region { base: 0, size: 0 },
+        in_flight_channel: None,
     };
 }
 
@@ -147,7 +151,11 @@ impl RegionPool {
             }
             self.set_range(first, count, true);
             let region = Region { base, size };
-            self.entries[slot] = Allocation { owner, region };
+            self.entries[slot] = Allocation {
+                owner,
+                region,
+                in_flight_channel: None,
+            };
             return Ok(region);
         }
         Err(Errno::Enomem)
@@ -182,7 +190,11 @@ impl RegionPool {
             .find(|e| e.owner.is_none())
             .ok_or(Errno::Enospc)?;
         let region = Region { base, size };
-        *entry = Allocation { owner, region };
+        *entry = Allocation {
+            owner,
+            region,
+            in_flight_channel: None,
+        };
         self.set_range(first, pages, true);
         Ok(region)
     }
@@ -193,12 +205,46 @@ impl RegionPool {
             .any(|e| e.owner == owner && e.region == region)
     }
 
+    pub fn is_in_flight(&self, region: Region) -> bool {
+        self.entries
+            .iter()
+            .any(|e| !e.owner.is_none() && e.region == region && e.in_flight_channel.is_some())
+    }
+
+    pub fn set_in_flight(
+        &mut self,
+        owner: Pid,
+        region: Region,
+        channel: Option<u8>,
+    ) -> Result<(), Errno> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.owner == owner && e.region == region)
+            .ok_or(Errno::Eperm)?;
+        match (entry.in_flight_channel, channel) {
+            (None, Some(ch)) => {
+                entry.in_flight_channel = Some(ch);
+                Ok(())
+            }
+            (Some(_), None) => {
+                entry.in_flight_channel = None;
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(Errno::Ebusy),
+            (None, None) => Err(Errno::Einval),
+        }
+    }
+
     pub fn free(&mut self, owner: Pid, region: Region) -> Result<(), Errno> {
         let slot = self
             .entries
             .iter()
             .position(|e| e.owner == owner && e.region == region)
             .ok_or(Errno::Eperm)?;
+        if self.entries[slot].in_flight_channel.is_some() {
+            return Err(Errno::Ebusy);
+        }
         let first = (region.base - self.base) / self.page_size;
         let count = region.size / self.page_size;
         self.set_range(first, count, false);
@@ -210,14 +256,46 @@ impl RegionPool {
         self.release_owner_with(owner, |_| {});
     }
 
+    /// Release all regions owned by `owner` that are not currently `in_flight_channel`.
+    /// Any region with active DMA stays reserved until [`Self::finish_in_flight`] completes.
     pub fn release_owner_with(&mut self, owner: Pid, mut on_free: impl FnMut(Region)) {
         for i in 0..ALLOCATIONS {
             let entry = self.entries[i];
-            if entry.owner == owner {
+            if entry.owner == owner && entry.in_flight_channel.is_none() {
                 self.free(owner, entry.region).unwrap();
                 on_free(entry.region);
             }
         }
+    }
+
+    /// Complete an in-flight DMA hold on `region` for `channel`.
+    /// If `owner_still_alive` is false (process exited while DMA was active) and `success`
+    /// is true, frees `region` immediately and returns `true` so the caller can unmap MMU.
+    /// If `success` is false, leaves the region quarantined (`in_flight_channel` retained).
+    pub fn finish_in_flight(
+        &mut self,
+        region: Region,
+        channel: u8,
+        owner_still_alive: bool,
+        success: bool,
+    ) -> Result<bool, Errno> {
+        let slot = self
+            .entries
+            .iter()
+            .position(|e| {
+                !e.owner.is_none() && e.region == region && e.in_flight_channel == Some(channel)
+            })
+            .ok_or(Errno::Einval)?;
+        if !success {
+            return Ok(false);
+        }
+        self.entries[slot].in_flight_channel = None;
+        if !owner_still_alive {
+            let owner = self.entries[slot].owner;
+            self.free(owner, region).unwrap();
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -236,7 +314,7 @@ impl RegionAllocator {
         }
     }
 
-    /// Configure the managed external PSRAM pool (`page_size` must be a power of two >= 4 KiB).
+    /// Configure the managed external 32 MiB PSRAM pool (`page_size` must be a power of two >= 4 KiB).
     pub fn configure_psram(&mut self, start: usize, end: usize, page_size: usize) {
         self.psram = RegionPool::new(start, end, page_size);
     }
@@ -282,6 +360,49 @@ impl RegionAllocator {
         match class {
             MemoryClass::Sram => self.sram.owns(owner, region),
             MemoryClass::Psram => self.psram.owns(owner, region),
+        }
+    }
+
+    pub fn is_in_flight(&self, region: Region) -> bool {
+        self.sram.is_in_flight(region) || self.psram.is_in_flight(region)
+    }
+
+    pub fn set_in_flight(
+        &mut self,
+        owner: Pid,
+        region: Region,
+        channel: Option<u8>,
+    ) -> Result<MemoryClass, Errno> {
+        if self.sram.owns(owner, region) {
+            self.sram.set_in_flight(owner, region, channel)?;
+            Ok(MemoryClass::Sram)
+        } else if self.psram.owns(owner, region) {
+            self.psram.set_in_flight(owner, region, channel)?;
+            Ok(MemoryClass::Psram)
+        } else {
+            Err(Errno::Eperm)
+        }
+    }
+
+    pub fn finish_in_flight(
+        &mut self,
+        region: Region,
+        channel: u8,
+        owner_still_alive: bool,
+        success: bool,
+    ) -> Result<(MemoryClass, bool), Errno> {
+        if self.sram.contains(region) {
+            let freed = self
+                .sram
+                .finish_in_flight(region, channel, owner_still_alive, success)?;
+            Ok((MemoryClass::Sram, freed))
+        } else if self.psram.contains(region) {
+            let freed = self
+                .psram
+                .finish_in_flight(region, channel, owner_still_alive, success)?;
+            Ok((MemoryClass::Psram, freed))
+        } else {
+            Err(Errno::Einval)
         }
     }
 
@@ -385,10 +506,10 @@ mod tests {
     }
 
     #[test]
-    fn psram_pool_manages_30_mib_beyond_2_mib_framebuffer_window() {
+    fn psram_pool_manages_full_32_mib_and_in_flight_dma_holds() {
         let sram_base = 0x4ff6_0000;
-        let psram_start = 0x8820_0000;
-        let psram_end = 0x8a00_0000; // 30 MiB = 480 * 64 KiB pages
+        let psram_start = 0x8800_0000;
+        let psram_end = 0x8a00_0000; // full 32 MiB = 512 * 64 KiB pages
         let mut alloc = RegionAllocator::new(sram_base, sram_base + 16 * PAGE);
 
         // Before PSRAM pool is configured, Psram allocations fail with ENOMEM.
@@ -400,50 +521,64 @@ mod tests {
 
         alloc.configure_psram(psram_start, psram_end, PSRAM_MMU_PAGE);
         assert!(alloc.psram_configured());
-        assert_eq!(alloc.psram_pool().pages(), 480);
+        assert_eq!(alloc.psram_pool().pages(), 512);
 
-        // Small request rounds up to 64 KiB MMU page at 0x8820_0000 (never overlaps 0x8800_0000..0x8820_0000).
+        // Without display framebuffer active, a single 32 MiB NAPOT region can be allocated!
+        let full_32m = alloc
+            .allocate_in(MemoryClass::Psram, Pid(1), 32 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            full_32m,
+            Region {
+                base: 0x8800_0000,
+                size: 32 * 1024 * 1024,
+            }
+        );
+        assert_eq!(alloc.free(Pid(1), full_32m), Ok(MemoryClass::Psram));
+
+        // Allocate a 64 KiB user region at 0x8800_0000, then a 2 MiB display framebuffer;
+        // the 2 MiB framebuffer naturally aligns to 0x8820_0000.
         let p1 = alloc
             .allocate_in(MemoryClass::Psram, Pid(1), 16 * 1024)
             .unwrap();
         assert_eq!(
             p1,
             Region {
-                base: 0x8820_0000,
+                base: 0x8800_0000,
                 size: 64 * 1024,
             }
         );
-        assert!(alloc.is_psram(p1));
-        assert!(alloc.owns_in(MemoryClass::Psram, Pid(1), p1));
-        assert!(!alloc.owns_in(MemoryClass::Sram, Pid(1), p1));
-
-        // 4 MiB NAPOT request aligns naturally to 0x8840_0000.
-        let p2 = alloc
-            .allocate_in(MemoryClass::Psram, Pid(2), 3 * 1024 * 1024)
+        let fb = alloc
+            .allocate_in(MemoryClass::Psram, Pid(99), 1_843_200)
             .unwrap();
         assert_eq!(
-            p2,
+            fb,
             Region {
-                base: 0x8840_0000,
-                size: 4 * 1024 * 1024,
+                base: 0x8820_0000,
+                size: 2 * 1024 * 1024,
             }
         );
-        assert_eq!(p2.base % p2.size, 0);
 
-        // Next 64 KiB request fills the hole at 0x8821_0000.
-        let p3 = alloc
-            .allocate_in(MemoryClass::Psram, Pid(1), 64 * 1024)
-            .unwrap();
-        assert_eq!(p3.base, 0x8821_0000);
+        // Mark `fb` as in-flight on DW-GDMA channel 1: cannot be freed while active.
+        assert_eq!(
+            alloc.set_in_flight(Pid(99), fb, Some(1)),
+            Ok(MemoryClass::Psram)
+        );
+        assert!(alloc.is_in_flight(fb));
+        assert_eq!(alloc.free(Pid(99), fb), Err(Errno::Ebusy));
 
-        let mut freed_count = 0usize;
-        alloc.release_psram_owner_with(Pid(1), |region| {
-            assert!(region == p1 || region == p3);
-            freed_count += 1;
-        });
-        assert_eq!(freed_count, 2);
-        assert!(!alloc.owns(Pid(1), p1));
-        assert!(alloc.owns(Pid(2), p2));
-        assert_eq!(alloc.free(Pid(2), p2), Ok(MemoryClass::Psram));
+        // If owner exits while DMA is in-flight, region stays reserved until DMA finishes.
+        let mut freed_on_exit = 0usize;
+        alloc.release_psram_owner_with(Pid(99), |_| freed_on_exit += 1);
+        assert_eq!(freed_on_exit, 0);
+        assert!(alloc.owns(Pid(99), fb));
+
+        // Once DMA finishes for the exited owner, region is automatically freed.
+        assert_eq!(
+            alloc.finish_in_flight(fb, 1, false, true),
+            Ok((MemoryClass::Psram, true))
+        );
+        assert!(!alloc.owns(Pid(99), fb));
+        assert_eq!(alloc.free(Pid(1), p1), Ok(MemoryClass::Psram));
     }
 }

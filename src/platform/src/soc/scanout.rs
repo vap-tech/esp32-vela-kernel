@@ -2,7 +2,7 @@
 //! HP0 owns a four-frame ring. Each frame has a reusable black source block, an
 //! incrementing image span, and the fixed black source again.
 //! Orbit stores a 64-row RGB565 band. Pixel mode uses a single source word.
-//! Full-screen modes use one kernel-owned PSRAM framebuffer and four LLIs.
+//! Full-screen modes use a dynamically allocated 2 MiB PSRAM framebuffer and four LLIs.
 //! CPU accesses use direct aliases, DMA uses bus addresses.
 use crate::pac::{read, write};
 use core::fmt;
@@ -101,6 +101,10 @@ impl Scanout {
             dma_errors: 0,
             running: false,
         }
+    }
+
+    pub const fn is_running(&self) -> bool {
+        self.running
     }
 
     /// Read live scanout counters and (while active) DSI bridge FIFO occupancy.
@@ -217,11 +221,19 @@ impl Scanout {
     }
 
     /// Arm DW-GDMA CH0 and start continuous DSI bridge video scanout.
+    /// When `mode >= 4`, `frame_bus_addr` specifies the AXI bus alias (`0x4800_0000 + offset`)
+    /// of the allocated 2 MiB PSRAM framebuffer.
     ///
     /// # Safety
     /// Exclusive ownership of DW-GDMA CH0, DSI host/bridge, `_orbit_*` buffers,
-    /// and (when `mode >= 4`) the initialized PSRAM framebuffer window.
-    pub unsafe fn start(&mut self, coverage: &[u8; ICON * ICON], color: [u8; 3], mode: u8) {
+    /// and (when `mode >= 4`) the mapped PSRAM framebuffer window.
+    pub unsafe fn start(
+        &mut self,
+        coverage: &[u8; ICON * ICON],
+        color: [u8; 3],
+        mode: u8,
+        frame_bus_addr: usize,
+    ) {
         let pixel_only = mode == 3;
         let full = mode >= 4;
         let blocks = if full { 1 } else { PER_FRAME };
@@ -265,7 +277,7 @@ impl Scanout {
             let middle = if pixel_only { 1 } else { WIDTH * ICON / 4 };
             for i in 0..blocks * SLOTS {
                 let (src, items, fixed) = if full {
-                    (crate::soc::psram::FRAME, WIDTH * HEIGHT / 4, false)
+                    (frame_bus_addr, WIDTH * HEIGHT / 4, false)
                 } else {
                     match i % PER_FRAME {
                         0 => (black, before, true),

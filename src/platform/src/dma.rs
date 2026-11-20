@@ -1,74 +1,36 @@
-use vela_kernel::{
-    dma::Lease,
-    id::{Pid, Ticks},
-};
+//! Platform DMA cache-coherency hooks and channel indices.
+//!
+//! Hardware state live-tracked in `vela_kernel::dma::DmaTable`:
+//! - `DMA_CH_GDMA_AHB_CH1 = 0`: GDMA-AHB channel 1 memory-to-memory copy.
+//! - `DMA_CH_DW_GDMA_SCANOUT = 1`: DesignWare AXI DMA channel 0 MIPI-DSI video scanout.
+use vela_kernel::{dma::DmaDirection, task::Region};
 
-pub struct DmaChannel {
-    lease: Lease,
-    length: usize,
-    deadline: Ticks,
-    completed: u32,
-    errors: u32,
-    bytes: u64,
+use crate::syscall;
+
+pub const DMA_CH_GDMA_AHB_CH1: usize = syscall::DMA_CHANNEL_GDMA_AHB_CH1 as usize;
+pub const DMA_CH_DW_GDMA_SCANOUT: usize = syscall::DMA_CHANNEL_DW_GDMA_SCANOUT as usize;
+
+/// Prepare `region` before handing ownership to a DMA bus master.
+/// While `L1-DCache` remains in bypass mode (`0x12`), enforces a full I/O and
+/// memory ordering fence; when cached `L1-DCache` mappings are enabled in a later
+/// stage, this hook performs a cache-line clean/writeback for `ToDevice`/`MemToMem`
+/// and invalidate for `FromDevice`.
+#[inline(always)]
+pub fn prepare_dma_buffer(_region: Region, _direction: DmaDirection, _cached: bool) {
+    // SAFETY: memory ordering barrier before programming DMA descriptors.
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
 }
 
-impl DmaChannel {
-    pub const fn new() -> Self {
-        Self {
-            lease: Lease::Free,
-            length: 0,
-            deadline: Ticks::ZERO,
-            completed: 0,
-            errors: 0,
-            bytes: 0,
-        }
-    }
-
-    pub fn acquire(&mut self, owner: Pid) -> bool {
-        self.lease.acquire(owner)
-    }
-
-    pub fn release_process(&mut self, owner: Pid) {
-        self.lease.release_process(owner);
-    }
-
-    pub fn is_cpu_owner(&self, owner: Pid) -> bool {
-        self.lease == Lease::Cpu(owner)
-    }
-
-    pub fn submit(&mut self, owner: Pid, length: usize, deadline: Ticks) {
-        assert!(self.lease.submit(owner));
-        self.length = length;
-        self.deadline = deadline;
-    }
-
-    pub fn timed_out(&self, uptime: Ticks) -> bool {
-        matches!(self.lease, Lease::Device(_) | Lease::Detached) && uptime >= self.deadline
-    }
-
-    pub fn length(&self) -> usize {
-        self.length
-    }
-
-    pub fn finish(&mut self, success: bool) -> Option<Pid> {
-        if success {
-            self.completed = self.completed.saturating_add(1);
-            self.bytes = self.bytes.saturating_add(self.length as u64);
-        } else {
-            self.errors = self.errors.saturating_add(1);
-        }
-        self.lease.finish(success)
-    }
-
-    pub const fn completed(&self) -> u32 {
-        self.completed
-    }
-
-    pub const fn errors(&self) -> u32 {
-        self.errors
-    }
-
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
+/// Complete `region` after a DMA bus master finishes and before restoring U-mode access.
+/// While `L1-DCache` remains in bypass mode, enforces a full I/O and memory ordering
+/// fence; when cached `L1-DCache` mappings are enabled, this hook invalidates stale
+/// `L1-DCache` lines for `FromDevice`/`MemToMem`.
+#[inline(always)]
+pub fn finish_dma_buffer(_region: Region, _direction: DmaDirection, _cached: bool) {
+    // SAFETY: memory ordering barrier after DMA completion IRQ.
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
     }
 }

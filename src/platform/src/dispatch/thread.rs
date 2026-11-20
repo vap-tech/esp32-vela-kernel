@@ -10,6 +10,7 @@ use vela_kernel::{
 use super::Args;
 use crate::{
     arch,
+    dma::DMA_CH_GDMA_AHB_CH1,
     runtime::{IRQ_SLOT_CONSOLE_RX, Runtime},
     syscall,
     usermem::{copy_to_user, copy_to_user_within},
@@ -210,15 +211,15 @@ impl Runtime {
                     return Err(Errno::Einval);
                 }
                 let scan = self.display.telemetry();
-                let dma_bytes = self.dma.bytes();
+                let dma_bytes = self.dma.bytes(DMA_CH_GDMA_AHB_CH1);
                 let words = [
                     (u32::from(scan.mode) << 8) | u32::from(scan.running),
                     scan.frames,
                     scan.underruns,
                     scan.dma_errors,
                     scan.fifo_level,
-                    self.dma.completed(),
-                    self.dma.errors(),
+                    self.dma.completed(DMA_CH_GDMA_AHB_CH1),
+                    self.dma.errors(DMA_CH_GDMA_AHB_CH1),
                     dma_bytes as u32,
                     (dma_bytes >> 32) as u32,
                 ];

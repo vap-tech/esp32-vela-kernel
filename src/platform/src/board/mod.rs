@@ -6,7 +6,7 @@ use crate::soc::{
     clock,
     display_io::{self as io, Bus},
     dsi,
-    psram::{Controller as PsramController, Probe as PsramProbe},
+    psram::{self, Probe as PsramProbe},
     scanout::{Scanout, Snapshot as ScanoutSnapshot},
 };
 use core::fmt;
@@ -48,15 +48,17 @@ unsafe fn backlight(on: bool) {
 
 /// Sequential trusted display bring-up steps. Positive result is a minimum delay
 /// in 10ms ticks before the next stage; the shell sleeps between stages.
+/// When `mode >= 4`, `frame_direct_base` is the direct uncached address of the
+/// allocated 2 MiB PSRAM framebuffer (`0x8800_0000 + offset`).
 ///
 /// # Safety
 /// Exclusive HP0 ownership of the Tab5 display I2C bus, backlight GPIO/LEDC,
-/// CPLL/display clocks, MSPI2/3 PSRAM, MIPI-DSI host/PHY, and DW-GDMA CH0 with
-/// machine interrupts masked.
+/// CPLL/display clocks, mapped PSRAM framebuffer, MIPI-DSI host/PHY, and DW-GDMA CH0
+/// with machine interrupts masked.
 pub unsafe fn display_step(
     stage: u8,
     mode: u8,
-    psram: &mut PsramController,
+    frame_direct_base: usize,
     scanout: &mut Scanout,
 ) -> (Option<Diagnostic>, Result<u32, u32>) {
     let orbit = mode != 1;
@@ -68,7 +70,8 @@ pub unsafe fn display_step(
         };
         return (
             None,
-            unsafe { images::draw_rows(image, usize::from(stage - 5) * 32, 32) }.map(|()| 1),
+            unsafe { images::draw_rows(image, frame_direct_base, usize::from(stage - 5) * 32, 32) }
+                .map(|()| 1),
         );
     }
     let stage = if mode >= 4 && stage >= 45 {
@@ -99,22 +102,16 @@ pub unsafe fn display_step(
                 (None, res)
             }
             2 => {
-                let mut diag = None;
                 let res = (|| {
                     let version = BUS.transfer(0x55, &[0, 0], true).map_err(|_| 2u32)?;
                     if version != 1 {
                         return Err(0x100 + u32::from(version));
                     }
                     clock::display_speed().map_err(|_| 9u32)?;
-                    if mode >= 4 {
-                        let (probe, init) = psram.initialize();
-                        diag = probe.map(Diagnostic::Psram);
-                        init?;
-                    }
                     dsi::power_phy();
                     Ok(2)
                 })();
-                (diag, res)
+                (None, res)
             }
             3 => {
                 let res = (|| {
@@ -140,7 +137,17 @@ pub unsafe fn display_step(
                         return Err(7);
                     }
                     if orbit {
-                        scanout.start(include_bytes!("orbit.a8"), [0x85, 0xbf, 0xff], mode);
+                        let bus_addr = if mode >= 4 {
+                            psram::bus_address(frame_direct_base)
+                        } else {
+                            0
+                        };
+                        scanout.start(
+                            include_bytes!("orbit.a8"),
+                            [0x85, 0xbf, 0xff],
+                            mode,
+                            bus_addr,
+                        );
                         return Ok(12);
                     }
                     Ok(0)

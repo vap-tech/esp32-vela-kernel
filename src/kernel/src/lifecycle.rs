@@ -9,6 +9,7 @@
 use crate::{
     call::CallTable,
     capability::{self as cap, Authority, Capability, Object},
+    dma::DmaTable,
     errno::Errno,
     event::{EventTable, MAX_EVENTS},
     id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks, Tid},
@@ -156,6 +157,44 @@ pub fn resolve_event(
 ) -> Result<(usize, Object), Errno> {
     let capability = processes.slot(process).capabilities.get(handle, rights)?;
     let index = events.resolve(capability.object)?;
+    Ok((index, capability.object))
+}
+
+/// Bind DMA channel `index` to `owner` and install its root capability,
+/// rolling back the lease if the process capability table is full.
+pub fn bind_dma_channel(
+    dma: &mut DmaTable,
+    processes: &mut Processes,
+    owner: ProcSlot,
+    index: usize,
+    rights: u16,
+) -> Result<Handle, Errno> {
+    let pid = processes.slot(owner).id;
+    let object = dma.acquire(index, pid)?;
+    match processes
+        .slot_mut(owner)
+        .capabilities
+        .install(Capability { object, rights })
+    {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            dma.release_process(index, pid);
+            Err(e)
+        }
+    }
+}
+
+/// Validate `handle` and `rights` in `process` and resolve the live DMA channel slot.
+pub fn resolve_dma_channel(
+    processes: &Processes,
+    dma: &DmaTable,
+    process: ProcSlot,
+    handle: Handle,
+    rights: u16,
+) -> Result<(usize, Object), Errno> {
+    let proc = processes.slot(process);
+    let capability = proc.capabilities.get(handle, rights)?;
+    let index = dma.resolve(capability.object, proc.id)?;
     Ok((index, capability.object))
 }
 
@@ -711,7 +750,7 @@ pub fn alloc_memory_in(
     Ok(region)
 }
 
-/// Free an owned memory region if no live thread stack resides inside it,
+/// Free an owned memory region if no live thread stack or in-flight DMA resides inside it,
 /// revoking all capabilities/mappings and waking blocked receivers with `-EFAULT`.
 pub fn free_memory<C: Context>(
     processes: &mut Processes,
@@ -730,11 +769,13 @@ pub fn free_memory<C: Context>(
     {
         return Err(Errno::Eperm);
     }
-    if scheduler.tasks.iter().any(|t| {
-        t.process == current
-            && t.state != State::Terminated
-            && region.contains(t.stack.base, t.stack.size)
-    }) {
+    if allocator.is_in_flight(region)
+        || scheduler.tasks.iter().any(|t| {
+            t.process == current
+                && t.state != State::Terminated
+                && region.contains(t.stack.base, t.stack.size)
+        })
+    {
         return Err(Errno::Ebusy);
     }
     invalidate_object(processes, scheduler, Object::Memory { owner, region }, None);
@@ -946,6 +987,7 @@ pub fn terminate_process<C: Context>(
 mod tests {
     use super::*;
     use crate::{
+        dma::DmaController,
         event::WaitOutcome,
         memory::{PAGE, PSRAM_MMU_PAGE},
     };
@@ -1436,7 +1478,7 @@ mod tests {
     fn psram_alloc_grant_free_and_process_exit_return_regions_to_pool() {
         let mut h = harness();
         h.allocator
-            .configure_psram(0x8820_0000, 0x8a00_0000, PSRAM_MMU_PAGE);
+            .configure_psram(0x8800_0000, 0x8a00_0000, PSRAM_MMU_PAGE);
 
         let owner = ProcSlot(0);
         let peer = ProcSlot(1);
@@ -1453,7 +1495,7 @@ mod tests {
         assert_eq!(
             psram_r1,
             Region {
-                base: 0x8820_0000,
+                base: 0x8800_0000,
                 size: 128 * 1024,
             }
         );
@@ -1487,7 +1529,25 @@ mod tests {
             64 * 1024,
         )
         .unwrap();
-        assert_eq!(psram_r2.base, 0x8822_0000);
+        assert_eq!(psram_r2.base, 0x8802_0000);
+
+        // Region marked in-flight for DMA cannot be freed until DMA finishes.
+        h.allocator
+            .set_in_flight(h.processes.slot(owner).id, psram_r2, Some(1))
+            .unwrap();
+        assert_eq!(
+            free_memory(
+                &mut h.processes,
+                &mut h.allocator,
+                &mut h.scheduler,
+                owner,
+                psram_r2,
+            ),
+            Err(Errno::Ebusy)
+        );
+        h.allocator
+            .finish_in_flight(psram_r2, 1, true, true)
+            .unwrap();
 
         // Explicit free of psram_r2 returns MemoryClass::Psram.
         assert_eq!(
@@ -1521,6 +1581,42 @@ mod tests {
                 .memory
                 .permits(psram_r1.base, 1, process::READ)
         );
+    }
+
+    #[test]
+    fn dma_channel_bind_and_resolve_enforce_capabilities_and_ownership() {
+        let mut h = harness();
+        let mut dma = DmaTable::new();
+        dma.register(0, DmaController::GdmaAhb).unwrap();
+        let p0 = ProcSlot(0);
+        let p1 = ProcSlot(1);
+
+        let handle = bind_dma_channel(
+            &mut dma,
+            &mut h.processes,
+            p0,
+            0,
+            cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL,
+        )
+        .unwrap();
+        let (idx, obj) = resolve_dma_channel(
+            &h.processes,
+            &dma,
+            p0,
+            handle,
+            cap::READ | cap::WRITE | cap::WAIT,
+        )
+        .unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(
+            resolve_dma_channel(&h.processes, &dma, p1, handle, cap::WAIT),
+            Err(Errno::Ebadf)
+        );
+        dma.release_process(0, h.processes.slot(p0).id);
+        let handle2 =
+            bind_dma_channel(&mut dma, &mut h.processes, p1, 0, cap::WAIT | cap::CONTROL).unwrap();
+        let (_, obj2) = resolve_dma_channel(&h.processes, &dma, p1, handle2, cap::WAIT).unwrap();
+        assert_ne!(obj, obj2);
     }
 
     #[test]

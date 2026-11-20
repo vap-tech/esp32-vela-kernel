@@ -17,6 +17,8 @@ pub struct Pid(pub u32);
 
 impl Pid {
     pub const NONE: Self = Self(0);
+    /// Monotonic owner tag for kernel-owned subsystem allocations (e.g. display framebuffer).
+    pub const KERNEL: Self = Self(u32::MAX);
 
     pub const fn raw(self) -> u32 {
         self.0
@@ -28,8 +30,8 @@ impl Pid {
 
     pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
-            Some(next) => Some(Self(next)),
-            None => None,
+            Some(next) if next < Self::KERNEL.0 => Some(Self(next)),
+            _ => None,
         }
     }
 }

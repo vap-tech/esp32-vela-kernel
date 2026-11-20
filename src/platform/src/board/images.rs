@@ -92,12 +92,23 @@ unsafe fn verify(asset: &'static Asset) -> Result<(), u32> {
     Ok(())
 }
 
-/// Fill and verify one bounded row range in the kernel-owned framebuffer.
+/// Fill and verify one bounded row range in the dynamically allocated PSRAM
+/// framebuffer at direct uncached address `frame_direct_base`.
 ///
 /// # Safety
-/// Exclusive HP0 ownership of Flash ROM reads and the initialized PSRAM
-/// framebuffer window (`psram::DIRECT..+FRAME_BYTES`) with IRQs masked.
-pub unsafe fn draw_rows(asset: &'static Asset, row: usize, rows: usize) -> Result<(), u32> {
+/// Exclusive HP0 ownership of Flash ROM reads and the mapped PSRAM
+/// framebuffer window (`frame_direct_base..+FRAME_BYTES`) with IRQs masked.
+pub unsafe fn draw_rows(
+    asset: &'static Asset,
+    frame_direct_base: usize,
+    row: usize,
+    rows: usize,
+) -> Result<(), u32> {
+    if frame_direct_base < psram::POOL_START
+        || frame_direct_base + psram::FRAME_BYTES > psram::POOL_END
+    {
+        return Err(12);
+    }
     let first = row.checked_mul(720).ok_or(13u32)?;
     let end = rows
         .checked_mul(720)
@@ -119,7 +130,7 @@ pub unsafe fn draw_rows(asset: &'static Asset, row: usize, rows: usize) -> Resul
                 .filter(|&n| n <= psram::FRAME_BYTES / 2)
                 .ok_or(13u32)?;
             for index in position.max(first)..next.min(end) {
-                let address = (psram::DIRECT + index * 2) as *mut u16;
+                let address = (frame_direct_base + index * 2) as *mut u16;
                 unsafe {
                     if readback {
                         if address.read_volatile() != pixel {

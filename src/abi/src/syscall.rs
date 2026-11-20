@@ -40,7 +40,7 @@ pub const PROCESS_EXIT: u32 = 13;
 pub const MEM_ALLOC: u32 = 14; // a0=requested bytes, a1=MEM_CLASS_* -> a0=base, a1=actual size
 pub const MEM_FREE: u32 = 15; // a0=base, a1=exact allocated size
 pub const MEM_CLASS_SRAM: u32 = 0; // internal SRAM pool (4 KiB granularity)
-pub const MEM_CLASS_PSRAM: u32 = 1; // external AP HEX PSRAM pool beyond display window (64 KiB MMU page granularity)
+pub const MEM_CLASS_PSRAM: u32 = 1; // external 32 MiB AP HEX PSRAM pool (64 KiB MMU page granularity)
 
 pub const CAP_GRANT: u32 = 16; // a0=source handle (GRANT), a1=target PID, a2=subset rights -> peer handle
 pub const CAP_REVOKE: u32 = 17; // a0=owner handle (CONTROL) -> revokes all peer grants
@@ -52,7 +52,7 @@ pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
 pub const THREAD_PRIORITY: u32 = 22; // a0=own TID, a1=priority 0..ceiling
 pub const SPAWN_HELLO: u32 = 23; // a0=ProcessSpawn handle (EXECUTE), a1=selector (0=hello, 1=pic, 2=dma, 3=pic-psram) -> PID
 pub const EVENT_WAIT: u32 = 24; // a0=event handle (WAIT | ACK), a1=timeout ticks (0=infinite, 1..=6000)
-pub const DMA_COPY: u32 = 25; // owning DMA driver: copy a0 bytes between private page halves, block until IRQ
+pub const DMA_COPY: u32 = 25; // a0=DMA channel capability handle (READ|WRITE|WAIT) or legacy len (a1=0), a1=len (4..=2048); block until IRQ
 pub const SENTINEL_STATUS: u32 = 26; // a0=Sentinel handle (READ) -> a0=version (0 until READY), a1=epoch
 pub const SENTINEL_HELLO: u32 = 27; // a0=Sentinel handle (READ); blocks for ACK, returns sequence
 pub const SENTINEL_QUERY: u32 = 28; // a0=Sentinel handle (READ), a1=writable 24B buffer, a2=size
@@ -73,3 +73,6 @@ pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot ind
 pub const IRQ_UNBIND: u32 = 40; // a0=bound event handle (CONTROL); mask line, wake waiters with -EPIPE, release slot
 
 pub const IRQ_SLOT_CONSOLE_RX: u32 = 0; // USB Serial/JTAG RX packet interrupt slot (CLIC line 18)
+
+pub const DMA_CHANNEL_GDMA_AHB_CH1: u32 = 0; // GDMA-AHB channel 1 memory-to-memory copy
+pub const DMA_CHANNEL_DW_GDMA_SCANOUT: u32 = 1; // DW-GDMA channel 0 MIPI-DSI video scanout
