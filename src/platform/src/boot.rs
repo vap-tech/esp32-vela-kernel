@@ -35,10 +35,11 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 extern "C" fn rust_main() -> ! {
-    // SAFETY: M-mode startup owns scratch and console, IRQs masked.
+    // SAFETY: M-mode startup owns scratch, console, and board I2C pins; IRQs masked.
     unsafe {
         core::arch::asm!("csrw mscratch, zero", options(nostack));
         arch::init_counters();
+        board::init_i2c();
     }
     let mut console = unsafe { soc::console::Console::new() };
     assert_eq!(arch::hart_id(), 0);
@@ -136,6 +137,15 @@ extern "C" fn rust_main() -> ! {
         cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
     )
     .unwrap();
+    let procfs_i2c_cap = runtime
+        .processes
+        .slot_mut(procfs.slot)
+        .capabilities
+        .install(Capability {
+            object: Object::Authority(Authority::I2c),
+            rights: cap::READ | cap::WRITE,
+        })
+        .unwrap();
     let shell_caps = &mut runtime.processes.slot_mut(shell.slot).capabilities;
     let spawn_cap = shell_caps
         .install(Capability {
@@ -163,7 +173,19 @@ extern "C" fn rust_main() -> ! {
         .unwrap();
 
     runtime
-        .start_loaded(procfs, [request.raw(), proc_reply.raw(), 0, 0, 0, 0], 0, 1)
+        .start_loaded(
+            procfs,
+            [
+                request.raw(),
+                proc_reply.raw(),
+                procfs_i2c_cap.raw(),
+                0,
+                0,
+                0,
+            ],
+            0,
+            1,
+        )
         .unwrap();
     runtime
         .start_loaded(

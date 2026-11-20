@@ -20,6 +20,7 @@ pub enum Authority {
     Display,
     Sentinel,
     IrqControl,
+    I2c,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

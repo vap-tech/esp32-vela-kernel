@@ -2,7 +2,7 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, div64, dword_le, sys, word_le};
+use vela_user::{Buffer, TextBuf, div64, dword_le, ina226, sys, word_le};
 
 vela_user::entry!(main);
 
@@ -28,8 +28,8 @@ fn ticks_16m_to_ns(ticks_16m: u32) -> (u32, u32) {
 }
 
 /// Render a virtual `/proc/*` file into `out`.
-/// Returns `0` on success, `1` on ENOENT, `2` on kernel query failure.
-fn render_path(path: &[u8], out: &mut TextBuf<384>) -> u8 {
+/// Returns `0` on success, `1` on ENOENT, `2` on kernel/device query failure.
+fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
     match path {
         b"/proc/loadavg" | b"/proc/uptime" => {
             let mut snap = [0u8; abi::STATS_BYTES];
@@ -263,6 +263,32 @@ fn render_path(path: &[u8], out: &mut TextBuf<384>) -> u8 {
             out.push(b'\n');
             0
         }
+        b"/proc/power" => {
+            let Ok(reading) = ina226::sample_tab5(i2c_cap) else {
+                out.append(b"service unavailable\n");
+                return 2;
+            };
+            out.append(b"sensor ina226\nbus i2c_gpio31_32\naddr 0x41\nid ");
+            out.hex16(reading.mfg_id);
+            out.push(b':');
+            out.hex16(reading.die_id);
+            out.append(b"\nshunt_mohm ");
+            out.decimal(ina226::TAB5_SHUNT_MOHM);
+            out.append(b"\nrail battery_2s\nsupply ");
+            out.append(reading.supply.as_bytes());
+            out.append(b"\nbattery ");
+            out.append(reading.battery.as_bytes());
+            out.append(b"\nvbus_mv ");
+            out.decimal(reading.vbus_mv);
+            out.append(b"\nvshunt_uv ");
+            out.signed_decimal(reading.vshunt_uv);
+            out.append(b"\ncurrent_ma ");
+            out.signed_decimal(reading.current_ma);
+            out.append(b"\npower_mw ");
+            out.decimal(reading.power_mw);
+            out.push(b'\n');
+            0
+        }
         _ => {
             out.append(b"procfs: no such file\n");
             1
@@ -287,12 +313,12 @@ impl SnapshotCache {
         }
     }
 
-    fn render_or_reuse(&mut self, offset: usize, path: &[u8]) -> (u8, &[u8]) {
+    fn render_or_reuse(&mut self, offset: usize, path: &[u8], i2c_cap: u32) -> (u8, &[u8]) {
         let same_path =
             offset > 0 && path.len() == self.path_len && self.path[..self.path_len] == *path;
         if !same_path {
             self.text.clear();
-            self.status = render_path(path, &mut self.text);
+            self.status = render_path(path, i2c_cap, &mut self.text);
             if path.len() <= self.path.len() {
                 self.path[..path.len()].copy_from_slice(path);
                 self.path_len = path.len();
@@ -306,7 +332,12 @@ impl SnapshotCache {
 
 /// Handle `op=0` (RPC ping), `op=1` (legacy single-frame read), and `op=2`
 /// (`[2, offset_lo, offset_hi, path...]` -> `[status, more, slice...]`).
-fn handle_request(request: &Buffer, response: &mut Buffer, cache: &mut SnapshotCache) {
+fn handle_request(
+    request: &Buffer,
+    i2c_cap: u32,
+    response: &mut Buffer,
+    cache: &mut SnapshotCache,
+) {
     response.clear();
     let req = request.as_slice();
     match req.first().copied() {
@@ -314,13 +345,13 @@ fn handle_request(request: &Buffer, response: &mut Buffer, cache: &mut SnapshotC
             response.push(0);
         }
         Some(1) if req.len() > 1 => {
-            let (status, bytes) = cache.render_or_reuse(0, &req[1..]);
+            let (status, bytes) = cache.render_or_reuse(0, &req[1..], i2c_cap);
             response.push(status);
             response.append(bytes);
         }
         Some(2) if req.len() > 3 => {
             let offset = u16::from_le_bytes([req[1], req[2]]) as usize;
-            let (status, bytes) = cache.render_or_reuse(offset, &req[3..]);
+            let (status, bytes) = cache.render_or_reuse(offset, &req[3..], i2c_cap);
             let start = offset.min(bytes.len());
             let end = (start + (abi::IPC_BYTES - 2)).min(bytes.len());
             let more = u8::from(status == 0 && end < bytes.len());
@@ -335,7 +366,7 @@ fn handle_request(request: &Buffer, response: &mut Buffer, cache: &mut SnapshotC
     }
 }
 
-fn main(request_handle: u32, reply_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
+fn main(request_handle: u32, reply_handle: u32, i2c_cap: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     let mut cache = SnapshotCache::new();
     let mut request = Buffer::new();
     let mut response = Buffer::new();
@@ -349,7 +380,7 @@ fn main(request_handle: u32, reply_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a
         if !ok {
             sys::exit();
         }
-        handle_request(&request, &mut response, &mut cache);
+        handle_request(&request, i2c_cap, &mut response, &mut cache);
         pending_token = request.reply;
         if pending_token == 0 && !response.send(reply_handle) {
             sys::exit();

@@ -1,4 +1,4 @@
-//! GPIO matrix and open-drain software I2C for the board bring-up probe.
+//! GPIO matrix and open-drain software I2C for the board bring-up and system sensors.
 //! Called only from the serialized board driver on HP0.
 use crate::pac::{read, write};
 const GPIO: usize = 0x500e0000;
@@ -74,6 +74,7 @@ impl Bus {
     unsafe fn start(&self) -> Result<(), ()> {
         unsafe {
             drive(self.sda, false);
+            pause();
             self.clock()?;
             if !level(self.sda) {
                 return Err(());
@@ -81,6 +82,7 @@ impl Bus {
             drive(self.sda, true);
             pause();
             drive(self.scl, true);
+            pause();
             Ok(())
         }
     }
@@ -108,26 +110,40 @@ impl Bus {
         }
     }
 
+    /// Execute a multi-byte write (`tx`), optional repeated-start read (`rx`),
+    /// and STOP condition on the open-drain bus. Sends master ACK (`SDA = 0`)
+    /// after each received byte except the final byte (`NACK`, `SDA = 1`).
+    ///
     /// # Safety
     /// Exclusive ownership of `self.sda` and `self.scl` pins on HP0 with IRQs masked.
-    pub unsafe fn transfer(&self, addr: u8, bytes: &[u8], read_one: bool) -> Result<u8, ()> {
+    pub unsafe fn transfer_bytes(&self, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), ()> {
+        if tx.is_empty() && rx.is_empty() {
+            return Err(());
+        }
         unsafe {
             let result = (|| {
-                self.start()?;
-                self.send(addr << 1)?;
-                for &byte in bytes {
-                    self.send(byte)?;
+                if !tx.is_empty() {
+                    self.start()?;
+                    self.send(addr << 1)?;
+                    for &byte in tx {
+                        self.send(byte)?;
+                    }
                 }
-                let mut data = 0;
-                if read_one {
+                if !rx.is_empty() {
                     self.start()?;
                     self.send((addr << 1) | 1)?;
-                    for _ in 0..8 {
-                        data = (data << 1) | u8::from(self.bit(true)?);
+                    let last = rx.len() - 1;
+                    for (i, slot) in rx.iter_mut().enumerate() {
+                        let mut data = 0u8;
+                        for _ in 0..8 {
+                            data = (data << 1) | u8::from(self.bit(true)?);
+                        }
+                        *slot = data;
+                        // Master sends ACK (0) if more bytes follow, NACK (1) on last byte.
+                        let _ = self.bit(i == last)?;
                     }
-                    self.bit(true)?;
                 }
-                Ok(data)
+                Ok(())
             })();
             drive(self.sda, true);
             pause();
@@ -136,6 +152,14 @@ impl Bus {
             pause();
             stop.and(result)
         }
+    }
+
+    /// # Safety
+    /// Exclusive ownership of `self.sda` and `self.scl` pins on HP0 with IRQs masked.
+    pub unsafe fn transfer(&self, addr: u8, bytes: &[u8], read_one: bool) -> Result<u8, ()> {
+        let mut out = [0u8; 1];
+        let rx: &mut [u8] = if read_one { &mut out } else { &mut [] };
+        unsafe { self.transfer_bytes(addr, bytes, rx) }.map(|()| out[0])
     }
 }
 

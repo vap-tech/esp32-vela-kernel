@@ -34,6 +34,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `cat /proc/cpuinfo` | Read live hart0/APB/LP clocks, frequency-aware `mcycle` utilization (`user`/`kernel`/`idle`/`capacity`) and measured SYSTIMER IRQ latency. |
 | `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, ticks, measured `user_cycles`, preemptions and stack size. |
 | `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
+| `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
 | `display diag` | Show the full-screen diagnostic image from PSRAM, in keyboard-down landscape. |
 | `display boot` | Show the Vela boot artwork from the same PSRAM framebuffer. |
@@ -90,6 +91,7 @@ Neither command enters PMU light/deep sleep.
 | ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled images selected by index; no general filesystem loader or dynamic linker. |
 | Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` is enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
+| Userspace `INA226` power driver (`I2C_TRANSFER`, `/proc/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
 | Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
 
@@ -106,7 +108,7 @@ gives owner send+receive rights. Boot assignments and explicit capability grants
 peers; global endpoint IDs are not user handles. Receiving requires an explicit
 process-local RECEIVE capability; handle values alone confer no authority.
 Privileged operations (process spawning, display scanout control, Sentinel
-supervision, IRQ slot binding/consumption and DMA channel transfers) likewise require explicit process-local capability
+supervision, IRQ slot binding/consumption, DMA channel transfers and board I²C sensor access) likewise require explicit process-local capability
 handles granted by boot policy rather than ambient PID checks.
 Send is nonblocking: full => EAGAIN, no partial message. Services sleep before
 retrying backpressure. Receive blocks or uses NONBLOCK; EMSGSIZE leaves the
@@ -405,9 +407,9 @@ CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
 for expansion and framebuffer readback. A separate validation reader also
 uses 4 KiB during the first row batch.
 
-Current SRAM payload is 121248 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 11552 bytes, leaving 293 KiB before the separate AHB DMA
-reservation. This frees 254 KiB compared with
+Current SRAM payload is 123936 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 11552 bytes, leaving 291 KiB before the separate AHB DMA
+reservation. This frees 251 KiB compared with
 embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
 reserved for mode switching. The artwork is selected through the shell;
 startup still enters the USB shell.

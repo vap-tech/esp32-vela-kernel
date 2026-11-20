@@ -71,6 +71,8 @@ pub const IPC_REPLY_RECV: u32 = 37; // a0=reply token (0=skip), a1=reply buf, a2
 pub const IRQ_ACK: u32 = 38; // a0=event handle (ACK); clear pending notification and re-arm hardware IRQ source
 pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot index -> bound event handle
 pub const IRQ_UNBIND: u32 = 40; // a0=bound event handle (CONTROL); mask line, wake waiters with -EPIPE, release slot
+pub const I2C_TRANSFER: u32 = 41; // a0=I2c handle (READ|WRITE), a1=7-bit addr, a2=tx_ptr, a3=tx_len (<=16), a4=rx_ptr, a5=rx_len (<=16) -> 0 / -errno
+pub const I2C_MAX_BYTES: usize = 16;
 
 pub const IRQ_SLOT_CONSOLE_RX: u32 = 0; // USB Serial/JTAG RX packet interrupt slot (CLIC line 18)
 

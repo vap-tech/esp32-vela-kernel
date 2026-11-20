@@ -2,21 +2,29 @@ use vela_abi::syscall as abi;
 
 #[inline(always)]
 pub fn call6(number: u32, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) -> (u32, u32) {
-    let (result, second);
-    // SAFETY: U-mode ecall ABI; integer registers preserved except a0/a1 return pair.
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a7") number,
-            inlateout("a0") a0 => result,
-            inlateout("a1") a1 => second,
-            in("a2") a2,
-            in("a3") a3,
-            in("a4") a4,
-            in("a5") a5,
-        );
+    #[cfg(target_arch = "riscv32")]
+    {
+        let (result, second);
+        // SAFETY: U-mode ecall ABI; integer registers preserved except a0/a1 return pair.
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a7") number,
+                inlateout("a0") a0 => result,
+                inlateout("a1") a1 => second,
+                in("a2") a2,
+                in("a3") a3,
+                in("a4") a4,
+                in("a5") a5,
+            );
+        }
+        (result, second)
     }
-    (result, second)
+    #[cfg(not(target_arch = "riscv32"))]
+    {
+        let _ = (number, a0, a1, a2, a3, a4, a5);
+        (abi::ENOSYS, 0)
+    }
 }
 
 #[inline(always)]
@@ -66,6 +74,27 @@ pub fn irq_unbind(event_handle: u32) -> u32 {
 }
 
 #[inline(always)]
+pub fn i2c_transfer(handle: u32, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), i32> {
+    let tx_ptr = if tx.is_empty() { 0 } else { tx.as_ptr() as u32 };
+    let rx_ptr = if rx.is_empty() {
+        0
+    } else {
+        rx.as_mut_ptr() as u32
+    };
+    let rc = call6(
+        abi::I2C_TRANSFER,
+        handle,
+        u32::from(addr),
+        tx_ptr,
+        tx.len() as u32,
+        rx_ptr,
+        rx.len() as u32,
+    )
+    .0 as i32;
+    if rc == 0 { Ok(()) } else { Err(rc) }
+}
+
+#[inline(always)]
 pub fn exit() -> ! {
     call(abi::EXIT, 0, 0, 0, 0);
     loop {
@@ -99,24 +128,31 @@ macro_rules! entry {
 
 #[inline(always)]
 pub fn rdcycle64() -> u64 {
-    // SAFETY: U-mode read-only shadow CSRs `cycle`/`cycleh` enabled via `mcounteren.CY = 1`.
-    unsafe {
-        loop {
-            let hi1: u32;
-            let lo: u32;
-            let hi2: u32;
-            core::arch::asm!(
-                "rdcycleh {0}",
-                "rdcycle {1}",
-                "rdcycleh {2}",
-                out(reg) hi1,
-                out(reg) lo,
-                out(reg) hi2,
-                options(nomem, nostack)
-            );
-            if hi1 == hi2 {
-                return (u64::from(hi1) << 32) | u64::from(lo);
+    #[cfg(target_arch = "riscv32")]
+    {
+        // SAFETY: U-mode read-only shadow CSRs `cycle`/`cycleh` enabled via `mcounteren.CY = 1`.
+        unsafe {
+            loop {
+                let hi1: u32;
+                let lo: u32;
+                let hi2: u32;
+                core::arch::asm!(
+                    "rdcycleh {0}",
+                    "rdcycle {1}",
+                    "rdcycleh {2}",
+                    out(reg) hi1,
+                    out(reg) lo,
+                    out(reg) hi2,
+                    options(nomem, nostack)
+                );
+                if hi1 == hi2 {
+                    return (u64::from(hi1) << 32) | u64::from(lo);
+                }
             }
         }
+    }
+    #[cfg(not(target_arch = "riscv32"))]
+    {
+        0
     }
 }

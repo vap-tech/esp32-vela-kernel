@@ -9,7 +9,6 @@ vela-abi = { path = "../abi" }
 [lib]
 name = "vela_user"
 path = "src/lib.rs"
-test = false
 bench = false
 
 [[bin]]

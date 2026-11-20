@@ -11,10 +11,11 @@ use vela_kernel::{
 
 use super::Args;
 use crate::{
+    board,
     dma::{DMA_CH_GDMA_AHB_CH1, prepare_dma_buffer},
     pmp,
     runtime::{IRQ_SLOT_CONSOLE_RX, Runtime, device_wait},
-    soc,
+    soc, syscall,
     usermem::{copy_from_user, copy_to_user_within},
 };
 
@@ -207,6 +208,50 @@ impl Runtime {
             self.mask_irq_slot(index);
         }
         *switch = self.scheduler.should_preempt();
+        Ok(0)
+    }
+
+    pub(super) fn sys_i2c_transfer(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        let addr = u8::try_from(args.a1).map_err(|_| Errno::Einval)?;
+        let tx_ptr = args.a2 as usize;
+        let tx_len = args.a3 as usize;
+        let rx_ptr = args.a4 as usize;
+        let rx_len = args.a5 as usize;
+        if (tx_len == 0 && rx_len == 0)
+            || tx_len > syscall::I2C_MAX_BYTES
+            || rx_len > syscall::I2C_MAX_BYTES
+        {
+            return Err(Errno::Einval);
+        }
+        let mut required_rights = 0u16;
+        if tx_len > 0 {
+            required_rights |= cap::WRITE;
+        }
+        if rx_len > 0 {
+            required_rights |= cap::READ;
+        }
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::I2c,
+            required_rights,
+        )?;
+        let mut tx = [0u8; syscall::I2C_MAX_BYTES];
+        if tx_len > 0 {
+            copy_from_user(self.memory(), tx_ptr, &mut tx[..tx_len])?;
+        }
+        if rx_len > 0 && !self.writable(rx_ptr, rx_len) {
+            return Err(Errno::Efault);
+        }
+        let mut rx = [0u8; syscall::I2C_MAX_BYTES];
+        // SAFETY: sole HP0 kernel owner of the Tab5 system I2C pins with IRQs masked.
+        unsafe {
+            board::i2c_transfer(addr, &tx[..tx_len], &mut rx[..rx_len])?;
+        }
+        if rx_len > 0 {
+            copy_to_user_within(self.memory(), rx_ptr, rx_len, &rx[..rx_len])?;
+        }
         Ok(0)
     }
 

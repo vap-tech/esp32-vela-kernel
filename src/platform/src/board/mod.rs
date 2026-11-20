@@ -10,9 +10,37 @@ use crate::soc::{
     scanout::{Scanout, Snapshot as ScanoutSnapshot},
 };
 use core::fmt;
+use vela_kernel::errno::Errno;
 
 const BUS: Bus = Bus { sda: 31, scl: 32 };
 const RESET_BITS: u8 = 0x30; // expander 1 P4 LCD, P5 touch
+pub const INA226_ADDR: u8 = 0x41; // Tab5 2S battery-rail power monitor (5 mOhm shunt)
+
+/// Initialize the Tab5 HP system I2C bus (`GPIO31` SDA, `GPIO32` SCL).
+///
+/// # Safety
+/// Exclusive HP0 ownership of `GPIO31`/`GPIO32` with machine interrupts masked.
+pub unsafe fn init_i2c() {
+    unsafe {
+        BUS.init();
+    }
+}
+
+/// Execute a bounded capability-gated I2C transaction on the Tab5 system bus.
+/// Only user-accessible board sensors (`0x41` INA226) are permitted; board
+/// reset/power I/O expanders (`0x43`, `0x44`) remain kernel-exclusive.
+///
+/// # Safety
+/// Exclusive HP0 ownership of `GPIO31`/`GPIO32` with machine interrupts masked.
+pub unsafe fn i2c_transfer(addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), Errno> {
+    if !(0x08..=0x77).contains(&addr) || (tx.is_empty() && rx.is_empty()) {
+        return Err(Errno::Einval);
+    }
+    if addr != INA226_ADDR {
+        return Err(Errno::Eperm);
+    }
+    unsafe { BUS.transfer_bytes(addr, tx, rx).map_err(|()| Errno::Eio) }
+}
 
 #[derive(Clone, Copy)]
 pub enum Diagnostic {
