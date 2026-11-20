@@ -13,7 +13,7 @@ use crate::{
     event::{EventTable, MAX_EVENTS},
     id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks, Tid},
     ipc::{self, Ipc, Message},
-    memory::RegionAllocator,
+    memory::{MemoryClass, RegionAllocator},
     process::{self, AddressSpace, Lifecycle, Processes},
     sched::{Scheduler, TASKS},
     task::{Context, Region, State, Wait},
@@ -228,24 +228,6 @@ pub fn require_authority(
 ) -> Result<(), Errno> {
     let capability = processes.slot(process).capabilities.get(handle, 0)?;
     if capability.object != Object::Authority(expected) {
-        return Err(Errno::Ebadf);
-    }
-    if capability.rights & rights != rights {
-        return Err(Errno::Eperm);
-    }
-    Ok(())
-}
-
-/// Verify that `process` holds `handle` naming `expected` event object with `rights`.
-pub fn require_event(
-    processes: &Processes,
-    process: ProcSlot,
-    handle: Handle,
-    expected: Object,
-    rights: u16,
-) -> Result<(), Errno> {
-    let capability = processes.slot(process).capabilities.get(handle, 0)?;
-    if capability.object != expected {
         return Err(Errno::Ebadf);
     }
     if capability.rights & rights != rights {
@@ -692,8 +674,20 @@ pub fn alloc_memory(
     current: ProcSlot,
     requested: usize,
 ) -> Result<Region, Errno> {
+    alloc_memory_in(processes, allocator, current, MemoryClass::Sram, requested)
+}
+
+/// Allocate a NAPOT region in `class` (`Sram` or `Psram`) for `current`, map it
+/// `READ | WRITE`, and install its root capability, rolling back cleanly on error.
+pub fn alloc_memory_in(
+    processes: &mut Processes,
+    allocator: &mut RegionAllocator,
+    current: ProcSlot,
+    class: MemoryClass,
+    requested: usize,
+) -> Result<Region, Errno> {
     let owner = processes.slot(current).id;
-    let region = allocator.allocate(owner, requested)?;
+    let region = allocator.allocate_in(class, owner, requested)?;
     if let Err(e) = processes
         .slot_mut(current)
         .memory
@@ -725,7 +719,7 @@ pub fn free_memory<C: Context>(
     scheduler: &mut Scheduler<C>,
     current: ProcSlot,
     region: Region,
-) -> Result<(), Errno> {
+) -> Result<MemoryClass, Errno> {
     let owner = processes.slot(current).id;
     if !allocator.owns(owner, region)
         || processes
@@ -744,8 +738,7 @@ pub fn free_memory<C: Context>(
         return Err(Errno::Ebusy);
     }
     invalidate_object(processes, scheduler, Object::Memory { owner, region }, None);
-    allocator.free(owner, region).unwrap();
-    Ok(())
+    allocator.free(owner, region)
 }
 
 /// Update the base priority of a live thread owned by `current` within its ceiling.
@@ -952,7 +945,10 @@ pub fn terminate_process<C: Context>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{event::WaitOutcome, memory::PAGE};
+    use crate::{
+        event::WaitOutcome,
+        memory::{PAGE, PSRAM_MMU_PAGE},
+    };
 
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
     struct TestCtx {
@@ -1423,15 +1419,108 @@ mod tests {
         assert_eq!(h.processes.slot(p0).state, Lifecycle::Alive);
 
         // Now freeing the worker stack succeeds.
-        free_memory(
+        assert_eq!(
+            free_memory(
+                &mut h.processes,
+                &mut h.allocator,
+                &mut h.scheduler,
+                p0,
+                stack,
+            ),
+            Ok(MemoryClass::Sram)
+        );
+        assert!(!h.allocator.owns(h.processes.slot(p0).id, stack));
+    }
+
+    #[test]
+    fn psram_alloc_grant_free_and_process_exit_return_regions_to_pool() {
+        let mut h = harness();
+        h.allocator
+            .configure_psram(0x8820_0000, 0x8a00_0000, PSRAM_MMU_PAGE);
+
+        let owner = ProcSlot(0);
+        let peer = ProcSlot(1);
+        let peer_pid = h.processes.slot(peer).id;
+
+        let psram_r1 = alloc_memory_in(
             &mut h.processes,
             &mut h.allocator,
-            &mut h.scheduler,
-            p0,
-            stack,
+            owner,
+            MemoryClass::Psram,
+            128 * 1024,
         )
         .unwrap();
-        assert!(!h.allocator.owns(h.processes.slot(p0).id, stack));
+        assert_eq!(
+            psram_r1,
+            Region {
+                base: 0x8820_0000,
+                size: 128 * 1024,
+            }
+        );
+        assert!(h.processes.slot(owner).memory.permits(
+            psram_r1.base,
+            psram_r1.size,
+            process::READ | process::WRITE
+        ));
+        let cap_handle = memory_capability(&h.processes, owner, psram_r1.base).unwrap();
+        grant_or_map(
+            &mut h.processes,
+            owner,
+            cap_handle,
+            peer_pid,
+            cap::READ | cap::WRITE,
+            true,
+        )
+        .unwrap();
+        assert!(
+            h.processes
+                .slot(peer)
+                .memory
+                .permits(psram_r1.base, 4096, process::WRITE)
+        );
+
+        let psram_r2 = alloc_memory_in(
+            &mut h.processes,
+            &mut h.allocator,
+            owner,
+            MemoryClass::Psram,
+            64 * 1024,
+        )
+        .unwrap();
+        assert_eq!(psram_r2.base, 0x8822_0000);
+
+        // Explicit free of psram_r2 returns MemoryClass::Psram.
+        assert_eq!(
+            free_memory(
+                &mut h.processes,
+                &mut h.allocator,
+                &mut h.scheduler,
+                owner,
+                psram_r2,
+            ),
+            Ok(MemoryClass::Psram)
+        );
+        assert!(!h.allocator.owns(h.processes.slot(owner).id, psram_r2));
+
+        // Owner exits -> psram_r1 is unmapped from peer and returned to the PSRAM pool.
+        h.scheduler.current = ThreadSlot(0);
+        terminate_current_thread(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.allocator,
+            &mut h.scheduler,
+            deliver_checked,
+        )
+        .unwrap();
+        assert!(!h.allocator.owns(Pid(1), psram_r1));
+        assert!(
+            !h.processes
+                .slot(peer)
+                .memory
+                .permits(psram_r1.base, 1, process::READ)
+        );
     }
 
     #[test]

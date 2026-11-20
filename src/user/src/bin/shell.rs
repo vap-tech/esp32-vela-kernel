@@ -208,6 +208,37 @@ fn arena_probe() -> bool {
     ok && released && arena.allocate(layout).is_none()
 }
 
+fn psram_probe() -> bool {
+    let Ok(mut arena) = Arena::new_psram(128 * 1024) else {
+        return false;
+    };
+    let in_pool = arena.base() >= 0x8820_0000
+        && arena.size() == 128 * 1024
+        && arena.base() % arena.size() == 0;
+    let layout = core::alloc::Layout::from_size_align(64 * 1024, 64).unwrap();
+    let first = arena.allocate(layout);
+    let second = arena.allocate(layout);
+    let mut ok = false;
+    if let (Some(a), Some(b)) = (first, second) {
+        // SAFETY: distinct 64 KiB PSRAM suballocations inside mapped 128 KiB NAPOT region.
+        unsafe {
+            let a32 = a.as_ptr() as *mut u32;
+            let b32 = b.as_ptr() as *mut u32;
+            a32.write_volatile(0x5a6b_7c8d);
+            a32.add((64 * 1024 - 4) / 4).write_volatile(0x1357_9bdf);
+            b32.write_volatile(0xa594_8372);
+            b32.add((64 * 1024 - 4) / 4).write_volatile(0x2468_ace0);
+            ok = a32.read_volatile() == 0x5a6b_7c8d
+                && a32.add((64 * 1024 - 4) / 4).read_volatile() == 0x1357_9bdf
+                && b32.read_volatile() == 0xa594_8372
+                && b32.add((64 * 1024 - 4) / 4).read_volatile() == 0x2468_ace0;
+        }
+    }
+    let cap = sys::call(abi::MEM_CAP, arena.base() as u32, 0, 0, 0);
+    let released = arena.release().is_ok();
+    in_pool && ok && (cap as i32) >= 0 && released
+}
+
 fn sentinel_data(sentinel_cap: u32, sequence: u32, data: &mut Buffer) -> (u32, u32) {
     let mut result = (0, 0);
     for _ in 0..8 {
@@ -398,7 +429,7 @@ fn command(line: &Buffer, caps: Caps) {
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | bench | run hello/pic/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
+                b"help | cat <path> | uptime | bench | run hello/pic/pic-psram/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
             );
             sys::write(
                 b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot\n",
@@ -428,10 +459,11 @@ fn command(line: &Buffer, caps: Caps) {
                 sys::write(out.as_slice());
             }
         }
-        b"run hello" | b"run pic" | b"run dma" => {
+        b"run hello" | b"run pic" | b"run pic-psram" | b"run dma" => {
             let selector = match text {
                 b"run pic" => 1,
                 b"run dma" => 2,
+                b"run pic-psram" => 3,
                 _ => 0,
             };
             if (sys::call(abi::SPAWN_HELLO, caps.spawn, selector, 0, 0) as i32) < 0 {
@@ -537,8 +569,8 @@ fn command(line: &Buffer, caps: Caps) {
             sys::write(out.as_slice());
         }
         b"memtest" => {
-            if arena_probe() {
-                sys::write(b"arena: aligned allocations, bounds, release OK\n");
+            if arena_probe() && psram_probe() {
+                sys::write(b"arena: SRAM + PSRAM aligned allocations, bounds, release OK\n");
             } else {
                 sys::write(b"arena: FAIL\n");
             }

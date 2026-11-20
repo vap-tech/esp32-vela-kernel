@@ -3,6 +3,7 @@ use vela_kernel::{
     errno::Errno,
     id::{Handle, Pid, ProcSlot, Tid},
     lifecycle,
+    memory::MemoryClass,
     task::{Region, Wait},
 };
 
@@ -23,13 +24,26 @@ impl Runtime {
             Authority::ProcessSpawn,
             cap::EXECUTE,
         )?;
-        let bytes: &[u8] = match args.a1 {
-            0 => include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
-            2 => include_bytes!(concat!(env!("OUT_DIR"), "/dma.elf")),
-            1 => include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
+        let (bytes, class): (&[u8], MemoryClass) = match args.a1 {
+            0 => (
+                include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
+                MemoryClass::Sram,
+            ),
+            2 => (
+                include_bytes!(concat!(env!("OUT_DIR"), "/dma.elf")),
+                MemoryClass::Sram,
+            ),
+            1 => (
+                include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
+                MemoryClass::Sram,
+            ),
+            3 => (
+                include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
+                MemoryClass::Psram,
+            ),
             _ => return Err(Errno::Einval),
         };
-        self.spawn_elf(bytes, args.a1 == 2).map(Pid::raw)
+        self.spawn_elf_in(bytes, class, args.a1 == 2).map(Pid::raw)
     }
 
     pub(super) fn sys_yield(&mut self, switch: &mut bool) -> Result<u32, Errno> {
@@ -85,9 +99,14 @@ impl Runtime {
 
     pub(super) fn sys_process_exit(
         &mut self,
-        _current: ProcSlot,
+        current: ProcSlot,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
+        let owner = self.processes.slot(current).id;
+        let display = &mut self.display;
+        self.allocator.release_psram_owner_with(owner, |region| {
+            let _ = display.set_psram_region_mapped(region, false);
+        });
         let reaped = lifecycle::terminate_process(
             &mut self.processes,
             &mut self.ipc,

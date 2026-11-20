@@ -14,8 +14,16 @@ pub struct Arena {
 
 impl Arena {
     pub fn new(bytes: usize) -> Result<Self, u32> {
-        let (base, size) = sys::call6(abi::MEM_ALLOC, bytes as u32, 0, 0, 0, 0, 0);
-        if (base as i32) < 0 {
+        Self::new_in(bytes, abi::MEM_CLASS_SRAM)
+    }
+
+    pub fn new_psram(bytes: usize) -> Result<Self, u32> {
+        Self::new_in(bytes, abi::MEM_CLASS_PSRAM)
+    }
+
+    pub fn new_in(bytes: usize, class: u32) -> Result<Self, u32> {
+        let (base, size) = sys::call6(abi::MEM_ALLOC, bytes as u32, class, 0, 0, 0, 0);
+        if size == 0 {
             return Err(base);
         }
         Ok(Self {
@@ -23,6 +31,14 @@ impl Arena {
             size: size as usize,
             used: 0,
         })
+    }
+
+    pub const fn base(&self) -> usize {
+        self.base
+    }
+
+    pub const fn size(&self) -> usize {
+        self.size
     }
 
     pub fn allocate(&mut self, layout: Layout) -> Option<NonNull<u8>> {

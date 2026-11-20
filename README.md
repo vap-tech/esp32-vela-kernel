@@ -39,8 +39,8 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `display boot` | Show the Vela boot artwork from the same PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
 | `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
-| `memtest` | Check aligned userspace allocation, bounds and release. |
-| `run hello`, `run pic` | Launch the bundled fixed-address ELF and static PIE, respectively. |
+| `memtest` | Check aligned userspace allocation, bounds, capability lookup and release across both internal SRAM and external PSRAM. |
+| `run hello`, `run pic`, `run pic-psram` | Launch the bundled fixed-address ELF (SRAM) and static PIE (SRAM or external PSRAM), respectively. |
 | `run dma` | Copy and verify 2048 bytes of SRAM using GDMA-AHB. |
 | `sentinel` | Show the LP protocol version and boot epoch acknowledged by HP. |
 | `sentinel hello` | Send HELLO via the hardware mailbox and print the acknowledged sequence. |
@@ -87,8 +87,8 @@ Neither command enters PMU light/deep sleep.
 | Available | Current limit |
 | --- | --- |
 | Process/thread pools, priority scheduling, PMP and capabilities | Hart0 only; no HP SMP or enabled userspace FPU/DSP/PIE state. |
-| ELF32 and static PIE loading | Bundled images selected by index; no general filesystem loader or dynamic linker. |
-| SRAM allocation and controlled DMA copy | PSRAM/XIP and general cached DMA are not enabled. |
+| ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled images selected by index; no general filesystem loader or dynamic linker. |
+| Managed SRAM (4 KiB) and PSRAM (64 KiB MMU, 30 MiB pool) allocation + controlled DMA copy | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` is enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
@@ -148,8 +148,10 @@ Load is sampled runnable demand, not CPU utilization: console wakeups can
 contribute even when the CPU spends most time in WFI.
 
 Processes own address spaces, cached PMP images and capability tables; threads
-own saved contexts, stacks and priority/affinity. MEM_ALLOC reserves zeroed,
-NAPOT-compatible owned SRAM; MEM_FREE revokes aliases before reuse. Endpoint
+own saved contexts, stacks and priority/affinity. `MEM_ALLOC(bytes, class)` reserves zeroed,
+NAPOT-compatible owned internal SRAM (`MEM_CLASS_SRAM = 0`, 4 KiB pages) or external PSRAM
+(`MEM_CLASS_PSRAM = 1`, 64 KiB MMU pages in `0x8820_0000..0x8a00_0000` beyond the 2 MiB display
+framebuffer window); `MEM_FREE` revokes aliases and unmaps PSRAM MMU pages before reuse. Endpoint
 and memory grants cannot forward authority. IPC call/reply (`IPC_CALL`, `IPC_REPLY`, `IPC_REPLY_RECV`) uses single-use reply
 tokens, bounded priority donation, direct client-to-server handoff when a receiver is already waiting, and optional deadlines.
 
@@ -157,7 +159,7 @@ Userspace Arena explicitly suballocates aligned blocks inside one MEM_ALLOC
 region; metadata stays on the service stack, with checked arithmetic and explicit
 whole-region release. Raw pointers expire at release; sharing requires userspace
 synchronization. No global allocator or individual free. `memtest` exercises
-alignment, writable allocations, exhaustion and release in U-mode.
+alignment, writable allocations, exhaustion and release in U-mode across both SRAM and PSRAM.
 Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
 No SMP, POSIX or kernel VFS.
 
@@ -165,7 +167,7 @@ No SMP, POSIX or kernel VFS.
 
 The ELF loader checks RV32 bounds, segment permissions and entry before
 starting the process with a private stack and empty capability table. Exit and
-fault release its SRAM. Each PIE receives one aligned backing allocation and
+fault release its SRAM and unmap any owned PSRAM MMU pages. Each PIE receives one aligned backing allocation (in SRAM for `run pic` or in the managed PSRAM pool for `run pic-psram`) and
 separate PMP mappings for its segments. The supported relocation is symbol-free
 R_RISCV_RELATIVE with an aligned RW destination and an in-image addend.
 The spawn ABI selects a bundled executable by index.
@@ -375,11 +377,13 @@ lengths, CRCs and expected header as small metadata.
 The trusted driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
 mode registers and verifies the selected chip's 32 MiB density. The link
 initializes at SPLL/12 = 40 MHz and uses SPLL/6 = 80 MHz for HEX x16 DDR.
-The first 2 MiB are identity-mapped through the PSRAM controller MMU.
+The first 2 MiB (`pages 0..32`) are identity-mapped through the PSRAM controller MMU.
 A single framebuffer occupies 1843200 bytes at physical 0x48000000.
 CPU rendering and verification use the uncached 0x88000000 alias.
 DW-GDMA reads the bus alias with one descriptor per frame and a four-frame
-ring. Only the driver owns this window; the process allocator stays in SRAM.
+ring. The display driver exclusively owns this 2 MiB window (`0x88000000..0x88200000`), while the
+remaining 30 MiB (`0x88200000..0x8a000000`, `pages 32..512`) are managed as a 64 KiB-page NAPOT
+PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM` and `run pic-psram`).
 
 The raster is expanded and read back in batches of 32 rows, yielding between
 batches. The framebuffer is written only after the previous scanout stops.
@@ -397,9 +401,9 @@ CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
 for expansion and framebuffer readback. A separate validation reader also
 uses 4 KiB during the first row batch.
 
-Current SRAM payload is 114388 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 10704 bytes, leaving 301 KiB before the separate AHB DMA
-reservation. This frees 261 KiB compared with
+Current SRAM payload is 117416 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 11136 bytes, leaving 298 KiB before the separate AHB DMA
+reservation. This frees 258 KiB compared with
 embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
 reserved for mode switching. The artwork is selected through the shell;
 startup still enters the USB shell.
@@ -407,5 +411,4 @@ startup still enters the USB shell.
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
 13 an invalid image stream/range, 14 a framebuffer readback mismatch and
 15 a PSRAM command timeout, 16 a Flash read/range error, 17 an asset
-header mismatch and 18 an image CRC mismatch. PSRAM use is currently limited to the driver window.
-General PSRAM allocation, cached mappings and XIP remain separate work.
+header mismatch and 18 an image CRC mismatch. Cached `L1-DCache` PSRAM mappings and Flash XIP remain separate work.

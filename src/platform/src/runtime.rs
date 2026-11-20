@@ -6,7 +6,7 @@ use vela_kernel::{
     id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
     ipc::Ipc,
     lifecycle::{self, ReapedProcess},
-    memory::RegionAllocator,
+    memory::{MemoryClass, RegionAllocator},
     process::{AddressSpace, EXECUTE, Process, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
     stats::CycleAccounting,
@@ -87,6 +87,32 @@ impl Runtime {
         }
     }
 
+    pub fn ensure_psram_pool(&mut self) -> Result<(), Errno> {
+        if !self.display.psram_ready() {
+            let (probe, res) = self.display.ensure_psram();
+            if let Some(probe) = probe {
+                let _ = write!(self.console, "{probe}");
+            }
+            res?;
+        }
+        if !self.allocator.psram_configured() {
+            self.allocator.configure_psram(
+                soc::psram::POOL_START,
+                soc::psram::POOL_END,
+                soc::psram::MMU_PAGE_BYTES,
+            );
+        }
+        Ok(())
+    }
+
+    fn release_owner_memory(&mut self, owner: Pid) {
+        let display = &mut self.display;
+        self.allocator.release_psram_owner_with(owner, |region| {
+            let _ = display.set_psram_region_mapped(region, false);
+        });
+        self.allocator.release_owner(owner);
+    }
+
     pub fn memory(&self) -> &AddressSpace {
         &self.processes.slot(self.scheduler.current().process).memory
     }
@@ -165,6 +191,19 @@ impl Runtime {
     }
 
     pub fn terminate(&mut self) {
+        let process = self.scheduler.current().process;
+        let owner = self.processes.slot(process).id;
+        let is_last = !self.scheduler.tasks.iter().enumerate().any(|(i, t)| {
+            ThreadSlot(i) != self.scheduler.current
+                && t.process == process
+                && t.state != State::Terminated
+        });
+        if is_last {
+            let display = &mut self.display;
+            self.allocator.release_psram_owner_with(owner, |region| {
+                let _ = display.set_psram_region_mapped(region, false);
+            });
+        }
         if let Some(reaped) = lifecycle::terminate_current_thread(
             &mut self.processes,
             &mut self.ipc,
@@ -179,7 +218,22 @@ impl Runtime {
     }
 
     pub fn load_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<(LoadedElf, u32), Errno> {
+        self.load_elf_in(bytes, MemoryClass::Sram, dma_driver)
+    }
+
+    pub fn load_elf_in(
+        &mut self,
+        bytes: &[u8],
+        code_class: MemoryClass,
+        dma_driver: bool,
+    ) -> Result<(LoadedElf, u32), Errno> {
         let image = vela_kernel::elf::Image::parse(bytes).map_err(|_| Errno::Enoexec)?;
+        if code_class == MemoryClass::Psram {
+            if !image.pic {
+                return Err(Errno::Enoexec);
+            }
+            self.ensure_psram_pool()?;
+        }
         let process = self.processes.create(AddressSpace::EMPTY)?;
         let owner = self.processes.slot(process).id;
         let result = (|| {
@@ -191,7 +245,13 @@ impl Runtime {
                     .map(|s| s.region.base + s.region.size)
                     .max()
                     .ok_or(Errno::Enoexec)?;
-                self.allocator.allocate(owner, end)?.base
+                let backing = self.allocator.allocate_in(code_class, owner, end)?;
+                if code_class == MemoryClass::Psram
+                    && !self.display.set_psram_region_mapped(backing, true)
+                {
+                    return Err(Errno::Eio);
+                }
+                backing.base
             } else {
                 0
             };
@@ -223,7 +283,7 @@ impl Runtime {
                 }
                 space.insert(region, rights)?;
                 let data = image.data(i).ok_or(Errno::Enoexec)?;
-                // Reserved private SRAM. Clear BSS and all PMP-visible padding.
+                // Reserved private SRAM or mapped PSRAM. Clear BSS and all PMP-visible padding.
                 unsafe {
                     core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
                     core::ptr::copy_nonoverlapping(
@@ -284,7 +344,7 @@ impl Runtime {
         })();
         if result.is_err() {
             self.dma.release_process(owner);
-            self.allocator.release_owner(owner);
+            self.release_owner_memory(owner);
             self.pmp_images[process.index()] = None;
             *self.processes.slot_mut(process) = Process::EMPTY;
         }
@@ -307,13 +367,18 @@ impl Runtime {
 
     pub fn abort_loaded(&mut self, loaded: LoadedElf) {
         self.dma.release_process(loaded.pid);
-        self.allocator.release_owner(loaded.pid);
+        self.release_owner_memory(loaded.pid);
         self.pmp_images[loaded.slot.index()] = None;
         *self.processes.slot_mut(loaded.slot) = Process::EMPTY;
     }
 
-    pub fn spawn_elf(&mut self, bytes: &[u8], dma_driver: bool) -> Result<Pid, Errno> {
-        let (loaded, arg0) = self.load_elf(bytes, dma_driver)?;
+    pub fn spawn_elf_in(
+        &mut self,
+        bytes: &[u8],
+        code_class: MemoryClass,
+        dma_driver: bool,
+    ) -> Result<Pid, Errno> {
+        let (loaded, arg0) = self.load_elf_in(bytes, code_class, dma_driver)?;
         if let Err(e) = self.start_loaded(loaded, [arg0, 0, 0, 0, 0, 0], 1, 1) {
             self.abort_loaded(loaded);
             return Err(e);

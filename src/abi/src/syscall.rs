@@ -37,8 +37,10 @@ pub const EAGAIN: u32 = (-11i32) as u32;
 pub const THREAD_CREATE: u32 = 12; // a0=entry, a1=stack base, a2=size, a3=arg, a4=priority, a5=affinity
 pub const PROCESS_EXIT: u32 = 13;
 
-pub const MEM_ALLOC: u32 = 14; // a0=requested bytes -> a0=base, a1=actual size
+pub const MEM_ALLOC: u32 = 14; // a0=requested bytes, a1=MEM_CLASS_* -> a0=base, a1=actual size
 pub const MEM_FREE: u32 = 15; // a0=base, a1=exact allocated size
+pub const MEM_CLASS_SRAM: u32 = 0; // internal SRAM pool (4 KiB granularity)
+pub const MEM_CLASS_PSRAM: u32 = 1; // external AP HEX PSRAM pool beyond display window (64 KiB MMU page granularity)
 
 pub const CAP_GRANT: u32 = 16; // a0=source handle (GRANT), a1=target PID, a2=subset rights -> peer handle
 pub const CAP_REVOKE: u32 = 17; // a0=owner handle (CONTROL) -> revokes all peer grants
@@ -48,7 +50,7 @@ pub const MEM_GRANT: u32 = 19; // a0=memory handle (GRANT), a1=target PID, a2=R/
 pub const IPC_CALL: u32 = 20; // a0=endpoint handle (SEND), a1=req, a2=len, a3=reply buf, a4=cap, a5=timeout ticks
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
 pub const THREAD_PRIORITY: u32 = 22; // a0=own TID, a1=priority 0..ceiling
-pub const SPAWN_HELLO: u32 = 23; // a0=ProcessSpawn handle (EXECUTE), a1=selector (0=hello, 1=pic, 2=dma) -> PID
+pub const SPAWN_HELLO: u32 = 23; // a0=ProcessSpawn handle (EXECUTE), a1=selector (0=hello, 1=pic, 2=dma, 3=pic-psram) -> PID
 pub const EVENT_WAIT: u32 = 24; // a0=event handle (WAIT | ACK), a1=timeout ticks (0=infinite, 1..=6000)
 pub const DMA_COPY: u32 = 25; // owning DMA driver: copy a0 bytes between private page halves, block until IRQ
 pub const SENTINEL_STATUS: u32 = 26; // a0=Sentinel handle (READ) -> a0=version (0 until READY), a1=epoch

@@ -1,4 +1,4 @@
-use vela_kernel::errno::Errno;
+use vela_kernel::{errno::Errno, task::Region};
 
 use crate::{board, soc};
 
@@ -24,6 +24,24 @@ impl DisplayControl {
             psram: soc::psram::Controller::new(),
             scanout: soc::scanout::Scanout::new(),
         }
+    }
+
+    pub const fn psram_ready(&self) -> bool {
+        self.psram.is_ready()
+    }
+
+    /// Ensure MSPI2/3 AP HEX PSRAM is initialized so the 30 MiB user pool
+    /// (`0x8820_0000..0x8a00_0000`) can map and unmap 64 KiB MMU pages.
+    pub fn ensure_psram(&mut self) -> (Option<soc::psram::Probe>, Result<(), Errno>) {
+        // SAFETY: DisplayControl is owned by Runtime on HP0 with MIE=0.
+        let (probe, res) = unsafe { self.psram.initialize() };
+        (probe, res.map_err(|_| Errno::Eio))
+    }
+
+    /// Map or unmap 64 KiB PSRAM MMU pages for `region` in the managed user pool.
+    pub fn set_psram_region_mapped(&mut self, region: Region, mapped: bool) -> bool {
+        // SAFETY: DisplayControl is owned by Runtime on HP0 with MIE=0.
+        unsafe { self.psram.set_region_mapped(region, mapped) }
     }
 
     pub fn tick(&mut self) {

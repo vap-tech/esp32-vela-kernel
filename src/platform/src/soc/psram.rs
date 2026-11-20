@@ -4,6 +4,7 @@
 //! Trusted HP0 owns MSPI2/3. MSPI0/1 Flash configuration is untouched.
 use crate::pac::{read, write};
 use core::fmt;
+use vela_kernel::task::Region;
 
 const CTRL: usize = 0x5008e000;
 const USER: usize = 0x5008f000;
@@ -11,6 +12,12 @@ const CLK: usize = 0x500e6000;
 pub const FRAME: usize = 0x48000000;
 pub const DIRECT: usize = 0x88000000;
 pub const FRAME_BYTES: usize = 720 * 1280 * 2;
+pub const MMU_PAGE_BYTES: usize = 64 * 1024;
+pub const TOTAL_PAGES: usize = 512; // 32 MiB AP HEX PSRAM
+pub const DISPLAY_PAGES: usize = 32; // first 2 MiB reserved for display framebuffer
+pub const POOL_START: usize = DIRECT + DISPLAY_PAGES * MMU_PAGE_BYTES; // 0x8820_0000
+pub const POOL_END: usize = DIRECT + TOTAL_PAGES * MMU_PAGE_BYTES; // 0x8a00_0000
+const MMU_VALID_READ_WRITE: u32 = (1 << 11) | (1 << 10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Probe {
@@ -33,11 +40,15 @@ impl Controller {
         Self { ready: false }
     }
 
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
     /// Initialize MSPI2/3 AP HEX PSRAM and map the initial 2 MiB framebuffer window.
     ///
     /// # Safety
     /// Exclusive HP0 ownership of MSPI2/3, LDO VO2, PSRAM IO_MUX, and the direct
-    /// uncached PSRAM window (`0x8800_0000..+2 MiB`) with machine interrupts masked.
+    /// uncached PSRAM window (`0x8800_0000..+32 MiB`) with machine interrupts masked.
     pub unsafe fn initialize(&mut self) -> (Option<Probe>, Result<(), u32>) {
         if self.ready {
             return (None, Ok(()));
@@ -48,6 +59,57 @@ impl Controller {
             self.ready = true;
         }
         (probe, result)
+    }
+
+    /// Identity-map or unmap 64 KiB PSRAM MMU pages covering `region` in the managed
+    /// user pool (`0x8820_0000..0x8a00_0000`), verifying sparse word access when mapping.
+    /// Never modifies the reserved 2 MiB display framebuffer window (`pages 0..32`).
+    ///
+    /// # Safety
+    /// Exclusive HP0 ownership of MSPI2/3 MMU and `region` with machine interrupts masked.
+    pub unsafe fn set_region_mapped(&mut self, region: Region, mapped: bool) -> bool {
+        if !self.ready
+            || region.size == 0
+            || region.base < POOL_START
+            || region.base % MMU_PAGE_BYTES != 0
+            || region.size % MMU_PAGE_BYTES != 0
+        {
+            return false;
+        }
+        let Some(end) = region.base.checked_add(region.size) else {
+            return false;
+        };
+        if end > POOL_END {
+            return false;
+        }
+        let first_page = (region.base - DIRECT) / MMU_PAGE_BYTES;
+        let page_count = region.size / MMU_PAGE_BYTES;
+        unsafe {
+            for page in first_page..first_page + page_count {
+                let p = page as u32;
+                put(CTRL + 0x380, p);
+                let entry = if mapped { p | MMU_VALID_READ_WRITE } else { 0 };
+                put(CTRL + 0x37c, entry);
+            }
+            core::arch::asm!("fence iorw, iorw", options(nostack));
+            if mapped {
+                for idx in 0..page_count {
+                    let addr = region.base + idx * MMU_PAGE_BYTES;
+                    let pattern = 0xa5c3_5a3cu32 ^ (addr as u32);
+                    put(addr, pattern);
+                    if get(addr) != pattern {
+                        for page in first_page..first_page + page_count {
+                            put(CTRL + 0x380, page as u32);
+                            put(CTRL + 0x37c, 0);
+                        }
+                        core::arch::asm!("fence iorw, iorw", options(nostack));
+                        return false;
+                    }
+                    put(addr, 0);
+                }
+            }
+        }
+        true
     }
 }
 
@@ -209,10 +271,14 @@ unsafe fn init_once(probe_out: &mut Option<Probe>) -> Result<(), u32> {
         update(CTRL + 0x0c, (1 << 25) | (1 << 26), (1 << 25) | (1 << 26));
         update(CTRL + 0x3c, (1 << 31) | 1, 1); // AXI requests enabled
         bus_div(6); // SPLL / 6 = 80 MHz DDR AXI access
-        // Map the first 2 MiB. Access uses the uncached alias, DMA the bus alias.
-        for page in 0..32 {
+        // Map the first 2 MiB for the display framebuffer and clear the remaining 30 MiB MMU entries.
+        for page in 0..DISPLAY_PAGES as u32 {
             put(CTRL + 0x380, page);
-            put(CTRL + 0x37c, page | (1 << 11) | (1 << 10));
+            put(CTRL + 0x37c, page | MMU_VALID_READ_WRITE);
+        }
+        for page in DISPLAY_PAGES as u32..TOTAL_PAGES as u32 {
+            put(CTRL + 0x380, page);
+            put(CTRL + 0x37c, 0);
         }
         core::arch::asm!("fence iorw, iorw", options(nostack));
         // Distinct sparse addresses catch disconnected lines and address aliasing.
