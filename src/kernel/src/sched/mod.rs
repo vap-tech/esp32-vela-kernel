@@ -107,6 +107,24 @@ impl<C: Copy> Scheduler<C> {
     pub fn uptime(&self) -> Ticks {
         self.uptime
     }
+    /// Return `true` if any thread is currently `Ready` or `Running` on hart 0.
+    pub fn has_runnable(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| matches!(t.state, State::Ready | State::Running) && t.affinity & 1 != 0)
+    }
+    /// Earliest expiration deadline among all `Blocked` threads, if any.
+    pub fn nearest_deadline(&self) -> Option<Ticks> {
+        self.tasks
+            .iter()
+            .filter(|t| t.state == State::Blocked)
+            .filter_map(|t| t.deadline)
+            .min()
+    }
+    /// Next 5-second (`5 * HZ`) load average sampling boundary.
+    pub fn next_load_sample_at(&self) -> Ticks {
+        self.sampled_at.saturating_add(5 * HZ)
+    }
     pub fn create_thread(
         &mut self,
         process: ProcSlot,
@@ -302,6 +320,18 @@ impl<C: Context> Scheduler<C> {
     /// O(TASKS) pass, and update 5-second load samples.
     pub fn tick(&mut self, uptime: Ticks, calls: &mut CallTable) {
         self.ticks += 1;
+        self.advance_uptime(uptime, calls);
+    }
+
+    /// Synchronize `uptime` after waking from a tickless idle window without
+    /// counting a synthetic SYSTIMER interrupt if woken early by an external IRQ.
+    pub fn sync_uptime(&mut self, uptime: Ticks, calls: &mut CallTable) {
+        if uptime > self.uptime {
+            self.advance_uptime(uptime, calls);
+        }
+    }
+
+    fn advance_uptime(&mut self, uptime: Ticks, calls: &mut CallTable) {
         let cur = self.current.index();
         if self.tasks[cur].state == State::Running {
             self.tasks[cur].runtime_ticks += uptime.saturating_sub(self.uptime);
@@ -464,12 +494,18 @@ mod tests {
             Ticks(20),
         );
 
+        assert!(!s.has_runnable());
+        assert_eq!(s.nearest_deadline(), Some(Ticks(10)));
+        assert_eq!(s.next_load_sample_at(), Ticks(5 * HZ));
+
         s.tick(Ticks(5), &mut calls);
         assert_eq!(s.tasks[0].state, State::Blocked);
         assert_eq!(s.tasks[1].state, State::Blocked);
         assert_eq!(s.tasks[2].state, State::Blocked);
 
         s.tick(Ticks(10), &mut calls);
+        assert!(s.has_runnable());
+        assert_eq!(s.nearest_deadline(), Some(Ticks(15)));
         assert_eq!(s.tasks[0].state, State::Ready);
         assert_eq!(s.tasks[0].deadline, None);
         assert_eq!(s.tasks[0].context.a0, 0);

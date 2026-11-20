@@ -31,12 +31,13 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
 | `cat /proc/loadavg` | Read sampled runnable demand. |
 | `cat /proc/interrupts` | Read 64-bit hart0 interrupt counts (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`). |
-| `cat /proc/cpuinfo` | Read live hart0/APB/LP clocks, frequency-aware `mcycle` utilization (`user`/`kernel`/`idle`/`capacity`) and measured SYSTIMER IRQ latency. |
+| `cat /proc/cpuinfo` | Read live hart0/APB/LP clocks, DVFS policy/switch counts, tickless sleep counters, frequency-aware `mcycle` utilization (`user`/`kernel`/`idle`/`capacity`) and measured SYSTIMER IRQ latency. |
 | `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, ticks, measured `user_cycles`, preemptions and stack size. |
 | `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
 | `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
 | `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
+| `freq [auto/40/180]` | Query or set the HP0 DVFS operating-point policy (`auto` idle governor, `pin_40mhz` XTAL or `pin_180mhz` CPLL; `40 MHz` is rejected with `-EBUSY` while display or DMA is active). |
 | `display diag` | Stream the full-screen diagnostic image from microSD into PSRAM, in keyboard-down landscape. |
 | `display boot` | Stream the Vela boot artwork from microSD into the PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
@@ -51,6 +52,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `sentinel pause`, `sentinel resume` | Stop/restart HP heartbeats without stopping HP or resetting LP. |
 | `sentinel log` | Read the bounded LP diagnostic journal without consuming records. |
 | `sentinel mark` | Send an HP diagnostic MARK event with the current HP uptime tick as its value. |
+| `sentinel sleep <ms>` | Prepare a coordinated sleep window with LP (`SENTINEL_PREPARE_SLEEP`), enter tickless `wfi` at `40 MHz` XTAL until the LP `WAKE_EVENT` arrives, and restore the active operating point. |
 | `sentinel wake <ms>` | Arm an LP timer and block until its WAKE_EVENT. Range: 1–60000 ms. |
 | `sentinel prepare <ms>` | Agree a heartbeat pause with LP for 1–60000 ms while HP stays active. Use `sentinel cancel` or `sentinel wait` with the returned alarm. |
 | `sentinel arm <ms>`, `sentinel wait` | Arm without waiting for expiry; later consume the latched event. |
@@ -73,17 +75,20 @@ sentinel status
 sentinel mark
 sentinel log
 sentinel wake 1000
+sentinel sleep 1500
 sentinel arm 10000
 sentinel cancel
 sentinel arm 10
 sentinel wait
 ```
 
-`wake` blocks until the actual LP event. `arm` returns after the setup ACK;
+`wake` blocks until the actual LP event. `sleep` prepares a coordinated heartbeat-paused
+sleep window with LP, enters tickless `wfi` (downshifting HP0 to `40 MHz` XTAL in `auto` mode)
+after re-checking pending console/mailbox/IRQ events under `MIE=0`, and restores `180 MHz`
+and periodic heartbeats upon wake. `arm` returns after the setup ACK;
 `wait` also accepts an event that has already arrived. Cancel before expiry;
 if it has already fired, collect it with `sentinel wait`. There is one alarm slot.
 Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
-Neither command enters PMU light/deep sleep.
 
 ## Current scope
 
@@ -95,7 +100,7 @@ Neither command enters PMU light/deep sleep.
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Userspace `INA226` power driver (`I2C_TRANSFER`, `/proc/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
 | Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Raw LBA block access (`SD_ASSET_LBA = 2048` for `VELAIMG1` RLE streams); no FAT/VFS layer. |
-| Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
+| Coordinated LP Sentinel sleep (`sentinel sleep`), DVFS (`40 MHz <-> 180 MHz`) and Tickless idle (`SYSTIMER`) | WFI + XTAL downshift with pre-sleep IRQ/generation re-check; full PMU HP power-domain power-down/reset resume is not used. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
 
 Boot services (`procfs`, `shell` and `console`) are built as standalone static PIE
@@ -294,21 +299,42 @@ with missed=0; log, status, help, uptime and /proc/loadavg passed. Four host tes
 cover one-shot/backpressure, cancellation, 48-bit wrap and deadline arbitration.
 Log: target/sentinel-wakeup-smoke.log.
 
-### Preparing a sleep interval
+### Preparing a sleep interval, DVFS and Tickless Idle
 
 A healthy observer accepts PREPARE_SLEEP after reserving the one-shot timer.
 Its ACK carries the wake token. HP suppresses automatic heartbeats for that
 ticket, and STATUS reports `prepared` with the age of the last real heartbeat.
 `SENTINEL_PREPARE_SLEEP` rejects sleep preparation with `-EBUSY` while any DMA
 channel (`GDMA-AHB CH1` or `DW-GDMA CH0` scanout) or the MIPI-DSI display
-pipeline is active; run `display off` first to stop scanout and release the
+pipeline is active, or when an unconsumed IRQ/Event notification is pending in
+`EventTable`; run `display off` first to stop scanout and release the
 framebuffer. Cancellation before the deadline disarms the timer. At or after the deadline
 expiry wins, and WAIT consumes one WAKE_EVENT. Either outcome opens a fresh
-heartbeat timeout window. HP remains active throughout this protocol check.
+heartbeat timeout window and immediately schedules a fresh HP heartbeat so LP
+exits `PreparedSleep` without false missed-heartbeat transitions.
+
+Right before entering `wfi`, `Runtime::poll_pending_before_idle` re-checks the
+USB Serial/JTAG RX FIFO, the LP Sentinel mailbox doorbell (`has_pending_irq()`),
+`EventTable::any_pending()` and `EventTable::table_generation()` under `MIE=0`.
+If any thread is woken, the scheduler dispatches it immediately without entering
+idle. Otherwise `Runtime::enter_tickless_idle` computes the next deadline across
+thread sleeps/timeouts (`Scheduler::nearest_deadline`), Sentinel heartbeat/alarm
+timeouts (`SentinelClient::next_deadline`) and the 5-second load average window
+(`1..=400` ticks = 10 ms .. 4.0 s) and reprograms `SYSTIMER` comparator 0 in
+26-bit period mode when neither display scanout nor DMA is active.
+
+In `auto` DVFS mode (`CLOCK_CONTROL`, `freq [auto/40/180]`), HP0 downshifts to
+`40 MHz` XTAL (`CPU/MEM/SYS/APB = 40 MHz`) during tickless and `sentinel sleep <ms>`
+windows when `!display.is_active() && !dma.any_active()`, and restores the active
+`180 MHz` CPLL (`CPU/MEM/SYS = 180 MHz`, `APB = 90 MHz`) operating point upon wakeup.
+`CycleAccounting` integrates exact `mcycle` capacity across every frequency switch
+and tracks `freq_mode`, `freq_switches`, `tickless_sleeps` and `tickless_ticks` in
+`/proc/cpuinfo`.
 
 On Tab5 a cancelled 800 ms interval left no pending wake after its original
-deadline. A 4500 ms interval produced one event at 450 HP ticks. STATUS
-changed from prepared to healthy, with zero missed transitions and notices.
+deadline. A 1500 ms `sentinel sleep 1500` interval downshifted HP0 from 180 MHz
+to 40 MHz during sleep, woke on `WAKE_EVENT` at `elapsed_ticks=150`, restored
+180 MHz and resumed heartbeats with `missed=0`.
 
 ### Display bring-up checkpoint
 
@@ -420,8 +446,8 @@ Both full-screen images and their orientation were confirmed on Tab5 with an
 passed 40 frames without recurring underrun, followed by `/proc/sdcard`, `/proc/streams`,
 `/proc/power` and healthy Sentinel with missed=0.
 
-Current SRAM payload is 131952 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 15712 bytes (including the 4 KiB aligned microSD stream chunk buffer).
+Current SRAM payload is 137456 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 15776 bytes (including the 4 KiB aligned microSD stream chunk buffer).
 The artwork is selected through the shell; startup still enters the USB shell.
 
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,

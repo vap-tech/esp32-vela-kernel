@@ -4,6 +4,7 @@ use vela_kernel::{
     id::{Handle, ProcSlot, Ticks},
     lifecycle,
     sentinel::{WakePhase, WakeTicket},
+    stats::FreqMode,
     task::{Context, State, Wait},
 };
 
@@ -15,6 +16,34 @@ use crate::{
 };
 
 impl Runtime {
+    pub(super) fn sys_clock_control(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        frame: &mut arch::TrapFrame,
+    ) -> Result<u32, Errno> {
+        let rights = if args.a1 == syscall::FREQ_MODE_QUERY {
+            cap::READ
+        } else {
+            cap::CONTROL
+        };
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Sentinel,
+            rights,
+        )?;
+        let cpu_mhz = if args.a1 == syscall::FREQ_MODE_QUERY {
+            unsafe { soc::clock::rates_mhz().cpu }
+        } else {
+            let mode = FreqMode::from_abi(args.a1)?;
+            self.set_freq_mode(mode)?
+        };
+        frame.set_return2(self.freq_mode.to_abi());
+        Ok(cpu_mhz)
+    }
+
     pub(super) fn sys_sentinel_control(
         &mut self,
         current: ProcSlot,
@@ -58,8 +87,10 @@ impl Runtime {
             return Err(Errno::Einval);
         }
         // Sleep preparation requires all active DMA channels (GDMA-AHB CH1 and
-        // DW-GDMA CH0 scanout) and the MIPI-DSI display pipeline to be stopped first.
-        if sleep && (self.display.is_active() || self.dma.any_active()) {
+        // DW-GDMA CH0 scanout) and the MIPI-DSI display pipeline to be stopped,
+        // and no unconsumed IRQ/Event notification pending in EventTable.
+        if sleep && (self.display.is_active() || self.dma.any_active() || self.events.any_pending())
+        {
             return Err(Errno::Ebusy);
         }
         if self.sentinel.wake_ticket().is_some() {
@@ -182,7 +213,7 @@ impl Runtime {
         if matches!(ticket.phase, WakePhase::Fired(_)) {
             return Err(Errno::Ealready);
         }
-        let now = self.scheduler.uptime();
+        let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER cancel snapshot"));
         let sequence = self.sentinel.request(
             if ticket.sleep {
                 sentinel_wire::CANCEL_SLEEP
@@ -251,7 +282,7 @@ impl Runtime {
         if data && (size != sentinel_wire::LOG_BYTES || !self.writable(pointer, size)) {
             return Err(Errno::Efault);
         }
-        let now = self.scheduler.uptime();
+        let now = Ticks(unsafe { soc::timer::uptime_ticks() }.expect("SYSTIMER command snapshot"));
         let sequence = self.sentinel.request(command, arg0, arg1, now)?;
         let deadline = now.saturating_add(100);
         self.scheduler.block_until(

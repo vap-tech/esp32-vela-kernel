@@ -1,5 +1,7 @@
-//! Fixed display operating point for P4 rev1.x, following ESP-IDF v5.5.2.
-//! CPU/MEM/SYS 180 MHz, APB 90 MHz, CPLL 360 MHz. HP0, IRQs masked.
+//! Verified HP operating points for ESP32-P4 rev1.x, following ESP-IDF v5.5.2:
+//! - High (`display_speed`): CPU/MEM/SYS 180 MHz, APB 90 MHz, CPLL 360 MHz.
+//! - Low (`xtal_speed`): CPU/MEM/SYS/APB 40 MHz on XTAL root clock.
+//! HP0, IRQs masked.
 use crate::pac::{read, write};
 const CLK: usize = 0x500e6000;
 const ANALOG: usize = 0x50124000;
@@ -35,7 +37,7 @@ unsafe fn latch() -> Result<(), ()> {
     }
 }
 
-/// Switch HP/MEM/SYS/APB clocks to the verified display operating point.
+/// Switch HP/MEM/SYS/APB clocks to the verified 180 MHz CPLL operating point.
 ///
 /// # Safety
 /// Exclusive HP0 clock/CPLL/ROM ownership with machine interrupts masked.
@@ -74,6 +76,46 @@ pub unsafe fn display_speed() -> Result<(), ()> {
         let set_ticks: extern "C" fn(u32) = core::mem::transmute(0x4fc00044usize);
         set_ticks(180);
         Ok(())
+    }
+}
+
+/// Switch HP/MEM/SYS/APB clocks back to the 40 MHz XTAL operating point.
+///
+/// # Safety
+/// Exclusive HP0 clock/ROM ownership with machine interrupts masked.
+pub unsafe fn xtal_speed() -> Result<(), ()> {
+    unsafe {
+        if get(0x50111040) & 3 == 0 {
+            return Ok(());
+        }
+        // Switch root mux to XTAL (40 MHz) first while CPLL dividers are >= 1.
+        update(0x50111040, 3, 0);
+        // Restore CPU -> MEM -> APB dividers to 1:1.
+        update(CLK + 4, 0x1fffffe0, 0);
+        latch()?;
+        update(CLK + 8, u32::MAX, 0);
+        latch()?;
+        update(CLK + 0xc, 0xffff0000, 0);
+        latch()?;
+        let set_ticks: extern "C" fn(u32) = core::mem::transmute(0x4fc00044usize);
+        set_ticks(40);
+        Ok(())
+    }
+}
+
+/// Switch between the verified 40 MHz XTAL (`high_180mhz = false`) and 180 MHz CPLL
+/// (`high_180mhz = true`) operating points and return the active rates.
+///
+/// # Safety
+/// Exclusive HP0 clock/CPLL/ROM ownership with machine interrupts masked.
+pub unsafe fn set_speed(high_180mhz: bool) -> Result<RatesMhz, ()> {
+    unsafe {
+        if high_180mhz {
+            display_speed()?;
+        } else {
+            xtal_speed()?;
+        }
+        Ok(rates_mhz())
     }
 }
 

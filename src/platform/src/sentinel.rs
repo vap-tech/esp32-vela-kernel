@@ -61,6 +61,36 @@ impl SentinelClient {
         self.wake = ticket;
     }
 
+    /// Return `true` while a coordinated sleep window (`PREPARE_SLEEP`) is active
+    /// and has not yet fired on the LP Sentinel.
+    pub fn is_sleep_prepared(&self) -> bool {
+        self.wake
+            .is_some_and(|t| t.sleep && !matches!(t.phase, WakePhase::Fired(_)))
+    }
+
+    /// Earliest HP-side timer deadline needed by `SentinelClient::tick`, if any.
+    ///
+    /// While `is_sleep_prepared()` is true and no mailbox request is in flight,
+    /// periodic HP heartbeats are suspended by LP, so the earliest deadline is
+    /// the prepared sleep ticket's expiration guard (`ticket.expires`).
+    pub fn next_deadline(&self) -> Option<Ticks> {
+        let mut earliest: Option<Ticks> = None;
+        let mut consider = |d: Ticks| {
+            earliest = Some(earliest.map_or(d, |cur| cur.min(d)));
+        };
+        if let Some(inflight) = self.link.in_flight() {
+            consider(inflight.deadline());
+        } else if self.link.is_ready() && self.heartbeat && !self.is_sleep_prepared() {
+            consider(self.next_beat);
+        }
+        if let Some(ticket) = self.wake
+            && !matches!(ticket.phase, WakePhase::Fired(_))
+        {
+            consider(ticket.expires);
+        }
+        earliest
+    }
+
     pub fn release_wake_on_exit(&mut self, owner: Pid) {
         if self
             .wake
@@ -122,9 +152,7 @@ impl SentinelClient {
         }
         if self.link.is_ready()
             && self.heartbeat
-            && !self
-                .wake
-                .is_some_and(|t| t.sleep && !matches!(t.phase, WakePhase::Fired(_)))
+            && !self.is_sleep_prepared()
             && !self.link.is_pending()
             && uptime >= self.next_beat
             && self
@@ -183,6 +211,10 @@ impl SentinelClient {
         let elapsed = now.saturating_sub(ticket.started).min(u64::from(u32::MAX)) as u32;
         ticket.phase = WakePhase::Fired(elapsed);
         self.wake = Some(ticket);
+        // Schedule an immediate heartbeat after LP exits PreparedSleep (`end_sleep(now)`).
+        if ticket.sleep {
+            self.next_beat = now;
+        }
         let alive = processes.find_alive(ticket.owner).is_some();
         if !alive || Self::finish_wake_waiter(scheduler, processes, ticket, ticket.token, elapsed) {
             self.wake = None;
@@ -310,6 +342,9 @@ impl SentinelClient {
         {
             if let Some(ticket) = self.wake {
                 if ticket.token == argument {
+                    if ticket.sleep {
+                        self.next_beat = Ticks::ZERO;
+                    }
                     Self::finish_wake_waiter(
                         scheduler,
                         processes,

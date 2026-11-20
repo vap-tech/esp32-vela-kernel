@@ -182,6 +182,10 @@ impl Runtime {
                     (cyc.capacity_cycles >> 32) as u32,
                     cyc.irq_latency_last_16m,
                     cyc.irq_latency_max_16m,
+                    self.freq_mode.to_abi() | (cyc.freq_switches << 8),
+                    cyc.tickless_entries,
+                    cyc.tickless_ticks as u32,
+                    (cyc.tickless_ticks >> 32) as u32,
                 ];
                 let mut buffer = [0u8; syscall::STATS_CPU_BYTES];
                 for (i, word) in words.into_iter().enumerate() {

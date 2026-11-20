@@ -10,7 +10,7 @@ use vela_kernel::{
     memory::RegionAllocator,
     process::{PROCESSES, Processes},
     sched::Scheduler,
-    stats::CycleAccounting,
+    stats::{CycleAccounting, FreqMode},
 };
 
 use crate::{
@@ -91,6 +91,11 @@ extern "C" fn rust_main() -> ! {
             dma_interrupts: 0,
             sentinel_interrupts: 0,
             cycles: CycleAccounting::new(),
+            freq_mode: FreqMode::Auto,
+            active_high_180mhz: false,
+            tickless_armed: false,
+            tickless_enter_16m: 0,
+            tickless_period_16m: soc::timer::PERIOD_10MS_16M,
             logs: BootLogs::EMPTY,
         })
     };

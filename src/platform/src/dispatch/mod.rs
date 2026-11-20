@@ -79,6 +79,7 @@ impl Runtime {
             syscall::IRQ_BIND => self.sys_irq_bind(current, args),
             syscall::IRQ_UNBIND => self.sys_irq_unbind(current, args, switch),
             syscall::I2C_TRANSFER => self.sys_i2c_transfer(current, args),
+            syscall::CLOCK_CONTROL => self.sys_clock_control(current, args, frame),
             syscall::CONSOLE_READ => self.sys_console_read(current, args),
             syscall::SLEEP => self.sys_sleep(args, switch),
             _ => Err(Errno::Enosys),

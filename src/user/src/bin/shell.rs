@@ -150,7 +150,7 @@ fn run_bench(request_handle: u32) {
     {
         sys::write(FAILED);
         return;
-    }
+    };
     let cpu_mhz = word_le(&cpu, 4);
     let lat_last_16m = word_le(&cpu, 48);
     let lat_max_16m = word_le(&cpu, 52);
@@ -340,14 +340,16 @@ fn sentinel_log(sentinel_cap: u32) {
 
 fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
     const PREPARE_PREFIX: &[u8] = b"sentinel prepare ";
+    const SLEEP_PREFIX: &[u8] = b"sentinel sleep ";
     const ARM_PREFIX: &[u8] = b"sentinel arm ";
     const WAKE_PREFIX: &[u8] = b"sentinel wake ";
 
     let wait = line.eq_at(0, b"sentinel wait");
     let cancel = line.eq_at(0, b"sentinel cancel");
-    let prepare = line.starts_with(PREPARE_PREFIX);
+    let sleep = line.starts_with(SLEEP_PREFIX);
+    let prepare = sleep || line.starts_with(PREPARE_PREFIX);
     let arm = prepare || line.starts_with(ARM_PREFIX);
-    let wake = line.starts_with(WAKE_PREFIX);
+    let wake = sleep || line.starts_with(WAKE_PREFIX);
     if !wait && !cancel && !arm && !wake {
         return false;
     }
@@ -361,7 +363,9 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
         abi::SENTINEL_ARM_WAKE
     };
     let argument = if arm || wake {
-        let prefix_len = if prepare {
+        let prefix_len = if sleep {
+            SLEEP_PREFIX.len()
+        } else if prepare {
             PREPARE_PREFIX.len()
         } else if arm {
             ARM_PREFIX.len()
@@ -401,7 +405,9 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
         sys::write(b"Sentinel wake cancelled\n");
     } else {
         let mut out = Buffer::new();
-        if prepare {
+        if sleep {
+            out.append(b"Sentinel sleep WAKE_EVENT token=");
+        } else if prepare {
             out.append(b"Sentinel sleep prepared token=");
         } else if arm {
             out.append(b"Sentinel wake armed token=");
@@ -409,7 +415,7 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
             out.append(b"Sentinel WAKE_EVENT token=");
         }
         out.decimal(result.0);
-        if !arm {
+        if !arm || sleep {
             out.append(b" elapsed_ticks=");
             out.decimal(result.1);
         }
@@ -419,21 +425,53 @@ fn wake_command(line: &Buffer, sentinel_cap: u32) -> bool {
     true
 }
 
+fn freq_command(text: &[u8], sentinel_cap: u32) -> bool {
+    let mode = match text {
+        b"freq" => abi::FREQ_MODE_QUERY,
+        b"freq auto" => abi::FREQ_MODE_AUTO,
+        b"freq 40" => abi::FREQ_MODE_40MHZ,
+        b"freq 180" => abi::FREQ_MODE_180MHZ,
+        _ => return false,
+    };
+    let (cpu_mhz, active_mode) = sys::call6(abi::CLOCK_CONTROL, sentinel_cap, mode, 0, 0, 0, 0);
+    if (cpu_mhz as i32) <= 0 {
+        if cpu_mhz as i32 == -16 {
+            sys::write(b"freq busy; stop active display/DMA before downclocking to 40 MHz\n");
+        } else {
+            sys::write(FAILED);
+        }
+        return true;
+    }
+    let mode_name: &[u8] = match active_mode {
+        abi::FREQ_MODE_40MHZ => b"pin_40mhz",
+        abi::FREQ_MODE_180MHZ => b"pin_180mhz",
+        _ => b"auto",
+    };
+    let mut out = Buffer::new();
+    out.append(b"cpu_mhz=");
+    out.decimal(cpu_mhz);
+    out.append(b" mode=");
+    out.append(mode_name);
+    out.push(b'\n');
+    sys::write(out.as_slice());
+    true
+}
+
 fn command(line: &Buffer, caps: Caps) {
     let text = line.as_slice();
     if text.is_empty() {
         return;
     }
-    if wake_command(line, caps.sentinel) {
+    if wake_command(line, caps.sentinel) || freq_command(text, caps.sentinel) {
         return;
     }
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | bench | sdcard | run hello/pic/pic-psram/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
+                b"help | cat <path> | uptime | bench | freq [auto/40/180] | sdcard | run hello/pic/pic-psram/dma | memtest\n",
             );
             sys::write(
-                b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",
+                b"sentinel [hello/status/pause/resume/log/mark] | sentinel sleep/wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",
             );
         }
         b"sdcard" => {

@@ -146,6 +146,18 @@ impl EventTable {
         self.slots.get(index).is_some_and(|s| s.pending)
     }
 
+    /// Return `true` if any bound IRQ slot currently has an unconsumed `pending` notification.
+    pub fn any_pending(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.registered && s.owner.is_some() && s.pending)
+    }
+
+    /// Return the monotonic binding generation counter of the table.
+    pub const fn table_generation(&self) -> u32 {
+        self.generation
+    }
+
     pub fn interrupts(&self, index: usize) -> u64 {
         self.slots.get(index).map_or(0, |s| s.interrupts)
     }
@@ -425,8 +437,11 @@ mod tests {
         assert_eq!(sched.task(ThreadSlot(0)).context.a0, 0);
 
         // 4. Hardware IRQ arrives while no thread is waiting -> latches pending=true.
+        assert!(!events.any_pending());
         assert_eq!(events.notify(0, &mut sched), None);
         assert!(events.is_pending(0));
+        assert!(events.any_pending());
+        assert_eq!(events.table_generation(), 1);
         assert_eq!(events.interrupts(0), 2);
 
         // Next EVENT_WAIT consumes latched pending immediately without calling arm callback.

@@ -38,6 +38,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             .user_cycles
             .saturating_add(user_delta);
         runtime.scheduler.task_mut(cur).user_cycles = updated;
+    } else {
+        runtime.exit_tickless_idle(interrupt && cause == 17);
     }
     let mut switch = false;
     if interrupt && cause == 17 {
@@ -47,9 +49,13 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             soc::timer::acknowledge();
             soc::timer::counter_16mhz().expect("SYSTIMER snapshot timeout")
         };
-        let live_tick = runtime.scheduler.snapshot().scheduler_ticks > 0;
-        runtime.cycles.on_timer_irq(raw_16m, 160_000, live_tick);
-        let uptime = Ticks(raw_16m / 160_000);
+        if !from_idle {
+            let live_tick = runtime.scheduler.snapshot().scheduler_ticks > 0;
+            runtime
+                .cycles
+                .on_timer_irq(raw_16m, soc::timer::PERIOD_10MS_16M, live_tick);
+        }
+        let uptime = Ticks(raw_16m / soc::timer::PERIOD_10MS_16M);
         if runtime.dma.timed_out(DMA_CH_GDMA_AHB_CH1, uptime) {
             unsafe {
                 soc::dma::finish(runtime.dma.length(DMA_CH_GDMA_AHB_CH1));
@@ -117,9 +123,13 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     if !from_idle {
         runtime.scheduler.save(*frame);
     }
-    let selected = runtime.scheduler.select(interrupt);
+    let mut selected = runtime.scheduler.select(interrupt);
+    if selected.is_none() && runtime.poll_pending_before_idle() {
+        selected = runtime.scheduler.select(false);
+    }
     if selected.is_none() {
         runtime.in_idle = true;
+        runtime.enter_tickless_idle();
         runtime.idle_frame.mcause = cause | (3 << 28) | (1 << 27);
         if !runtime.logs.idle {
             runtime.logs.idle = true;

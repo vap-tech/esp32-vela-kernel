@@ -87,6 +87,11 @@ pub unsafe fn start() -> Option<Boot> {
         Some(Boot { epoch, hz })
     }
 }
+/// Return `true` if the LP mailbox doorbell currently has an unconsumed reply.
+pub unsafe fn has_pending_irq() -> bool {
+    unsafe { read(BASE + 0x54) & READY_BIT != 0 }
+}
+
 /// Consume the LP doorbell only after seeing the hardware status bit.
 pub unsafe fn acknowledge(epoch: Option<u32>) -> Option<wire::Reply> {
     unsafe {

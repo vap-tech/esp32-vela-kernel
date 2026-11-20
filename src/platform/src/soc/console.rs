@@ -61,6 +61,11 @@ impl Console {
         }
     }
 
+    /// Return `true` if the USB Serial/JTAG RX FIFO currently holds at least one host byte.
+    pub fn rx_available(&self) -> bool {
+        unsafe { crate::pac::read(CONFIG) & (1 << 2) != 0 }
+    }
+
     /// Read one host byte if available; never blocks.
     pub fn read_byte(&mut self) -> Option<u8> {
         unsafe {

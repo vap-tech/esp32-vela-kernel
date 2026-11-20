@@ -1,8 +1,16 @@
+use crate::{errno::Errno, id::Ticks};
+
 /// Scheduler sampling contract, independent of trap/controller implementation.
 /// 100 Hz scheduling; load sampled each 5 seconds. Fixed point Q16 EWMA of
 /// Ready+Running tasks, alpha=exp(-5/tau), tau=60/300/900 seconds.
 /// Rounded Q16 coefficients: 60296, 64453, 65173. No floating point/heap needed.
 pub const HZ: u64 = 100;
+
+/// Base 10 ms periodic quantum in 16 MHz `SYSTIMER` ticks (`10 ms * 16_000_000 Hz = 160_000`).
+pub const BASE_PERIOD_16M: u64 = 160_000;
+
+/// Maximum single-interval tickless sleep window in 10 ms ticks (`400 * 160_000 = 64_000_000 < 2^26`).
+pub const MAX_TICKLESS_TICKS: u32 = 400;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -34,7 +42,67 @@ impl LoadAverage {
     }
 }
 
-/// Measured per-hart cycle breakdown and timer IRQ entry latency snapshot.
+/// Operating point selection policy for HP0 DVFS (`40 MHz` XTAL <-> `180 MHz` CPLL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FreqMode {
+    /// DVFS idle governor: downshift to 40 MHz XTAL during tickless/prepared sleep
+    /// when no high-bus-rate peripheral (`display` / `dma`) is active, and restore
+    /// the previously active operating point (or 180 MHz on display start) on wake.
+    Auto = 0,
+    /// Pin 40 MHz XTAL (rejected with [`Errno::Ebusy`] while display or DMA is active).
+    Pin40Mhz = 1,
+    /// Pin 180 MHz CPLL even during tickless idle.
+    Pin180Mhz = 2,
+}
+
+impl FreqMode {
+    pub const fn from_abi(raw: u32) -> Result<Self, Errno> {
+        match raw {
+            0 => Ok(Self::Auto),
+            1 => Ok(Self::Pin40Mhz),
+            2 => Ok(Self::Pin180Mhz),
+            _ => Err(Errno::Einval),
+        }
+    }
+
+    pub const fn to_abi(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Compute the next SYSTIMER tickless sleep interval in 10 ms ticks (`1..=max_ticks`).
+///
+/// Returns `1` (standard 100 Hz periodic tick) whenever `display_active` or `dma_active`
+/// requires 10 ms periodic servicing, or if the earliest deadline is already due.
+pub fn compute_tickless_ticks(
+    now: Ticks,
+    thread_deadline: Option<Ticks>,
+    sentinel_deadline: Option<Ticks>,
+    load_sample_deadline: Ticks,
+    display_active: bool,
+    dma_active: bool,
+    max_ticks: u32,
+) -> u32 {
+    if display_active || dma_active || max_ticks <= 1 {
+        return 1;
+    }
+    let mut earliest = load_sample_deadline;
+    if let Some(d) = thread_deadline
+        && d < earliest
+    {
+        earliest = d;
+    }
+    if let Some(d) = sentinel_deadline
+        && d < earliest
+    {
+        earliest = d;
+    }
+    let delta = earliest.saturating_sub(now);
+    delta.clamp(1, u64::from(max_ticks)) as u32
+}
+
+/// Measured per-hart cycle breakdown, timer IRQ entry latency, and DVFS/tickless telemetry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CycleSnapshot {
     pub user_cycles: u64,
@@ -43,6 +111,9 @@ pub struct CycleSnapshot {
     pub capacity_cycles: u64,
     pub irq_latency_last_16m: u32,
     pub irq_latency_max_16m: u32,
+    pub freq_switches: u32,
+    pub tickless_entries: u32,
+    pub tickless_ticks: u64,
 }
 
 impl CycleSnapshot {
@@ -65,14 +136,15 @@ impl CycleSnapshot {
     }
 }
 
-/// Frequency-aware `mcycle` and 16 MHz timer capacity/latency tracker.
+/// Frequency-aware `mcycle` and 16 MHz timer capacity/latency/DVFS/tickless tracker.
 ///
-/// Integrates available CPU cycles across clock switches (`40 MHz` XTAL -> `180 MHz`
+/// Integrates available CPU cycles across clock switches (`40 MHz` XTAL <-> `180 MHz`
 /// CPLL) with exact mod-16 remainder retention so utilization never drifts even if
 /// `wfi` clock-gates `mcycle`.
 pub struct CycleAccounting {
     last_mcycle: u64,
     last_counter_16m: u64,
+    expected_irq_16m: Option<u64>,
     cpu_mhz: u32,
     user_cycles: u64,
     kernel_cycles: u64,
@@ -81,6 +153,9 @@ pub struct CycleAccounting {
     capacity_cycles: u64,
     irq_latency_last_16m: u32,
     irq_latency_max_16m: u32,
+    freq_switches: u32,
+    tickless_entries: u32,
+    tickless_ticks: u64,
 }
 
 impl CycleAccounting {
@@ -88,6 +163,7 @@ impl CycleAccounting {
         Self {
             last_mcycle: 0,
             last_counter_16m: 0,
+            expected_irq_16m: None,
             cpu_mhz: 40,
             user_cycles: 0,
             kernel_cycles: 0,
@@ -96,13 +172,37 @@ impl CycleAccounting {
             capacity_cycles: 0,
             irq_latency_last_16m: 0,
             irq_latency_max_16m: 0,
+            freq_switches: 0,
+            tickless_entries: 0,
+            tickless_ticks: 0,
         }
+    }
+
+    pub const fn cpu_mhz(&self) -> u32 {
+        self.cpu_mhz
     }
 
     pub fn start(&mut self, mcycle: u64, counter_16m: u64, cpu_mhz: u32) {
         self.last_mcycle = mcycle;
         self.last_counter_16m = counter_16m;
+        self.expected_irq_16m = None;
         self.cpu_mhz = cpu_mhz;
+    }
+
+    /// Record the exact 16 MHz comparator target (`now_16m + period_16m`) when
+    /// reprogramming `SYSTIMER` target 0 for tickless idle or restoring 10 ms periodic mode.
+    pub fn set_expected_irq_16m(&mut self, expected_16m: Option<u64>) {
+        self.expected_irq_16m = expected_16m;
+    }
+
+    /// Record a tickless idle entry programmed for `planned_ticks` (`> 1`).
+    pub fn record_tickless_entry(&mut self) {
+        self.tickless_entries = self.tickless_entries.saturating_add(1);
+    }
+
+    /// Record elapsed 10 ms ticks spent in a tickless sleep window upon wakeup.
+    pub fn record_tickless_wake(&mut self, elapsed_ticks: u64) {
+        self.tickless_ticks = self.tickless_ticks.saturating_add(elapsed_ticks);
     }
 
     fn advance_capacity(&mut self, counter_16m: u64) {
@@ -140,19 +240,46 @@ impl CycleAccounting {
     /// comparator-to-ISR latency in 16 MHz ticks (`1 tick = 62.5 ns`).
     pub fn on_timer_irq(&mut self, counter_16m: u64, period_16m: u64, measure_latency: bool) {
         self.advance_capacity(counter_16m);
+        let quantum_16m = if period_16m == 0 {
+            BASE_PERIOD_16M
+        } else {
+            period_16m.min(BASE_PERIOD_16M)
+        };
         if measure_latency && period_16m != 0 {
-            let lat = (counter_16m % period_16m).min(u64::from(u32::MAX)) as u32;
+            let lat64 = match self.expected_irq_16m {
+                Some(expected) => {
+                    if counter_16m >= expected {
+                        let delta = counter_16m - expected;
+                        let steps = (delta / period_16m) + 1;
+                        self.expected_irq_16m = Some(expected.saturating_add(steps * period_16m));
+                        delta % quantum_16m
+                    } else {
+                        counter_16m % quantum_16m
+                    }
+                }
+                None => counter_16m % quantum_16m,
+            };
+            let lat = lat64.min(u64::from(u32::MAX)) as u32;
             self.irq_latency_last_16m = lat;
             if lat > self.irq_latency_max_16m {
                 self.irq_latency_max_16m = lat;
             }
+        } else if let Some(expected) = self.expected_irq_16m
+            && period_16m != 0
+            && counter_16m >= expected
+        {
+            let steps = ((counter_16m - expected) / period_16m) + 1;
+            self.expected_irq_16m = Some(expected.saturating_add(steps * period_16m));
         }
     }
 
     /// Flush capacity accumulated under the previous frequency and switch to `new_cpu_mhz`.
     pub fn sync_clock(&mut self, counter_16m: u64, new_cpu_mhz: u32) {
         self.advance_capacity(counter_16m);
-        self.cpu_mhz = new_cpu_mhz;
+        if self.cpu_mhz != new_cpu_mhz {
+            self.cpu_mhz = new_cpu_mhz;
+            self.freq_switches = self.freq_switches.saturating_add(1);
+        }
     }
 
     /// Flush in-progress trap cycles and capacity up to `now` and return an atomic snapshot.
@@ -166,6 +293,9 @@ impl CycleAccounting {
             capacity_cycles: self.capacity_cycles,
             irq_latency_last_16m: self.irq_latency_last_16m,
             irq_latency_max_16m: self.irq_latency_max_16m,
+            freq_switches: self.freq_switches,
+            tickless_entries: self.tickless_entries,
+            tickless_ticks: self.tickless_ticks,
         }
     }
 }
@@ -217,10 +347,12 @@ mod tests {
         acc.sync_clock(101, 40);
         acc.sync_clock(102, 40);
         assert_eq!(acc.capacity_cycles, 5);
+        assert_eq!(acc.freq_switches, 0);
 
         // Run 98 more ticks at 40 MHz (total 100 ticks * 2.5 = 250 cycles), then switch to 180 MHz.
         acc.sync_clock(200, 180);
         assert_eq!(acc.capacity_cycles, 250);
+        assert_eq!(acc.freq_switches, 1);
 
         // Run 4 ticks at 180 MHz (4 * 11.25 = 45 cycles -> total 295 cycles).
         acc.on_trap_entry(147, false);
@@ -228,5 +360,81 @@ mod tests {
         assert_eq!(snap.capacity_cycles, 295);
         assert_eq!(snap.busy_cycles(), 295);
         assert_eq!(snap.utilization_bps(), 10_000);
+        assert_eq!(snap.freq_switches, 1);
+    }
+
+    #[test]
+    fn tickless_policy_and_expected_irq_latency_tracking() {
+        assert_eq!(FreqMode::from_abi(0), Ok(FreqMode::Auto));
+        assert_eq!(FreqMode::from_abi(1), Ok(FreqMode::Pin40Mhz));
+        assert_eq!(FreqMode::from_abi(2), Ok(FreqMode::Pin180Mhz));
+        assert_eq!(FreqMode::from_abi(3), Err(Errno::Einval));
+
+        // Active display or DMA forces 1-tick periodic mode.
+        assert_eq!(
+            compute_tickless_ticks(
+                Ticks(100),
+                Some(Ticks(250)),
+                Some(Ticks(200)),
+                Ticks(500),
+                true,
+                false,
+                MAX_TICKLESS_TICKS,
+            ),
+            1
+        );
+        assert_eq!(
+            compute_tickless_ticks(
+                Ticks(100),
+                Some(Ticks(250)),
+                Some(Ticks(200)),
+                Ticks(500),
+                false,
+                true,
+                MAX_TICKLESS_TICKS,
+            ),
+            1
+        );
+
+        // Otherwise picks the minimum of thread deadline, sentinel deadline, load sample, and MAX_TICKLESS_TICKS.
+        assert_eq!(
+            compute_tickless_ticks(
+                Ticks(100),
+                Some(Ticks(185)),
+                Some(Ticks(200)),
+                Ticks(500),
+                false,
+                false,
+                MAX_TICKLESS_TICKS,
+            ),
+            85
+        );
+        assert_eq!(
+            compute_tickless_ticks(
+                Ticks(100),
+                None,
+                None,
+                Ticks(1_000),
+                false,
+                false,
+                MAX_TICKLESS_TICKS,
+            ),
+            MAX_TICKLESS_TICKS
+        );
+
+        // Verify expected_irq_16m tracks tickless comparator re-arming without phase drift.
+        let mut acc = CycleAccounting::new();
+        acc.start(0, 123_456, 40);
+        acc.record_tickless_entry();
+        let target_16m = 123_456 + 50 * 160_000;
+        acc.set_expected_irq_16m(Some(target_16m));
+        acc.on_timer_irq(target_16m + 14, 50 * 160_000, true);
+        acc.record_tickless_wake(50);
+
+        let snap = acc.snapshot(100, target_16m + 20);
+        assert_eq!(snap.irq_latency_last_16m, 14);
+        assert_eq!(snap.irq_latency_max_16m, 14);
+        assert_eq!(snap.tickless_entries, 1);
+        assert_eq!(snap.tickless_ticks, 50);
     }
 }

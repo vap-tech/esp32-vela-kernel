@@ -117,11 +117,20 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             let (c_lo, c_hi) = dword_le(&snap, 40);
             let lat_last = word_le(&snap, 48);
             let lat_max = word_le(&snap, 52);
+            let freq_meta = word_le(&snap, 56);
+            let tickless_entries = word_le(&snap, 60);
+            let (tl_lo, tl_hi) = dword_le(&snap, 64);
 
             let user = (u64::from(u_hi) << 32) | u64::from(u_lo);
             let kernel = (u64::from(k_hi) << 32) | u64::from(k_lo);
             let cap = (u64::from(c_hi) << 32) | u64::from(c_lo);
             let busy_bps = ratio_bps(user.saturating_add(kernel), cap);
+            let freq_mode: &[u8] = match freq_meta & 0xff {
+                1 => b"pin_40mhz",
+                2 => b"pin_180mhz",
+                _ => b"auto",
+            };
+            let freq_switches = freq_meta >> 8;
 
             out.append(b"hart ");
             out.decimal(hart);
@@ -131,6 +140,14 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             out.decimal(apb_mhz);
             out.append(b"\nlp_hz ");
             out.decimal(lp_hz);
+            out.append(b"\nfreq_mode ");
+            out.append(freq_mode);
+            out.append(b"\nfreq_switches ");
+            out.decimal(freq_switches);
+            out.append(b"\ntickless_sleeps ");
+            out.decimal(tickless_entries);
+            out.append(b" ticks ");
+            out.decimal64(tl_lo, tl_hi);
             out.append(b"\nbusy_pct ");
             out.hundredths(busy_bps);
             out.append(b"\nuser_cycles ");

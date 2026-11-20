@@ -51,6 +51,9 @@ impl Runtime {
                 self.cycles.sync_clock(now_16m, after_rates.cpu);
             }
         }
+        if after_rates.cpu >= 180 {
+            self.active_high_180mhz = true;
+        }
         if let Some(diag) = diag {
             use core::fmt::Write;
             let _ = write!(self.console, "{diag}");

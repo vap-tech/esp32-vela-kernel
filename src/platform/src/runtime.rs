@@ -5,13 +5,13 @@ use vela_kernel::{
     dma::{DmaDirection, DmaTable},
     errno::Errno,
     event::EventTable,
-    id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
+    id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks, Tid},
     ipc::Ipc,
     lifecycle::{self, ReapedProcess},
     memory::{MemoryClass, RegionAllocator},
     process::{AddressSpace, EXECUTE, Process, Processes, READ, WRITE},
     sched::{Scheduler, TASKS},
-    stats::CycleAccounting,
+    stats::{CycleAccounting, FreqMode, MAX_TICKLESS_TICKS, compute_tickless_ticks},
     task::{Region, State, Wait},
 };
 
@@ -65,6 +65,11 @@ pub struct Runtime {
     pub dma_interrupts: u64,
     pub sentinel_interrupts: u64,
     pub cycles: CycleAccounting,
+    pub freq_mode: FreqMode,
+    pub active_high_180mhz: bool,
+    pub tickless_armed: bool,
+    pub tickless_enter_16m: u64,
+    pub tickless_period_16m: u64,
     pub logs: BootLogs,
 }
 
@@ -91,6 +96,170 @@ impl Runtime {
     pub fn mask_irq_slot(&mut self, index: usize) {
         if index == IRQ_SLOT_CONSOLE_RX {
             self.console.mask_rx_irq();
+        }
+    }
+
+    /// Switch HP0 operating point (`40 MHz` XTAL <-> `180 MHz` CPLL) while
+    /// integrating `mcycle` capacity at the exact `SYSTIMER` transition point.
+    pub fn apply_cpu_speed(&mut self, high_180mhz: bool) -> Result<u32, Errno> {
+        if !high_180mhz && (self.display.is_active() || self.dma.any_active()) {
+            return Err(Errno::Ebusy);
+        }
+        // SAFETY: sole HP0 clock/timer owner under masked IRQs.
+        unsafe {
+            let before = soc::clock::rates_mhz();
+            if let Some(now_16m) = soc::timer::counter_16mhz() {
+                self.cycles.sync_clock(now_16m, before.cpu);
+            }
+            let after = soc::clock::set_speed(high_180mhz).map_err(|_| Errno::Eio)?;
+            if let Some(now_16m) = soc::timer::counter_16mhz() {
+                self.cycles.sync_clock(now_16m, after.cpu);
+            }
+            Ok(after.cpu)
+        }
+    }
+
+    /// Configure the DVFS governor policy (`Auto`, `Pin40Mhz`, `Pin180Mhz`) and
+    /// immediately apply the corresponding active operating point.
+    pub fn set_freq_mode(&mut self, mode: FreqMode) -> Result<u32, Errno> {
+        match mode {
+            FreqMode::Pin40Mhz => {
+                let cpu = self.apply_cpu_speed(false)?;
+                self.freq_mode = FreqMode::Pin40Mhz;
+                self.active_high_180mhz = false;
+                Ok(cpu)
+            }
+            FreqMode::Pin180Mhz => {
+                let cpu = self.apply_cpu_speed(true)?;
+                self.freq_mode = FreqMode::Pin180Mhz;
+                self.active_high_180mhz = true;
+                Ok(cpu)
+            }
+            FreqMode::Auto => {
+                self.freq_mode = FreqMode::Auto;
+                let want_high =
+                    self.active_high_180mhz || self.display.is_active() || self.dma.any_active();
+                if want_high {
+                    self.active_high_180mhz = true;
+                    self.apply_cpu_speed(true)
+                } else {
+                    self.apply_cpu_speed(false)
+                }
+            }
+        }
+    }
+
+    /// Re-check pending peripheral events, LP mailbox replies, and IRQ slot
+    /// generations under `MIE=0` right before entering `wfi`.
+    ///
+    /// Returns `true` if any thread was woken (so the caller must select the
+    /// newly runnable thread instead of entering idle).
+    pub fn poll_pending_before_idle(&mut self) -> bool {
+        let gen_before = self.events.table_generation();
+        // 1. If a console waiter is blocked on `IRQ_SLOT_CONSOLE_RX` and the
+        //    USB Serial/JTAG FIFO already has bytes ready, deliver the event now.
+        if !self.events.is_masked(IRQ_SLOT_CONSOLE_RX) && self.console.rx_available() {
+            self.console.mask_rx_irq();
+            if self
+                .events
+                .notify(IRQ_SLOT_CONSOLE_RX, &mut self.scheduler)
+                .is_some()
+            {
+                return true;
+            }
+        }
+        // 2. If the LP Sentinel mailbox doorbell is asserted, consume and dispatch it.
+        if unsafe { soc::sentinel::has_pending_irq() } {
+            self.sentinel_interrupts += 1;
+            if let Some(reply) = unsafe { soc::sentinel::acknowledge(self.sentinel.epoch()) } {
+                self.sentinel
+                    .handle_reply(reply, &mut self.scheduler, &self.processes);
+            }
+        }
+        // 3. Re-verify if any thread became runnable or if an event/generation changed.
+        self.scheduler.has_runnable()
+            || self.events.table_generation() != gen_before
+            || (self.events.any_pending() && self.scheduler.has_runnable())
+    }
+
+    /// Program `SYSTIMER` target 0 for the next idle window (`1..=MAX_TICKLESS_TICKS`)
+    /// and apply the DVFS idle operating point (`40 MHz` XTAL when eligible).
+    pub fn enter_tickless_idle(&mut self) {
+        let now = unsafe { soc::timer::uptime_ticks() }
+            .map(Ticks)
+            .unwrap_or_else(|| self.scheduler.uptime());
+        self.sentinel.tick(now);
+        let sleep_ticks = compute_tickless_ticks(
+            now,
+            self.scheduler.nearest_deadline(),
+            self.sentinel.next_deadline(),
+            self.scheduler.next_load_sample_at(),
+            self.display.is_active(),
+            self.dma.any_active(),
+            MAX_TICKLESS_TICKS,
+        );
+        // Downshift to 40 MHz XTAL during tickless sleep (`sleep_ticks >= 2` or
+        // coordinated `PREPARE_SLEEP`) when in Auto or Pin40Mhz mode and no
+        // high-bandwidth peripheral is active.
+        let can_downshift = !self.display.is_active()
+            && !self.dma.any_active()
+            && matches!(self.freq_mode, FreqMode::Auto | FreqMode::Pin40Mhz)
+            && (sleep_ticks >= 2 || self.sentinel.is_sleep_prepared());
+        if can_downshift {
+            let _ = self.apply_cpu_speed(false);
+        }
+        if sleep_ticks > 1 {
+            // SAFETY: sole hart0 SYSTIMER owner under masked IRQs.
+            if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {
+                let (period_16m, expected_16m) =
+                    unsafe { soc::timer::arm_period_ticks(sleep_ticks) };
+                self.tickless_armed = true;
+                self.tickless_enter_16m = now_16m;
+                self.tickless_period_16m = period_16m;
+                self.cycles.record_tickless_entry();
+                self.cycles.set_expected_irq_16m(expected_16m);
+            }
+        }
+    }
+
+    /// Restore periodic 10 ms `SYSTIMER` ticks and the active DVFS operating point
+    /// upon waking from a tickless idle window.
+    ///
+    /// If `timer_irq` is `false` (woken early by an external interrupt such as
+    /// `USB_RX` or `LP_SENTINEL`), also synchronizes `Scheduler` and `SentinelClient`
+    /// to the current `SYSTIMER` epoch so elapsed deadlines are serviced first.
+    pub fn exit_tickless_idle(&mut self, timer_irq: bool) {
+        // SAFETY: sole hart0 SYSTIMER owner under masked IRQs.
+        let now_16m =
+            unsafe { soc::timer::counter_16mhz() }.expect("SYSTIMER tickless exit snapshot");
+        if self.tickless_armed {
+            let elapsed_ticks =
+                now_16m.saturating_sub(self.tickless_enter_16m) / soc::timer::PERIOD_10MS_16M;
+            self.cycles.record_tickless_wake(elapsed_ticks.max(1));
+            if timer_irq {
+                let live_tick = self.scheduler.snapshot().scheduler_ticks > 0;
+                self.cycles
+                    .on_timer_irq(now_16m, self.tickless_period_16m, live_tick);
+            }
+            let next_periodic_16m = unsafe { soc::timer::restore_periodic_10ms() };
+            self.cycles.set_expected_irq_16m(next_periodic_16m);
+            self.tickless_armed = false;
+            self.tickless_period_16m = soc::timer::PERIOD_10MS_16M;
+            if !timer_irq {
+                let uptime = Ticks(now_16m / soc::timer::PERIOD_10MS_16M);
+                self.sentinel.tick(uptime);
+                self.scheduler.sync_uptime(uptime, &mut self.calls);
+            }
+        }
+        let restore_high = match self.freq_mode {
+            FreqMode::Pin180Mhz => true,
+            FreqMode::Pin40Mhz => self.display.is_active() || self.dma.any_active(),
+            FreqMode::Auto => {
+                self.active_high_180mhz || self.display.is_active() || self.dma.any_active()
+            }
+        };
+        if restore_high && self.cycles.cpu_mhz() < 180 {
+            let _ = self.apply_cpu_speed(true);
         }
     }
 

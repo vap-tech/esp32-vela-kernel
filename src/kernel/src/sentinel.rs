@@ -27,6 +27,12 @@ pub struct InFlight {
     deadline: Ticks,
 }
 
+impl InFlight {
+    pub const fn deadline(&self) -> Ticks {
+        self.deadline
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
     Heartbeat(u32),
@@ -250,18 +256,18 @@ mod tests {
     fn exit_retains_only_unfinished_owned_alarm() {
         let mut ticket = WakeTicket {
             token: 1,
-            owner: Pid(2),
+            owner: Pid(3),
             started: Ticks(0),
-            expires: Ticks(5),
-            delay_ms: 10,
+            expires: Ticks(200),
+            delay_ms: 1000,
             sleep: false,
             phase: WakePhase::Requested,
         };
-        assert!(!ticket.release_on_exit(Pid(2)));
-        ticket.phase = WakePhase::Armed;
-        assert!(!ticket.release_on_exit(Pid(2)));
-        ticket.phase = WakePhase::Fired(1);
         assert!(!ticket.release_on_exit(Pid(3)));
-        assert!(ticket.release_on_exit(Pid(2)));
+        ticket.phase = WakePhase::Armed;
+        assert!(!ticket.release_on_exit(Pid(3)));
+        ticket.phase = WakePhase::Fired(99);
+        assert!(!ticket.release_on_exit(Pid(2)));
+        assert!(ticket.release_on_exit(Pid(3)));
     }
 }

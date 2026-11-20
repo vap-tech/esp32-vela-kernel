@@ -9,8 +9,8 @@ pub const STATS: u32 = 5; // a0=writable user buffer, a1=byte len, a2=STATS_* se
 pub const STATS_SUMMARY: u32 = 0; // legacy summary (+ optional USB RX count)
 pub const STATS_BYTES: usize = 44; // 4*u32, 2*u64, 3*u32, little-endian
 pub const STATS_IRQ_BYTES: usize = STATS_BYTES + 8; // optional USB RX IRQ count at byte 44
-pub const STATS_CPU: u32 = 1; // hart, clocks, mcycle breakdown, capacity, IRQ latency
-pub const STATS_CPU_BYTES: usize = 56;
+pub const STATS_CPU: u32 = 1; // hart, clocks, mcycle breakdown, capacity, IRQ latency, DVFS/tickless
+pub const STATS_CPU_BYTES: usize = 72;
 pub const STATS_IRQ: u32 = 2; // u64 counts: systimer0, usb_rx, gdma_ahb_ch1, lp_sentinel
 pub const STATS_IRQ_ALL_BYTES: usize = 32;
 pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
@@ -84,6 +84,11 @@ pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot ind
 pub const IRQ_UNBIND: u32 = 40; // a0=bound event handle (CONTROL); mask line, wake waiters with -EPIPE, release slot
 pub const I2C_TRANSFER: u32 = 41; // a0=I2c handle (READ|WRITE), a1=7-bit addr, a2=tx_ptr, a3=tx_len (<=16), a4=rx_ptr, a5=rx_len (<=16) -> 0 / -errno
 pub const I2C_MAX_BYTES: usize = 16;
+pub const CLOCK_CONTROL: u32 = 42; // a0=Sentinel handle (CONTROL), a1=FREQ_MODE_* -> a0=active cpu_mhz, a1=active mode
+pub const FREQ_MODE_AUTO: u32 = 0; // DVFS idle governor: 180 MHz active, 40 MHz in tickless/prepared sleep
+pub const FREQ_MODE_40MHZ: u32 = 1; // Pin 40 MHz XTAL (rejected with -EBUSY while display/DMA active)
+pub const FREQ_MODE_180MHZ: u32 = 2; // Pin 180 MHz CPLL
+pub const FREQ_MODE_QUERY: u32 = 3; // Query current cpu_mhz and FREQ_MODE_* without changing policy
 
 pub const IRQ_SLOT_CONSOLE_RX: u32 = 0; // USB Serial/JTAG RX packet interrupt slot (CLIC line 18)
 
