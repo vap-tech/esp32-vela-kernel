@@ -289,6 +289,65 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<384>) -> u8 {
             out.push(b'\n');
             0
         }
+        b"/proc/sdcard" => {
+            let mut snap = [0u8; abi::STATS_SDCARD_BYTES];
+            if sys::call(
+                abi::STATS,
+                snap.as_mut_ptr() as u32,
+                abi::STATS_SDCARD_BYTES as u32,
+                abi::STATS_SDCARD,
+                0,
+            ) != 0
+            {
+                out.append(b"service unavailable\n");
+                return 2;
+            }
+            let flags = word_le(&snap, 0);
+            let ready = (flags & 1) != 0;
+            let sdhc = (flags & 2) != 0;
+            let verified = (flags & 4) != 0;
+            let provisioned = (flags & 8) != 0;
+            let ocr = word_le(&snap, 4);
+            let sectors = word_le(&snap, 8);
+            let asset_lba = word_le(&snap, 12);
+            let asset_bytes = word_le(&snap, 16);
+            let read_sectors = word_le(&snap, 20);
+            let written_sectors = word_le(&snap, 24);
+            let errors = word_le(&snap, 28);
+
+            out.append(b"bus spi_gpio39_44\nrail ldo_vo4_3300mv\nstate ");
+            out.append(if ready { b"ready" } else { b"uninitialized" });
+            out.append(b"\ntype ");
+            out.append(if !ready {
+                b"none"
+            } else if sdhc {
+                b"sdhc"
+            } else {
+                b"sdsc"
+            });
+            out.append(b"\nocr ");
+            out.hex32(ocr);
+            out.append(b"\nsectors ");
+            out.decimal(sectors);
+            out.append(b"\ncapacity_mib ");
+            out.decimal(sectors / 2048);
+            out.append(b"\nasset_lba ");
+            out.decimal(asset_lba);
+            out.append(b"\nasset_bytes ");
+            out.decimal(asset_bytes);
+            out.append(b"\nassets ");
+            out.append(if verified { b"verified" } else { b"unverified" });
+            out.append(b"\nprovisioned ");
+            out.decimal(u32::from(provisioned));
+            out.append(b"\nread_sectors ");
+            out.decimal(read_sectors);
+            out.append(b"\nwritten_sectors ");
+            out.decimal(written_sectors);
+            out.append(b"\nerrors ");
+            out.decimal(errors);
+            out.push(b'\n');
+            0
+        }
         _ => {
             out.append(b"procfs: no such file\n");
             1

@@ -9,10 +9,10 @@ use vela_kernel::{
 
 use super::Args;
 use crate::{
-    arch,
+    arch, board,
     dma::DMA_CH_GDMA_AHB_CH1,
     runtime::{IRQ_SLOT_CONSOLE_RX, Runtime},
-    syscall,
+    soc, syscall,
     usermem::{copy_to_user, copy_to_user_within},
 };
 
@@ -259,6 +259,33 @@ impl Runtime {
                     for (i, word) in words.into_iter().enumerate() {
                         buffer[base + i * 4..base + i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                     }
+                }
+                copy_to_user(self.memory(), ptr, &buffer)
+            }
+            syscall::STATS_SDCARD => {
+                if len != syscall::STATS_SDCARD_BYTES {
+                    return Err(Errno::Einval);
+                }
+                // SAFETY: sole HP0 owner under masked IRQs.
+                let sd = unsafe { soc::sdcard::telemetry() };
+                let asset = unsafe { board::images::status() };
+                let flags = u32::from(sd.ready)
+                    | (u32::from(sd.sdhc) << 1)
+                    | (u32::from(asset.verified) << 2)
+                    | (u32::from(asset.provisioned) << 3);
+                let words = [
+                    flags,
+                    sd.ocr,
+                    sd.sectors,
+                    asset.asset_lba,
+                    asset.asset_bytes,
+                    sd.read_sectors,
+                    sd.written_sectors,
+                    sd.errors,
+                ];
+                let mut buffer = [0u8; syscall::STATS_SDCARD_BYTES];
+                for (i, word) in words.into_iter().enumerate() {
+                    buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }
                 copy_to_user(self.memory(), ptr, &buffer)
             }

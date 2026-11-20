@@ -111,6 +111,7 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         "../user/src/sys.rs",
         "../user/src/arena.rs",
         "../user/src/ina226.rs",
+        "../user/src/sdcard.rs",
         "../user/src/bin/procfs.rs",
         "../user/src/bin/shell.rs",
         "../user/src/bin/console.rs",

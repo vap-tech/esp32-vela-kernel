@@ -1,5 +1,5 @@
 pub const NAME: &str = "M5Stack Tab5";
-mod images;
+pub mod images;
 mod st7121;
 
 use crate::soc::{
@@ -8,6 +8,7 @@ use crate::soc::{
     dsi,
     psram::{self, Probe as PsramProbe},
     scanout::{Scanout, Snapshot as ScanoutSnapshot},
+    sdcard::Probe as SdProbe,
 };
 use core::fmt;
 use vela_kernel::errno::Errno;
@@ -42,10 +43,24 @@ pub unsafe fn i2c_transfer(addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), Err
     unsafe { BUS.transfer_bytes(addr, tx, rx).map_err(|()| Errno::Eio) }
 }
 
+/// Probe the Tab5 microSD card and verify/provision the `VELAIMG1` asset bundle
+/// without changing the current MIPI-DSI display or framebuffer state.
+///
+/// # Safety
+/// Exclusive HP0 ownership of microSD SPI (`GPIO39..44`) and Flash staging ROM reads
+/// with machine interrupts masked.
+pub unsafe fn sdcard_probe() -> (Option<Diagnostic>, Result<u32, u32>) {
+    match unsafe { images::probe_and_verify() } {
+        Ok(probe) => (Some(Diagnostic::Sdcard(probe)), Ok(0)),
+        Err(code) => (None, Err(code)),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Diagnostic {
     Psram(PsramProbe),
     Scanout(ScanoutSnapshot),
+    Sdcard(SdProbe),
 }
 
 impl fmt::Display for Diagnostic {
@@ -53,6 +68,7 @@ impl fmt::Display for Diagnostic {
         match self {
             Self::Psram(probe) => probe.fmt(f),
             Self::Scanout(snapshot) => snapshot.fmt(f),
+            Self::Sdcard(probe) => probe.fmt(f),
         }
     }
 }
@@ -96,11 +112,9 @@ pub unsafe fn display_step(
         } else {
             &images::BOOT
         };
-        return (
-            None,
-            unsafe { images::draw_rows(image, frame_direct_base, usize::from(stage - 5) * 32, 32) }
-                .map(|()| 1),
-        );
+        let (sd_probe, res) =
+            unsafe { images::draw_rows(image, frame_direct_base, usize::from(stage - 5) * 32, 32) };
+        return (sd_probe.map(Diagnostic::Sdcard), res.map(|()| 1));
     }
     let stage = if mode >= 4 && stage >= 45 {
         stage - 40

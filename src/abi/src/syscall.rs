@@ -18,6 +18,8 @@ pub const STATS_STREAMS_BYTES: usize = 36;
 pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
 pub const STATS_TASK_WORDS: usize = 9;
 pub const STATS_TASKS_BYTES: usize = 8 * STATS_TASK_WORDS * 4;
+pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors
+pub const STATS_SDCARD_BYTES: usize = 32;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EINVAL: u32 = (-22i32) as u32;
@@ -66,7 +68,7 @@ pub const SENTINEL_ARM_WAKE: u32 = 32; // a0=Sentinel handle (WAIT), a1=1..60000
 pub const SENTINEL_WAIT_WAKE: u32 = 33; // a0=Sentinel handle (WAIT), a1=token (0=current) -> a0=token, a1=elapsed ticks
 pub const SENTINEL_CANCEL_WAKE: u32 = 34; // a0=Sentinel handle (WAIT), a1=token (0=current) -> ACK or EALREADY
 pub const SENTINEL_PREPARE_SLEEP: u32 = 35; // a0=Sentinel handle (WAIT | CONTROL), a1=ms -> wake token
-pub const DISPLAY_TEST: u32 = 36; // a0=Display handle (CONTROL), a1=mode (1..5 start, 0 step) -> delay ticks / 0 / -errno
+pub const DISPLAY_TEST: u32 = 36; // a0=Display handle (CONTROL), a1=mode (1..6 start, 0 step) -> delay ticks / 0 / -errno
 pub const IPC_REPLY_RECV: u32 = 37; // a0=reply token (0=skip), a1=reply buf, a2=reply len, a3=recv handle, a4=recv buf, a5=recv cap -> a0=len, a1=next token
 pub const IRQ_ACK: u32 = 38; // a0=event handle (ACK); clear pending notification and re-arm hardware IRQ source
 pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot index -> bound event handle

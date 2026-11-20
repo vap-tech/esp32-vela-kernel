@@ -6,6 +6,7 @@ pub mod dsi;
 pub mod flash;
 pub mod psram;
 pub mod scanout;
+pub mod sdcard;
 pub mod sentinel;
 pub mod timer;
 

@@ -132,6 +132,14 @@ impl DisplayControl {
         allocator: &mut RegionAllocator,
         dma: &mut DmaTable,
     ) -> (Option<board::Diagnostic>, Result<u32, Errno>) {
+        if arg == 6 {
+            // SAFETY: DisplayControl is owned by Runtime on HP0 with MIE=0.
+            let (diag, res) = unsafe { board::sdcard_probe() };
+            return match res {
+                Ok(v) => (diag, Ok(v)),
+                Err(code) => (diag, Ok(0u32.wrapping_sub(code))),
+            };
+        }
         if matches!(arg, 1..=5) {
             self.stop_scanout_and_release_dma(allocator, dma);
             if arg < 4 {
@@ -189,7 +197,7 @@ impl DisplayControl {
             Err(code) => {
                 self.stage = u8::MAX;
                 self.release_framebuffer(allocator, dma);
-                // Display driver returns board-specific diagnostic codes (1..18, 256..511),
+                // Display driver returns board-specific diagnostic codes (1..22, 256..511),
                 // encoded as negative integers directly in the DISPLAY_TEST ABI.
                 (diag, Ok(0u32.wrapping_sub(code)))
             }

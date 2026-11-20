@@ -429,11 +429,23 @@ fn command(line: &Buffer, caps: Caps) {
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | bench | run hello/pic/pic-psram/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
+                b"help | cat <path> | uptime | bench | sdcard | run hello/pic/pic-psram/dma | memtest | sentinel [hello/status/pause/resume/log/mark]\n",
             );
             sys::write(
                 b"sentinel wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot\n",
             );
+        }
+        b"sdcard" => {
+            let rc = sys::call(abi::DISPLAY_TEST, caps.display, 6, 0, 0);
+            if rc == 0 {
+                sys::write(b"microSD assets verified\n");
+            } else {
+                let mut out = Buffer::new();
+                out.append(b"sdcard error ");
+                out.decimal(0u32.wrapping_sub(rc));
+                out.push(b'\n');
+                sys::write(out.as_slice());
+            }
         }
         b"display test" | b"display orbit" | b"display pixel" | b"display diag"
         | b"display boot" => {

@@ -35,9 +35,10 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, ticks, measured `user_cycles`, preemptions and stack size. |
 | `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
 | `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
+| `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
-| `display diag` | Show the full-screen diagnostic image from PSRAM, in keyboard-down landscape. |
-| `display boot` | Show the Vela boot artwork from the same PSRAM framebuffer. |
+| `display diag` | Stream the full-screen diagnostic image from microSD into PSRAM, in keyboard-down landscape. |
+| `display boot` | Stream the Vela boot artwork from microSD into the PSRAM framebuffer. |
 | `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
 | `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
 | `memtest` | Check aligned userspace allocation, bounds, capability lookup and release across both internal SRAM and external PSRAM. |
@@ -92,6 +93,7 @@ Neither command enters PMU light/deep sleep.
 | Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` is enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Userspace `INA226` power driver (`I2C_TRANSFER`, `/proc/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
+| Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Raw LBA block access (`SD_ASSET_LBA = 2048` for `VELAIMG1` RLE streams); no FAT/VFS layer. |
 | Sentinel heartbeat, journal and wake events | Volatile LP state; HP startup resets LP. No PMU sleep/resume integration. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
 
@@ -367,54 +369,58 @@ source and 16-item source bursts removed those artifacts. Pixel and Orbit
 share the same zero source.
 
 
-### Full-screen graphics in PSRAM
+### Full-screen graphics from microSD in PSRAM
 
 `display diag` and `display boot` use the PNG masters in
 `vela_boot_and_display_assets`. During the build, `tools/display_assets.py`
 rotates each 1280×720 PNG counterclockwise into the 720×1280 scanout layout,
 placing the keyboard connector along the bottom edge,
 quantizes it to RGB565 and encodes little-endian (u16 count, u16 pixel)
-runs. The converter checks its output by an exact round trip. The run streams
-are packaged into a Flash-only area at 0x100000. Cargo includes their addresses,
-lengths, CRCs and expected header as small metadata.
+runs. The converter checks its output by an exact round trip. The 271920-byte
+`VELAIMG1` bundle (64-byte header + 87948-byte `DIAGNOSTIC` + 183908-byte `BOOT`
+RLE streams, 532 sectors) is stored on the Tab5 microSD card starting at `LBA 2048`
+(`1 MiB` offset). If a blank or unprovisioned microSD card is inserted, the
+microSD driver automatically stages the 532 sectors once from the Flash staging
+area (`0x100000`) onto the microSD card at `LBA 2048` and verifies both streams
+back from the card before rendering.
 
-The trusted driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
+The microSD driver (`src/platform/src/soc/sdcard.rs`) enables internal PMU
+`LDO_VO4` (`ext_ldo[4]`, `0x501151d8`/`0x501151dc`) at 3.3 V to power the
+`VDDPST_5` (`GPIO39..48`) domain, configures `GPIO43` (`CLK`), `GPIO44` (`CMD`/MOSI),
+`GPIO42` (`D3`/CS#) as push-pull outputs and `GPIO39..41` (`D0..D2`) as pulled-up
+inputs, and runs SD v2 / SDHC identification (`CMD0`, `CMD8`, `CMD59(1)` hardware
+CRC7 enable, `CMD55`+`ACMD41`, `CMD58` OCR, `CMD9` CSD capacity parsing). All
+512-byte sector reads (`CMD17`) and writes (`CMD24` + `CMD13` status check) verify
+16-bit `CRC16-CCITT` (`0x1021`) in software and on the card.
+
+The trusted display driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
 mode registers and verifies the selected chip's 32 MiB density. The link
 initializes at SPLL/12 = 40 MHz and uses SPLL/6 = 80 MHz for HEX x16 DDR.
 All 32 MiB (`0x88000000..0x8a000000`, `pages 0..512`) are managed as a unified
 64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM` and `run pic-psram`).
 When `display diag` or `display boot` starts, the display driver dynamically
 allocates a 2 MiB region from `RegionAllocator`, identity-maps its 32 MMU pages,
-renders the 1843200-byte framebuffer via the uncached `0x88xx_xxxx` alias, and
-binds `DW-GDMA CH0` (`InFlight`) reading the corresponding `0x48xx_xxxx` bus alias
-with one descriptor per frame and a four-frame ring. Switching back to `display test`,
-`display pixel` or `display orbit` stops scanout, releases the `InFlight` DMA hold
-and unmaps/frees the 2 MiB region so the full 32 MiB of PSRAM are available when full-screen PSRAM scanout is not active.
+streams 4 KiB (8-sector) RLE chunks from the microSD card into the 1843200-byte
+framebuffer via the uncached `0x88xx_xxxx` alias with full `CRC32` and pixel-count
+verification plus PSRAM readback, and binds `DW-GDMA CH0` (`InFlight`) reading
+the corresponding `0x48xx_xxxx` bus alias with one descriptor per frame and a
+four-frame ring. Switching back to `display test`, `display pixel` or `display orbit`
+stops scanout, releases the `InFlight` DMA hold and unmaps/frees the 2 MiB region
+so the full 32 MiB of PSRAM are available when full-screen PSRAM scanout is not active.
 
 The raster is expanded and read back in batches of 32 rows, yielding between
 batches. The framebuffer is written only after the previous scanout stops.
-Both full-screen images and their orientation were visually confirmed on
-Tab5. Startup checks passed 40 frames without recurring underrun, followed
-by shell/procfs, AHB DMA copy and healthy Sentinel with missed=0.
-Logs for Flash-backed rendering are `target/display-flash-diag.log` and
-`target/display-flash-boot.log`.
+Both full-screen images and their orientation were confirmed on Tab5 with an
+8 GB SDHC card (`ocr=0xc0ff8000`, `15646720` sectors / `7640 MiB`). Startup checks
+passed 40 frames without recurring underrun, followed by `/proc/sdcard`, `/proc/streams`,
+`/proc/power` and healthy Sentinel with missed=0.
 
-The RLE assets occupy 87948 + 183908 bytes in Flash, with a 64-byte
-versioned header. The build appends this area to the normal firmware image
-and checks Flash bounds, padding, stream pixel counts and CRCs. The runtime
-compares the header with the compiled metadata and checks the selected image's
-CRC before rendering. Source reads use a 4 KiB aligned stack buffer, reused
-for expansion and framebuffer readback. A separate validation reader also
-uses 4 KiB during the first row batch.
-
-Current SRAM payload is 123936 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 11552 bytes, leaving 291 KiB before the separate AHB DMA
-reservation. This frees 251 KiB compared with
-embedding the two images in SRAM. The ordinary SRAM Orbit buffer remains
-reserved for mode switching. The artwork is selected through the shell;
-startup still enters the USB shell.
+Current SRAM payload is 131624 bytes (including bundled service and test ELFs),
+SPM `.entry` (bootstrap + trap entry/exit) is 1352 bytes, and kernel BSS is 15712 bytes (including the 4 KiB aligned microSD stream chunk buffer).
+The artwork is selected through the shell; startup still enters the USB shell.
 
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
-13 an invalid image stream/range, 14 a framebuffer readback mismatch and
+13 an invalid image stream/range, 14 a framebuffer readback mismatch,
 15 a PSRAM command timeout, 16 a Flash read/range error, 17 an asset
-header mismatch and 18 an image CRC mismatch. Cached `L1-DCache` PSRAM mappings and Flash XIP remain separate work.
+header mismatch, 18 an image CRC mismatch, and 19–22 microSD init/read/CRC16/write
+errors. Cached `L1-DCache` PSRAM mappings and Flash XIP remain separate work.
