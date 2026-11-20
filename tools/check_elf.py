@@ -1,5 +1,4 @@
 """Check linked symbols/sections independently of the linker script."""
-import re
 import shutil
 import subprocess
 import sys
