@@ -1,0 +1,16 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "check": {
+          // Тесты no_std-крейтов запускаются на хосте (scripts/check.sh),
+          // а под riscv32 нет крейта `test`, поэтому --all-targets даёт ложные ошибки.
+          "allTargets": false
+        },
+        "cargo": {
+          "allTargets": false
+        }
+      }
+    }
+  }
+}
