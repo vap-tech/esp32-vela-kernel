@@ -817,11 +817,12 @@ fn command(line: &Buffer, caps: Caps) {
     }
     match text {
         b"help" => {
+            // Command names in bright cyan, arguments in the default colour.
             sys::write(
-                b"help | cat <path> | uptime | bench | smp [status/pin 0/pin 1/any] | freq [auto/40/180] | sdcard [bench [mib] [cmd_kib]] | i2cdetect [bus] | kbdled [auto/off/bright N/R G B] | run hello/pic/pic-psram/dma | memtest\n",
+                b"\x1b[96mhelp\x1b[0m | \x1b[96mcat\x1b[0m <path> | \x1b[96muptime\x1b[0m | \x1b[96mbench\x1b[0m | \x1b[96msmp\x1b[0m [status/pin 0/pin 1/any] | \x1b[96mfreq\x1b[0m [auto/40/180] | \x1b[96msdcard\x1b[0m [bench [mib] [cmd_kib]] | \x1b[96mi2cdetect\x1b[0m [bus] | \x1b[96mkbdled\x1b[0m [auto/off/bright N/R G B] | \x1b[96mrun\x1b[0m hello/pic/pic-psram/dma | \x1b[96mmemtest\x1b[0m\n",
             );
             sys::write(
-                b"sentinel [hello/status/pause/resume/log/mark] | sentinel sleep/wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",
+                b"\x1b[96msentinel\x1b[0m [hello/status/pause/resume/log/mark] | \x1b[96msentinel\x1b[0m sleep/wake/arm/prepare <ms> | \x1b[96msentinel\x1b[0m wait/cancel | \x1b[96mdisplay\x1b[0m test/orbit/pixel/diag/boot/off\n",
             );
         }
         b"display off" => {

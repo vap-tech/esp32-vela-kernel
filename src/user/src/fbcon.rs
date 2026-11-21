@@ -67,7 +67,16 @@ pub struct Console {
     /// Current SGR foreground (palette index 0..=7) and bold flag.
     pen: u8,
     bold: bool,
+    /// Characters of a `[tag]` at the start of the line seen so far (0 = not in a tag) and
+    /// their hash; the tag is coloured when its `]` arrives.
+    tag_len: u8,
+    tag_hash: u32,
 }
+
+/// Longest tag (with brackets) that is coloured.
+const MAX_TAG: u8 = 16;
+/// Palette indices a tag can get: the bright colours except red, which reads as an error.
+const TAG_COLORS: [u8; 5] = [10, 11, 12, 13, 14];
 
 impl Default for Console {
     fn default() -> Self {
@@ -90,6 +99,8 @@ impl Console {
             nparams: 0,
             pen: DEFAULT_COLOR,
             bold: false,
+            tag_len: 0,
+            tag_hash: 0,
         }
     }
 
@@ -116,7 +127,10 @@ impl Console {
             }
             match byte {
                 b'\n' => self.newline(),
-                b'\r' => self.col = 0,
+                b'\r' => {
+                    self.col = 0;
+                    self.tag_len = 0;
+                }
                 0x08 => self.col = self.col.min(COLS).saturating_sub(1),
                 b'\t' => {
                     let stop = (self.col / TAB + 1) * TAB;
@@ -228,7 +242,28 @@ impl Console {
         }
         self.cells[self.row][self.col] = byte;
         self.colors[self.row][self.col] = self.pen_color();
+        self.track_tag(byte);
         self.col += 1;
+    }
+
+    /// Colour a `[tag]` that opens a line (kernel and service log prefixes) by its name, unless
+    /// the text already has an explicit colour. Called with the cell at `col` just written.
+    fn track_tag(&mut self, byte: u8) {
+        if self.col == 0 && byte == b'[' && self.pen == DEFAULT_COLOR && !self.bold {
+            self.tag_len = 1;
+            self.tag_hash = 5381;
+        } else if self.tag_len > 0 {
+            if byte == b']' {
+                let color = TAG_COLORS[(self.tag_hash % TAG_COLORS.len() as u32) as usize];
+                self.colors[self.row][..=self.col].fill(color);
+                self.tag_len = 0;
+            } else if self.tag_len >= MAX_TAG || !byte.is_ascii_graphic() {
+                self.tag_len = 0;
+            } else {
+                self.tag_hash = self.tag_hash.wrapping_mul(33).wrapping_add(u32::from(byte));
+                self.tag_len += 1;
+            }
+        }
     }
 
     fn newline(&mut self) {
@@ -241,6 +276,7 @@ impl Console {
             self.colors.copy_within(1.., 0);
             self.colors[ROWS - 1] = [DEFAULT_COLOR; COLS];
         }
+        self.tag_len = 0;
     }
 
     /// Draw every cell whose picture changed. Returns how many cells were drawn.
@@ -512,5 +548,29 @@ mod tests {
         assert_eq!(console.cell(0, 0), b'x');
         assert_eq!(console.cell(1, 0), b'y');
         assert_eq!(console.cell(2, 0), b'z');
+    }
+
+    #[test]
+    fn log_tags_get_a_stable_colour_and_the_message_stays_default() {
+        let mut console = Console::new();
+        console.write(b"[kbd] hello\r\n[kbd] again\r\n[psram] x\r\n");
+        let tag = console.color(0, 0);
+        assert!(TAG_COLORS.contains(&tag));
+        for col in 0..5 {
+            assert_eq!(console.color(col, 0), tag, "all of [kbd] shares a colour");
+            assert_eq!(console.color(col, 1), tag, "same tag, same colour");
+        }
+        assert_eq!(console.color(5, 0), 7, "the space after the tag");
+        assert_eq!(console.color(6, 0), 7, "the message");
+        assert!(TAG_COLORS.contains(&console.color(0, 2)));
+    }
+
+    #[test]
+    fn tags_only_count_at_the_start_of_a_line_and_not_over_explicit_colours() {
+        let mut console = Console::new();
+        console.write(b"x [mid] \x1b[31m\r\n[red]\x1b[0m\r\n[ no end\r\n");
+        assert_eq!(console.color(2, 0), 7, "not at the line start");
+        assert_eq!(console.color(0, 1), 1, "an explicit colour wins");
+        assert_eq!(console.color(0, 2), 7, "an unterminated tag stays default");
     }
 }
