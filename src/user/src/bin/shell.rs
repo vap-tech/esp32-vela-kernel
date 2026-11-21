@@ -816,7 +816,7 @@ fn command(line: &Buffer, caps: Caps) {
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | bench | smp [status/pin 0/pin 1/any] | freq [auto/40/180] | sdcard [bench [mib] [cmd_kib]] | i2cdetect [bus] | run hello/pic/pic-psram/dma | memtest\n",
+                b"help | cat <path> | uptime | bench | smp [status/pin 0/pin 1/any] | freq [auto/40/180] | sdcard [bench [mib] [cmd_kib]] | i2cdetect [bus] | kbdled [auto/off/bright N/R G B] | run hello/pic/pic-psram/dma | memtest\n",
             );
             sys::write(
                 b"sentinel [hello/status/pause/resume/log/mark] | sentinel sleep/wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",
@@ -979,6 +979,14 @@ fn command(line: &Buffer, caps: Caps) {
         b"bench" => run_bench(caps.request),
         b"uptime" => read_file(b"/proc/uptime", caps.request),
         b"i2cdetect" => read_file(b"/proc/i2c", caps.request),
+        b"kbdled" => read_file(b"/ctl/kbdled", caps.request),
+        _ if text.starts_with(b"kbdled ") => {
+            // The arguments travel to procfs inside the path: `/ctl/kbdled <args>`.
+            let mut path = TextBuf::<96>::new();
+            path.append(b"/ctl/");
+            path.append(text);
+            read_file(path.as_slice(), caps.request);
+        }
         _ if text.starts_with(b"i2cdetect ") => {
             // `i2cdetect N` scans bus N through its device node `/dev/i2c-N`.
             let mut path = *b"/dev/i2c-?";

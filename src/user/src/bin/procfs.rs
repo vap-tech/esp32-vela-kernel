@@ -2,7 +2,7 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, div64, dword_le, i2c, ina226, sys, word_le};
+use vela_user::{Buffer, TextBuf, div64, dword_le, i2c, ina226, kbd, sys, word_le};
 
 vela_user::entry!(main);
 
@@ -44,6 +44,42 @@ impl I2cCaps {
             _ => None,
         }
     }
+}
+
+/// `kbdled [args]`: show or change the keyboard's RGB LEDs. Returns the status code.
+fn kbd_led(args: &[u8], ext1: u32, out: &mut TextBuf<512>) -> u8 {
+    let mut bus = kbd::SysBus(ext1);
+    let has_args = args.iter().any(|&c| c != b' ');
+    if has_args {
+        let Some(command) = kbd::parse_led_command(args) else {
+            out.append(b"kbd led: bad arguments (auto | off | bright 0..100 | R G B [R G B])\n");
+            return 1;
+        };
+        if kbd::apply_led(&mut bus, command).is_err() {
+            out.append(b"kbd led: no keyboard\n");
+            return 2;
+        }
+    }
+    let Ok(status) = kbd::read_led_status(&mut bus) else {
+        out.append(b"kbd led: no keyboard\n");
+        return 2;
+    };
+    out.append(if status.custom {
+        b"kbd led: mode=custom bright="
+    } else {
+        b"kbd led: mode=auto bright="
+    });
+    out.decimal(u32::from(status.brightness));
+    for (index, color) in status.colors.iter().enumerate() {
+        out.append(if index == 0 { b" rgb1=" } else { b" rgb2=" });
+        for channel in [color.r, color.g, color.b] {
+            for nibble in [channel >> 4, channel & 15] {
+                out.push(b"0123456789abcdef"[usize::from(nibble)]);
+            }
+        }
+    }
+    out.push(b'\n');
+    0
 }
 
 fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
@@ -481,6 +517,10 @@ fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
                 i2c::render_bus_line(out, info);
             }
             0
+        }
+        _ if path == b"/ctl/kbdled" || path.starts_with(b"/ctl/kbdled ") => {
+            let args = path.get(12..).unwrap_or(&[]);
+            kbd_led(args, i2c.ext1, out)
         }
         _ if i2c::bus_from_dev_path(path).is_some() => {
             let id = i2c::bus_from_dev_path(path).unwrap_or(0);

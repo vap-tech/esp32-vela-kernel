@@ -20,7 +20,14 @@ pub const ADDR: u8 = 0x6d;
 pub const REG_INT_CFG: u8 = 0x00;
 pub const REG_INT_STA: u8 = 0x01;
 pub const REG_EVENT_NUM: u8 = 0x02;
+pub const REG_BRIGHTNESS: u8 = 0x03;
 pub const REG_MODE: u8 = 0x10;
+/// RGB working mode, next to the keyboard mode register.
+pub const REG_RGB_MODE: u8 = 0x11;
+/// `RGB1_B, RGB1_G, RGB1_R, RGB2_B, RGB2_G, RGB2_R`, used in custom RGB mode only.
+pub const REG_RGB1: u8 = 0x60;
+/// The protocol table leaves one empty column between the two colour triples.
+pub const REG_RGB2: u8 = 0x64;
 pub const REG_CHAR_LEN: u8 = 0x40;
 pub const REG_CHAR_EVENT: u8 = 0x50;
 pub const REG_F0: u8 = 0xf0;
@@ -28,6 +35,10 @@ pub const REG_F0: u8 = 0xf0;
 pub const MODE_CHARACTER: u8 = 2;
 /// INT_CFG bit 2: interrupt only for Character-mode events.
 pub const INT_CHARACTER: u8 = 0x04;
+
+pub const RGB_BINDING: u8 = 0;
+pub const RGB_CUSTOM: u8 = 1;
+pub const MAX_BRIGHTNESS: u8 = 100;
 
 pub const MOD_CTRL: u8 = 1 << 0;
 pub const MOD_ALT: u8 = 1 << 2;
@@ -126,6 +137,124 @@ pub fn poll<B: Bus>(bus: &mut B) -> Result<Poll, i32> {
     }))
 }
 
+/// A colour, as the protocol document orders the channels in the register (`B, G, R`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedCommand {
+    /// Firmware-driven indication (the Aa/Sym state).
+    Auto,
+    /// Overall RGB brightness, `0..=MAX_BRIGHTNESS`.
+    Brightness(u8),
+    /// Fixed colours for the two LEDs.
+    Colors([Rgb; 2]),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LedStatus {
+    pub custom: bool,
+    pub brightness: u8,
+    pub colors: [Rgb; 2],
+}
+
+fn parse_number(word: &[u8]) -> Option<u32> {
+    if word.is_empty() || word.len() > 3 {
+        return None;
+    }
+    word.iter().try_fold(0u32, |n, &c| {
+        c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'))
+    })
+}
+
+/// Parse the argument text of the `kbdled` command:
+/// `auto`, `off`, `bright N`, `R G B` (both LEDs) or `R G B R G B`.
+/// Returns `None` for an empty string (a status request) and for anything malformed.
+pub fn parse_led_command(args: &[u8]) -> Option<LedCommand> {
+    let mut words = [&[][..]; 7];
+    let mut count = 0;
+    for word in args.split(|&c| c == b' ').filter(|w| !w.is_empty()) {
+        *words.get_mut(count)? = word;
+        count += 1;
+    }
+    let words = &words[..count];
+    match words {
+        [b"auto"] => Some(LedCommand::Auto),
+        [b"off"] => Some(LedCommand::Colors([Rgb { r: 0, g: 0, b: 0 }; 2])),
+        [b"bright", n] => {
+            let n = u8::try_from(parse_number(n)?).ok()?;
+            (n <= MAX_BRIGHTNESS).then_some(LedCommand::Brightness(n))
+        }
+        [_, _, _] | [_, _, _, _, _, _] => {
+            let mut channel = [0u8; 6];
+            for (slot, word) in channel.iter_mut().zip(words) {
+                *slot = u8::try_from(parse_number(word)?).ok()?;
+            }
+            let first = Rgb {
+                r: channel[0],
+                g: channel[1],
+                b: channel[2],
+            };
+            let second = if count == 6 {
+                Rgb {
+                    r: channel[3],
+                    g: channel[4],
+                    b: channel[5],
+                }
+            } else {
+                first
+            };
+            Some(LedCommand::Colors([first, second]))
+        }
+        _ => None,
+    }
+}
+
+/// Apply a LED command. Colours are written before custom mode is selected, so the LEDs
+/// never flash a stale colour.
+pub fn apply_led<B: Bus>(bus: &mut B, command: LedCommand) -> Result<(), i32> {
+    match command {
+        LedCommand::Auto => bus.transfer(&[REG_RGB_MODE, RGB_BINDING], &mut []),
+        LedCommand::Brightness(n) => bus.transfer(&[REG_BRIGHTNESS, n], &mut []),
+        LedCommand::Colors([a, b]) => {
+            bus.transfer(&[REG_RGB1, a.b, a.g, a.r], &mut [])?;
+            bus.transfer(&[REG_RGB2, b.b, b.g, b.r], &mut [])?;
+            bus.transfer(&[REG_RGB_MODE, RGB_CUSTOM], &mut [])
+        }
+    }
+}
+
+pub fn read_led_status<B: Bus>(bus: &mut B) -> Result<LedStatus, i32> {
+    let mut brightness = [0u8];
+    let mut mode = [0u8];
+    let mut first = [0u8; 3];
+    let mut second = [0u8; 3];
+    bus.transfer(&[REG_BRIGHTNESS], &mut brightness)?;
+    bus.transfer(&[REG_RGB_MODE], &mut mode)?;
+    bus.transfer(&[REG_RGB1], &mut first)?;
+    bus.transfer(&[REG_RGB2], &mut second)?;
+    Ok(LedStatus {
+        custom: mode[0] == RGB_CUSTOM,
+        brightness: brightness[0],
+        colors: [
+            Rgb {
+                r: first[2],
+                g: first[1],
+                b: first[0],
+            },
+            Rgb {
+                r: second[2],
+                g: second[1],
+                b: second[0],
+            },
+        ],
+    })
+}
+
 /// Keys the firmware reports as words, and the bytes the shell expects for them.
 const NAMED_KEYS: [(&[u8], &[u8]); 8] = [
     (b"enter", b"\r"),
@@ -176,6 +305,9 @@ mod tests {
         queue: [Option<(u8, [u8; MAX_CHARS], u8)>; 8],
         flushes: u32,
         reads_of_50: u32,
+        brightness: u8,
+        rgb_mode: u8,
+        rgb: [u8; 6],
     }
 
     impl Fake {
@@ -187,6 +319,9 @@ mod tests {
                 queue: [None; 8],
                 flushes: 0,
                 reads_of_50: 0,
+                brightness: 20,
+                rgb_mode: 0,
+                rgb: [0; 6],
             }
         }
         /// Queue a key the way the firmware does: the string plus one trailing byte, which
@@ -216,6 +351,18 @@ mod tests {
                     self.flushes += 1;
                 }
                 [REG_INT_STA, 0] => {}
+                [REG_BRIGHTNESS, v] => self.brightness = *v,
+                [REG_RGB_MODE, v] => self.rgb_mode = *v,
+                [REG_RGB1, colors @ ..] if colors.len() == 3 => {
+                    self.rgb[..3].copy_from_slice(colors);
+                }
+                [REG_RGB2, colors @ ..] if colors.len() == 3 => {
+                    self.rgb[3..].copy_from_slice(colors);
+                }
+                [REG_BRIGHTNESS] => rx[0] = self.brightness,
+                [REG_RGB_MODE] => rx[0] = self.rgb_mode,
+                [REG_RGB1] => rx.copy_from_slice(&self.rgb[..3]),
+                [REG_RGB2] => rx.copy_from_slice(&self.rgb[3..]),
                 [REG_F0] => rx[0] = 0x07,
                 [REG_MODE] => rx[0] = self.mode,
                 [REG_CHAR_LEN] => rx[0] = self.head_len(),
@@ -361,5 +508,81 @@ mod tests {
         assert_eq!(tr(&mut Fake::new(), 0, &[0x80]), None);
         assert_eq!(tr(&mut Fake::new(), 0, &[0x00]), None);
         assert_eq!(tr(&mut Fake::new(), 0, b""), None);
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> Rgb {
+        Rgb { r, g, b }
+    }
+
+    #[test]
+    fn led_commands_parse() {
+        let colors = |a, b| Some(LedCommand::Colors([a, b]));
+        assert_eq!(parse_led_command(b"auto"), Some(LedCommand::Auto));
+        assert_eq!(
+            parse_led_command(b"off"),
+            colors(rgb(0, 0, 0), rgb(0, 0, 0))
+        );
+        assert_eq!(
+            parse_led_command(b"bright 40"),
+            Some(LedCommand::Brightness(40))
+        );
+        assert_eq!(
+            parse_led_command(b" 255   0 16 "),
+            colors(rgb(255, 0, 16), rgb(255, 0, 16))
+        );
+        assert_eq!(
+            parse_led_command(b"1 2 3 4 5 6"),
+            colors(rgb(1, 2, 3), rgb(4, 5, 6))
+        );
+    }
+
+    #[test]
+    fn malformed_led_commands_are_rejected() {
+        for bad in [
+            &b""[..],
+            b"bright",
+            b"bright 101",
+            b"bright x",
+            b"256 0 0",
+            b"1 2",
+            b"1 2 3 4",
+            b"1 2 3 4 5 6 7",
+            b"-1 0 0",
+            b"red",
+            b"auto now",
+            b"1234 0 0",
+        ] {
+            assert_eq!(parse_led_command(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn colors_are_written_in_bgr_order_before_custom_mode() {
+        let mut kb = Fake::new();
+        apply_led(&mut kb, LedCommand::Colors([rgb(1, 2, 3), rgb(4, 5, 6)])).unwrap();
+        assert_eq!(kb.rgb, [3, 2, 1, 6, 5, 4]);
+        assert_eq!(kb.rgb_mode, RGB_CUSTOM);
+        let status = read_led_status(&mut kb).unwrap();
+        assert_eq!(status.colors, [rgb(1, 2, 3), rgb(4, 5, 6)]);
+        assert!(status.custom);
+    }
+
+    #[test]
+    fn auto_and_brightness_touch_only_their_registers() {
+        let mut kb = Fake::new();
+        apply_led(&mut kb, LedCommand::Brightness(55)).unwrap();
+        assert_eq!((kb.brightness, kb.rgb_mode), (55, 0));
+        apply_led(&mut kb, LedCommand::Colors([rgb(9, 9, 9); 2])).unwrap();
+        apply_led(&mut kb, LedCommand::Auto).unwrap();
+        assert_eq!(kb.rgb_mode, RGB_BINDING);
+        assert_eq!(read_led_status(&mut kb).unwrap().brightness, 55);
+    }
+
+    #[test]
+    fn led_commands_report_a_missing_keyboard() {
+        let mut kb = Fake::new();
+        kb.present = false;
+        assert_eq!(apply_led(&mut kb, LedCommand::Auto), Err(-6));
+        assert_eq!(read_led_status(&mut kb), Err(-6));
     }
 }
