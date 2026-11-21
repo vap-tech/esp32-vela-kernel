@@ -221,7 +221,8 @@ mod tests {
                 [REG_CHAR_LEN] => rx[0] = self.head_len(),
                 [REG_CHAR_EVENT] => {
                     self.reads_of_50 += 1;
-                    let (m, chars, len) = self.queue[0].take().expect("read of an empty queue");
+                    let (m, chars, len) =
+                        Option::take(&mut self.queue[0]).expect("read of an empty queue");
                     assert_eq!(rx.len(), usize::from(len) + 1, "read must be length + 1");
                     rx[0] = m;
                     rx[1..].copy_from_slice(&chars[..usize::from(len)]);
