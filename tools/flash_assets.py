@@ -1,4 +1,5 @@
 """Pack and validate display RLE data in a fixed Flash asset area."""
+
 from pathlib import Path
 import struct
 import sys
@@ -51,7 +52,7 @@ def verify_bundle(data):
         address, length, crc = struct.unpack_from("<III", data, 16 + i * 12)
         if address != FLASH_ADDRESS + position or address + length > FLASH_SIZE:
             raise ValueError("asset address range")
-        stream = data[position:position + length]
+        stream = data[position : position + length]
         if len(stream) != length or zlib.crc32(stream) != crc:
             raise ValueError("asset CRC/length")
         validate_stream(stream)
@@ -71,7 +72,7 @@ def attach(firmware, assets, flash_base):
 if __name__ == "__main__":
     firmware, assets = map(Path, sys.argv[1:])
     from image import FLASH_BASE
+
     data = assets.read_bytes()
     firmware.write_bytes(attach(firmware.read_bytes(), data, FLASH_BASE))
     print(f"Display assets: Flash={FLASH_ADDRESS:#x}, bytes={len(data)}, CRCs validated")
-

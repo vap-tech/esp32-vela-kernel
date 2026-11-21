@@ -1,11 +1,12 @@
 """Regenerate the 64x64 alpha coverage asset with the system librsvg renderer."""
+
 from pathlib import Path
 
 import cairo
 import gi
 
 gi.require_version("Rsvg", "2.0")
-from gi.repository import Rsvg
+from gi.repository import Rsvg  # pyright: ignore[reportAttributeAccessIssue]  # PyGObject: нет стабов
 
 root = Path(__file__).resolve().parents[1]
 panel = Rsvg.Handle.new_from_file(str(root / "orbit.svg"))

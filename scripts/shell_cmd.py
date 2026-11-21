@@ -5,6 +5,7 @@ usage: scripts/shell_cmd.py [-t SECONDS] [-w BOOT_WAIT] [--reset] CMD [CMD ...]
 Each CMD waits for the next `vela:/$ ` prompt (or SECONDS timeout).
 --reset pulses RTS (EN) with DTR low (GPIO0 high => normal boot) and logs the boot.
 """
+
 import argparse
 import fcntl
 import os

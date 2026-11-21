@@ -14,11 +14,11 @@ def solid(pixel):
 class FlashAssetTests(unittest.TestCase):
     def firmware(self):
         header = bytearray(24)
-        header[0] = 0xe9
+        header[0] = 0xE9
         header[23] = 1
         struct.pack_into("<I", header, 4, 0x30100000)
         struct.pack_into("<H", header, 12, 18)
-        return pack(make_rom(header, [(0x30100000, BINDING), (0x4ff40000, b"abcd")]))
+        return pack(make_rom(header, [(0x30100000, BINDING), (0x4FF40000, b"abcd")]))
 
     def test_asset_image_and_corruption(self):
         firmware = self.firmware()

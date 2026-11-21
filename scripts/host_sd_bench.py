@@ -6,12 +6,13 @@ Opens the block device via UDisks2 (no root needed for removable media).
 
 usage: scripts/host_sd_bench.py [DEV=sda] [MIB=100] [CHUNK_KIB=32]
 """
+
 import mmap
 import os
 import sys
 import time
 
-from gi.repository import Gio, GLib
+from gi.repository import Gio, GLib  # pyright: ignore[reportAttributeAccessIssue]  # PyGObject: нет стабов
 
 dev = sys.argv[1] if len(sys.argv) > 1 else "sda"
 mib = int(sys.argv[2]) if len(sys.argv) > 2 else 100
@@ -20,9 +21,14 @@ OFFSET = 16384 * 512
 
 bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
 proxy = Gio.DBusProxy.new_sync(
-    bus, 0, None, "org.freedesktop.UDisks2",
+    bus,
+    0,
+    None,
+    "org.freedesktop.UDisks2",
     f"/org/freedesktop/UDisks2/block_devices/{dev}",
-    "org.freedesktop.UDisks2.Block", None)
+    "org.freedesktop.UDisks2.Block",
+    None,
+)
 size = proxy.get_cached_property("Size").get_uint64()
 if size > 64 << 30:
     sys.exit("refusing: device larger than 64 GiB")
@@ -30,8 +36,13 @@ if size > 64 << 30:
 
 def open_dev(flags):
     res, fds = proxy.call_with_unix_fd_list_sync(
-        "OpenDevice", GLib.Variant("(sa{sv})", ("rw", {"flags": GLib.Variant("i", flags)})),
-        0, -1, None, None)
+        "OpenDevice",
+        GLib.Variant("(sa{sv})", ("rw", {"flags": GLib.Variant("i", flags)})),
+        0,
+        -1,
+        None,
+        None,
+    )
     return fds.get(res.unpack()[0])
 
 
@@ -56,6 +67,8 @@ for i, off in enumerate(range(0, total, chunk)):
         bad += 1
 tr = time.perf_counter() - t0
 os.close(fd)
-print(f"[host-bench] dev={dev} size={mib}MiB chunk={chunk // 1024}KiB "
-      f"write={tw * 1000:.0f}ms ({mib / tw:.2f}MiB/s) "
-      f"read={tr * 1000:.0f}ms ({mib / tr:.2f}MiB/s) verify={'ok' if not bad else f'BAD({bad})'}")
+print(
+    f"[host-bench] dev={dev} size={mib}MiB chunk={chunk // 1024}KiB "
+    f"write={tw * 1000:.0f}ms ({mib / tw:.2f}MiB/s) "
+    f"read={tr * 1000:.0f}ms ({mib / tr:.2f}MiB/s) verify={'ok' if not bad else f'BAD({bad})'}"
+)

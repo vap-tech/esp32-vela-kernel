@@ -1,0 +1,23 @@
+# Только конфигурация инструментов (ruff, basedpyright). Пакет не собирается.
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+# Компактный стиль `if x: y` / `a; b` в tools/ принят в проекте.
+ignore = ["E501", "E701", "E702", "UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# sys.path правится до импорта соседних модулей.
+"tools/orbit_asset.py" = ["E402"]
+
+[tool.basedpyright]
+include = ["scripts", "tools"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+# Скрипты запускаются напрямую, соседние модули в tools/ импортируются как top-level.
+extraPaths = ["tools"]
+reportImplicitRelativeImport = false
+reportMissingParameterType = false
+reportUnusedCallResult = false
