@@ -7,6 +7,8 @@ use vela_user::{Buffer, TextBuf, arena::Arena, sys, term::EscapeFilter, word_le}
 vela_user::entry!(main);
 
 const FAILED: &[u8] = b"service unavailable\n";
+/// Bold green; the trailing space stays inside the colour so `vela:/$ ` is still a plain substring.
+const PROMPT: &[u8] = b"\x1b[1;32mvela:/$ \x1b[0m";
 
 #[derive(Clone, Copy)]
 struct Caps {
@@ -1001,7 +1003,7 @@ fn command(line: &Buffer, caps: Caps) {
         _ if text.len() > 4 && text.starts_with(b"cat ") => {
             read_file(&text[4..], caps.request);
         }
-        _ => sys::write(b"unknown command (try help)\n"),
+        _ => sys::write(b"\x1b[31munknown command (try help)\x1b[0m\n"),
     }
 }
 
@@ -1023,7 +1025,7 @@ fn main(
     let mut skip_lf = false;
     let mut overflow = false;
     let mut escapes = EscapeFilter::new();
-    sys::write(b"vela:/$ ");
+    sys::write(PROMPT);
     loop {
         let mut input = Buffer::new();
         if !input.receive(input_handle) {
@@ -1048,7 +1050,7 @@ fn main(
                 }
                 line.clear();
                 overflow = false;
-                sys::write(b"vela:/$ ");
+                sys::write(PROMPT);
             } else if byte == 8 || byte == 127 {
                 if line.pop() {
                     sys::write(b"\x08 \x08");

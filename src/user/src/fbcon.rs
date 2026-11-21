@@ -8,7 +8,7 @@
 //! The grid is 80x22 (the shell's line limit is 80 columns). Only cells that changed since the
 //! last [`Console::render`] are drawn, so scrolling a mostly blank screen is cheap.
 
-use crate::{font, term::EscapeFilter};
+use crate::font;
 
 pub const FB_W: usize = 720;
 pub const FB_H: usize = 1280;
@@ -19,8 +19,17 @@ pub const CELL_H: usize = font::GLYPH_H;
 /// Blank rows above the grid so the 704 px of text sit centred in the 720 px height.
 const TOP: usize = (FB_W - ROWS * CELL_H) / 2;
 
+/// Default text colour (palette index 7) and background.
 pub const FG: u16 = 0xdefb;
 pub const BG: u16 = 0x0000;
+const DEFAULT_COLOR: u8 = 7;
+
+/// The 16 ANSI colours (RGB565): 0-7 normal, 8-15 bright. Index 0 is a dark grey so black
+/// text stays readable on the black background.
+pub const PALETTE: [u16; 16] = [
+    0x4208, 0xc986, 0x3648, 0xd5a5, 0x4b7c, 0xca99, 0x3e59, FG, // normal
+    0x7bef, 0xfa8a, 0x5fed, 0xff6b, 0x7d1f, 0xfbdf, 0x6fff, 0xffff, // bright
+];
 
 const TAB: usize = 8;
 const CURSOR: u16 = 0x100;
@@ -28,13 +37,32 @@ const CURSOR: u16 = 0x100;
 /// Words of 2 packed pixels (even pixel in the low half) covering the whole panel.
 pub const FB_WORDS: usize = FB_W * FB_H / 2;
 
+/// Escape-sequence parser state (`ESC [ params final`; `ESC O x` and others are dropped).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Esc {
+    Text,
+    Escape,
+    Csi,
+    Ss3,
+}
+
+const MAX_PARAMS: usize = 8;
+
 pub struct Console {
     cells: [[u8; COLS]; ROWS],
-    /// What the framebuffer currently shows: character, plus [`CURSOR`] for the cursor cell.
+    /// Palette index of each cell's text.
+    colors: [[u8; COLS]; ROWS],
+    /// What the framebuffer currently shows: character, [`CURSOR`] for the cursor cell and
+    /// the palette index in bits 9..12.
     drawn: [[u16; COLS]; ROWS],
     col: usize,
     row: usize,
-    escape: EscapeFilter,
+    esc: Esc,
+    params: [u16; MAX_PARAMS],
+    nparams: usize,
+    /// Current SGR foreground (palette index 0..=7) and bold flag.
+    pen: u8,
+    bold: bool,
 }
 
 impl Default for Console {
@@ -49,10 +77,15 @@ impl Console {
     pub const fn new() -> Self {
         Self {
             cells: [[b' '; COLS]; ROWS],
-            drawn: [[b' ' as u16; COLS]; ROWS],
+            colors: [[DEFAULT_COLOR; COLS]; ROWS],
+            drawn: [[b' ' as u16 | (DEFAULT_COLOR as u16) << 9; COLS]; ROWS],
             col: 0,
             row: 0,
-            escape: EscapeFilter::new(),
+            esc: Esc::Text,
+            params: [0; MAX_PARAMS],
+            nparams: 0,
+            pen: DEFAULT_COLOR,
+            bold: false,
         }
     }
 
@@ -65,11 +98,16 @@ impl Console {
         self.cells[row][col]
     }
 
-    /// Feed terminal output: printable ASCII, `\n`, `\r`, backspace and tab. ANSI escape
-    /// sequences and other control bytes are dropped.
+    /// Palette index of the text in a cell.
+    pub fn color(&self, col: usize, row: usize) -> u8 {
+        self.colors[row][col]
+    }
+
+    /// Feed terminal output: printable ASCII, `\n`, `\r`, backspace and tab, and the ANSI
+    /// colour sequence `ESC [ ... m` (SGR). Other escape sequences and control bytes are dropped.
     pub fn write(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if self.escape.swallow(byte) {
+            if self.escape(byte) {
                 continue;
             }
             match byte {
@@ -88,12 +126,104 @@ impl Console {
         }
     }
 
+    /// Returns `true` when `byte` belongs to an escape sequence.
+    fn escape(&mut self, byte: u8) -> bool {
+        match self.esc {
+            Esc::Text => {
+                if byte == 0x1b {
+                    self.esc = Esc::Escape;
+                    return true;
+                }
+                false
+            }
+            Esc::Escape => match byte {
+                b'[' => {
+                    self.esc = Esc::Csi;
+                    self.params = [0; MAX_PARAMS];
+                    self.nparams = 0;
+                    true
+                }
+                b'O' => {
+                    self.esc = Esc::Ss3;
+                    true
+                }
+                0x1b => true,
+                _ => {
+                    self.esc = Esc::Text;
+                    false
+                }
+            },
+            Esc::Csi => {
+                match byte {
+                    b'0'..=b'9' => {
+                        if self.nparams == 0 {
+                            self.nparams = 1;
+                        }
+                        let p = &mut self.params[self.nparams - 1];
+                        *p = p.saturating_mul(10).saturating_add(u16::from(byte - b'0'));
+                    }
+                    b';' => {
+                        if self.nparams == 0 {
+                            self.nparams = 1;
+                        }
+                        if self.nparams < MAX_PARAMS {
+                            self.nparams += 1;
+                        }
+                    }
+                    0x40..=0x7e => {
+                        if byte == b'm' {
+                            self.sgr();
+                        }
+                        self.esc = Esc::Text;
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Esc::Ss3 => {
+                self.esc = Esc::Text;
+                true
+            }
+        }
+    }
+
+    /// Apply the collected SGR parameters: reset, bold and the 16 foreground colours.
+    fn sgr(&mut self) {
+        if self.nparams == 0 {
+            self.nparams = 1; // `ESC [ m` is `ESC [ 0 m`
+        }
+        for i in 0..self.nparams {
+            match self.params[i] {
+                0 => {
+                    self.pen = DEFAULT_COLOR;
+                    self.bold = false;
+                }
+                1 => self.bold = true,
+                22 => self.bold = false,
+                n @ 30..=37 => self.pen = (n - 30) as u8,
+                39 => self.pen = DEFAULT_COLOR,
+                n @ 90..=97 => self.pen = (n - 90) as u8 + 8,
+                _ => {}
+            }
+        }
+    }
+
+    /// Palette index for new text: bold brightens the eight normal colours.
+    fn pen_color(&self) -> u8 {
+        if self.bold && self.pen < 8 {
+            self.pen + 8
+        } else {
+            self.pen
+        }
+    }
+
     fn put(&mut self, byte: u8) {
         if self.col == COLS {
             self.col = 0;
             self.newline();
         }
         self.cells[self.row][self.col] = byte;
+        self.colors[self.row][self.col] = self.pen_color();
         self.col += 1;
     }
 
@@ -104,6 +234,8 @@ impl Console {
         } else {
             self.cells.copy_within(1.., 0);
             self.cells[ROWS - 1] = [b' '; COLS];
+            self.colors.copy_within(1.., 0);
+            self.colors[ROWS - 1] = [DEFAULT_COLOR; COLS];
         }
     }
 
@@ -116,13 +248,22 @@ impl Console {
         let mut count = 0;
         for row in 0..ROWS {
             for col in 0..COLS {
-                let mut want = u16::from(self.cells[row][col]);
-                if row == cursor_row && col == cursor_col {
+                let ch = self.cells[row][col];
+                let at_cursor = row == cursor_row && col == cursor_col;
+                // A blank cell looks the same in every colour (the cursor block aside).
+                let color = if ch == b' ' && !at_cursor {
+                    DEFAULT_COLOR
+                } else {
+                    self.colors[row][col]
+                };
+                let mut want = u16::from(ch) | u16::from(color) << 9;
+                if at_cursor {
                     want |= CURSOR;
                 }
                 if self.drawn[row][col] != want {
+                    let rgb = PALETTE[usize::from(color)];
                     // SAFETY: forwarded from the caller; the cell is inside the grid.
-                    unsafe { draw_cell(fb, col, row, want as u8, want & CURSOR != 0) };
+                    unsafe { draw_cell(fb, col, row, want as u8, rgb, want & CURSOR != 0) };
                     self.drawn[row][col] = want;
                     count += 1;
                 }
@@ -132,18 +273,18 @@ impl Console {
     }
 }
 
-/// Draw one character cell, inverted for the cursor.
+/// Draw one character cell in `color`, inverted for the cursor.
 ///
 /// # Safety
 /// `fb` must point to `FB_WORDS` writable `u32` words and `col < COLS`, `row < ROWS`.
-pub unsafe fn draw_cell(fb: *mut u32, col: usize, row: usize, ch: u8, inverted: bool) {
+pub unsafe fn draw_cell(fb: *mut u32, col: usize, row: usize, ch: u8, color: u16, inverted: bool) {
     let index = if (font::FIRST..=font::LAST).contains(&ch) {
         usize::from(ch - font::FIRST)
     } else {
         usize::from(b'?' - font::FIRST)
     };
     let glyph = &font::GLYPHS[index];
-    let (fg, bg) = if inverted { (BG, FG) } else { (FG, BG) };
+    let (fg, bg) = if inverted { (BG, color) } else { (color, BG) };
     let u0 = col * CELL_W;
     let v0 = TOP + row * CELL_H;
     for gx in 0..CELL_W {
@@ -317,9 +458,55 @@ mod tests {
         let mut b = raster();
         // SAFETY: both are full-size rasters.
         unsafe {
-            draw_cell(a.as_mut_ptr(), 3, 3, 0x01, false);
-            draw_cell(b.as_mut_ptr(), 3, 3, b'?', false);
+            draw_cell(a.as_mut_ptr(), 3, 3, 0x01, FG, false);
+            draw_cell(b.as_mut_ptr(), 3, 3, b'?', FG, false);
         }
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sgr_colours_text_and_reset_restores_the_default() {
+        let mut console = Console::new();
+        console.write(b"\x1b[31mA\x1b[1;32mB\x1b[0mC\x1b[93mD\x1b[mE");
+        assert_eq!(console.color(0, 0), 1, "red");
+        assert_eq!(console.color(1, 0), 10, "bold green is bright green");
+        assert_eq!(console.color(2, 0), 7, "reset");
+        assert_eq!(console.color(3, 0), 11, "bright yellow");
+        assert_eq!(console.color(4, 0), 7, "ESC[m resets");
+        assert_eq!(console.cursor(), (5, 0), "escape sequences take no cells");
+    }
+
+    #[test]
+    fn coloured_glyphs_use_the_palette() {
+        let mut console = Console::new();
+        let mut fb = raster();
+        console.write(b"\x1b[31mA");
+        render(&mut console, &mut fb);
+        let seen: Vec<u16> = (0..CELL_W)
+            .flat_map(|gx| (0..CELL_H).map(move |gy| (gx, gy)))
+            .map(|(gx, gy)| (gx, gy))
+            .map(|(gx, gy)| landscape(&fb, gx, TOP + gy))
+            .collect();
+        assert!(seen.contains(&PALETTE[1]));
+        assert!(!seen.contains(&FG));
+    }
+
+    #[test]
+    fn recolouring_a_blank_cell_does_not_redraw_it() {
+        let mut console = Console::new();
+        let mut fb = raster();
+        render(&mut console, &mut fb);
+        console.write(b"\x1b[31m \x1b[0m");
+        // The blank only moved the cursor on: old cell back to blank, new cursor cell.
+        assert_eq!(render(&mut console, &mut fb), 2);
+    }
+
+    #[test]
+    fn unknown_sequences_are_dropped_and_parameters_are_bounded() {
+        let mut console = Console::new();
+        console.write(b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;99mx\x1b[2Jy\x1b[999999999999mz");
+        assert_eq!(console.cell(0, 0), b'x');
+        assert_eq!(console.cell(1, 0), b'y');
+        assert_eq!(console.cell(2, 0), b'z');
     }
 }
