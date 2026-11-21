@@ -14,33 +14,54 @@ use core::fmt;
 use vela_kernel::errno::Errno;
 
 const BUS: Bus = Bus { sda: 31, scl: 32 };
+/// Tab5 Ext.Port1 (J9 pins 7/8): GPIO0 SDA / GPIO1 SCL, shared with the Tab5 Keyboard (`0x6D`).
+const EXT1_BUS: Bus = Bus { sda: 0, scl: 1 };
 const RESET_BITS: u8 = 0x30; // expander 1 P4 LCD, P5 touch
 pub const INA226_ADDR: u8 = 0x41; // Tab5 2S battery-rail power monitor (5 mOhm shunt)
 
-/// Initialize the Tab5 HP system I2C bus (`GPIO31` SDA, `GPIO32` SCL).
+/// Initialize the Tab5 HP I2C buses: system (`GPIO31` SDA, `GPIO32` SCL) and Ext.Port1
+/// (`GPIO0` SDA, `GPIO1` SCL).
 ///
 /// # Safety
-/// Exclusive HP0 ownership of `GPIO31`/`GPIO32` with machine interrupts masked.
+/// Exclusive HP0 ownership of `GPIO0`/`GPIO1`/`GPIO31`/`GPIO32` with machine interrupts masked.
 pub unsafe fn init_i2c() {
     unsafe {
         BUS.init();
+        EXT1_BUS.init();
     }
 }
 
-/// Execute a bounded capability-gated I2C transaction on the Tab5 system bus.
-/// Only user-accessible board sensors (`0x41` INA226) are permitted; board
-/// reset/power I/O expanders (`0x43`, `0x44`) remain kernel-exclusive.
+/// Execute a bounded capability-gated I2C transaction on `bus` (`crate::syscall::I2C_BUS_*`).
+///
+/// - Empty `tx` and `rx` is an address-only probe, allowed for any valid address on every
+///   bus: `Ok` = ACK, `Enxio` = NACK, `Eio` = bus fault.
+/// - Data transfers on the system bus are limited to the user-accessible `0x41` INA226;
+///   the reset/power I/O expanders (`0x43`, `0x44`) remain kernel-exclusive.
+/// - Ext.Port1 carries no board devices, so any address is allowed there.
 ///
 /// # Safety
-/// Exclusive HP0 ownership of `GPIO31`/`GPIO32` with machine interrupts masked.
-pub unsafe fn i2c_transfer(addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), Errno> {
-    if !(0x08..=0x77).contains(&addr) || (tx.is_empty() && rx.is_empty()) {
+/// Exclusive HP0 ownership of the bus pins with machine interrupts masked.
+pub unsafe fn i2c_transfer(bus: u8, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), Errno> {
+    if !(0x08..=0x77).contains(&addr) {
         return Err(Errno::Einval);
     }
-    if addr != INA226_ADDR {
+    let (hw, data_allowed) = match bus {
+        crate::syscall::I2C_BUS_SYSTEM => (&BUS, addr == INA226_ADDR),
+        crate::syscall::I2C_BUS_EXT1 => (&EXT1_BUS, true),
+        _ => return Err(Errno::Enxio),
+    };
+    if tx.is_empty() && rx.is_empty() {
+        // SAFETY: caller guarantees exclusive pin ownership.
+        return match unsafe { hw.probe(addr) } {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Errno::Enxio),
+            Err(()) => Err(Errno::Eio),
+        };
+    }
+    if !data_allowed {
         return Err(Errno::Eperm);
     }
-    unsafe { BUS.transfer_bytes(addr, tx, rx).map_err(|()| Errno::Eio) }
+    unsafe { hw.transfer_bytes(addr, tx, rx).map_err(|()| Errno::Eio) }
 }
 
 /// Probe the Tab5 microSD card and verify/provision the `VELAIMG1` asset bundle

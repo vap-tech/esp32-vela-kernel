@@ -275,6 +275,24 @@ pub fn require_authority(
     Ok(())
 }
 
+/// Verify that `process` holds `handle` naming an `Authority::I2c(bus)` capability with
+/// `rights` and return the bus it is scoped to.
+pub fn require_i2c_bus(
+    processes: &Processes,
+    process: ProcSlot,
+    handle: Handle,
+    rights: u16,
+) -> Result<u8, Errno> {
+    let capability = processes.slot(process).capabilities.get(handle, 0)?;
+    let Object::Authority(Authority::I2c(bus)) = capability.object else {
+        return Err(Errno::Ebadf);
+    };
+    if capability.rights & rights != rights {
+        return Err(Errno::Eperm);
+    }
+    Ok(bus)
+}
+
 /// Validate `handle` and `rights` in `process` and resolve the live IPC endpoint.
 pub fn resolve_endpoint(
     processes: &Processes,

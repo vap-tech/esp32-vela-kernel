@@ -20,7 +20,8 @@ pub enum Authority {
     Display,
     Sentinel,
     IrqControl,
-    I2c,
+    /// One board I2C bus (`vela_abi::I2C_BUS_*`); policy per bus lives in the BSP.
+    I2c(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

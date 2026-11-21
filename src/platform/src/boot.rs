@@ -165,15 +165,19 @@ extern "C" fn rust_main() -> ! {
         cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
     )
     .unwrap();
-    let procfs_i2c_cap = runtime
-        .processes
-        .slot_mut(procfs.slot)
-        .capabilities
-        .install(Capability {
-            object: Object::Authority(Authority::I2c),
-            rights: cap::READ | cap::WRITE,
-        })
-        .unwrap();
+    let mut install_i2c = |bus: u8| {
+        runtime
+            .processes
+            .slot_mut(procfs.slot)
+            .capabilities
+            .install(Capability {
+                object: Object::Authority(Authority::I2c(bus)),
+                rights: cap::READ | cap::WRITE,
+            })
+            .unwrap()
+    };
+    let procfs_i2c_cap = install_i2c(crate::syscall::I2C_BUS_SYSTEM);
+    let procfs_i2c_ext_cap = install_i2c(crate::syscall::I2C_BUS_EXT1);
     let shell_caps = &mut runtime.processes.slot_mut(shell.slot).capabilities;
     let spawn_cap = shell_caps
         .install(Capability {
@@ -207,7 +211,7 @@ extern "C" fn rust_main() -> ! {
                 request.raw(),
                 proc_reply.raw(),
                 procfs_i2c_cap.raw(),
-                0,
+                procfs_i2c_ext_cap.raw(),
                 0,
                 0,
             ],

@@ -2,7 +2,7 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, div64, dword_le, ina226, sys, word_le};
+use vela_user::{Buffer, TextBuf, div64, dword_le, i2c, ina226, sys, word_le};
 
 vela_user::entry!(main);
 
@@ -29,7 +29,24 @@ fn ticks_16m_to_ns(ticks_16m: u32) -> (u32, u32) {
 
 /// Render a virtual `/proc/*` or `/dev/*` file into `out`.
 /// Returns `0` on success, `1` on ENOENT, `2` on kernel/device query failure.
-fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
+/// Capability handles for the board I2C buses (`vela_abi::syscall::I2C_BUS_*`).
+#[derive(Clone, Copy)]
+struct I2cCaps {
+    system: u32,
+    ext1: u32,
+}
+
+impl I2cCaps {
+    fn bus(self, id: u8) -> Option<u32> {
+        match id {
+            abi::I2C_BUS_SYSTEM => Some(self.system),
+            abi::I2C_BUS_EXT1 => Some(self.ext1),
+            _ => None,
+        }
+    }
+}
+
+fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
     match path {
         b"/proc/loadavg" | b"/proc/uptime" => {
             let mut snap = [0u8; abi::STATS_BYTES];
@@ -322,7 +339,7 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             0
         }
         b"/proc/power" => {
-            let Ok(reading) = ina226::sample_tab5(i2c_cap) else {
+            let Ok(reading) = ina226::sample_tab5(i2c.system) else {
                 out.append(b"service unavailable\n");
                 return 2;
             };
@@ -459,6 +476,25 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             out.push(b'\n');
             0
         }
+        b"/proc/i2c" => {
+            for info in &i2c::BUSES {
+                i2c::render_bus_line(out, info);
+            }
+            0
+        }
+        _ if i2c::bus_from_dev_path(path).is_some() => {
+            let id = i2c::bus_from_dev_path(path).unwrap_or(0);
+            match (i2c::bus_info(id), i2c.bus(id)) {
+                (Some(info), Some(cap)) => {
+                    i2c::render_scan_sys(out, info, cap);
+                    0
+                }
+                _ => {
+                    out.append(b"procfs: no such file\n");
+                    1
+                }
+            }
+        }
         b"/dev/zero" => {
             out.append(b"device /dev/zero\nsource kernel_zero_stream\nzero_256b");
             for _ in 0..8 {
@@ -491,12 +527,12 @@ impl SnapshotCache {
         }
     }
 
-    fn render_or_reuse(&mut self, offset: usize, path: &[u8], i2c_cap: u32) -> (u8, &[u8]) {
+    fn render_or_reuse(&mut self, offset: usize, path: &[u8], i2c: I2cCaps) -> (u8, &[u8]) {
         let same_path =
             offset > 0 && path.len() == self.path_len && self.path[..self.path_len] == *path;
         if !same_path {
             self.text.clear();
-            self.status = render_path(path, i2c_cap, &mut self.text);
+            self.status = render_path(path, i2c, &mut self.text);
             if path.len() <= self.path.len() {
                 self.path[..path.len()].copy_from_slice(path);
                 self.path_len = path.len();
@@ -512,7 +548,7 @@ impl SnapshotCache {
 /// (`[2, offset_lo, offset_hi, path...]` -> `[status, more, slice...]`).
 fn handle_request(
     request: &Buffer,
-    i2c_cap: u32,
+    i2c: I2cCaps,
     response: &mut Buffer,
     cache: &mut SnapshotCache,
 ) {
@@ -523,13 +559,13 @@ fn handle_request(
             response.push(0);
         }
         Some(1) if req.len() > 1 => {
-            let (status, bytes) = cache.render_or_reuse(0, &req[1..], i2c_cap);
+            let (status, bytes) = cache.render_or_reuse(0, &req[1..], i2c);
             response.push(status);
             response.append(bytes);
         }
         Some(2) if req.len() > 3 => {
             let offset = u16::from_le_bytes([req[1], req[2]]) as usize;
-            let (status, bytes) = cache.render_or_reuse(offset, &req[3..], i2c_cap);
+            let (status, bytes) = cache.render_or_reuse(offset, &req[3..], i2c);
             let start = offset.min(bytes.len());
             let end = (start + (abi::IPC_BYTES - 2)).min(bytes.len());
             let more = u8::from(status == 0 && end < bytes.len());
@@ -544,7 +580,18 @@ fn handle_request(
     }
 }
 
-fn main(request_handle: u32, reply_handle: u32, i2c_cap: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
+fn main(
+    request_handle: u32,
+    reply_handle: u32,
+    i2c_system: u32,
+    i2c_ext1: u32,
+    _a4: u32,
+    _a5: u32,
+) -> ! {
+    let i2c = I2cCaps {
+        system: i2c_system,
+        ext1: i2c_ext1,
+    };
     let mut cache = SnapshotCache::new();
     let mut request = Buffer::new();
     let mut response = Buffer::new();
@@ -558,7 +605,7 @@ fn main(request_handle: u32, reply_handle: u32, i2c_cap: u32, _a3: u32, _a4: u32
         if !ok {
             sys::exit();
         }
-        handle_request(&request, i2c_cap, &mut response, &mut cache);
+        handle_request(&request, i2c, &mut response, &mut cache);
         pending_token = request.reply;
         if pending_token == 0 && !response.send(reply_handle) {
             sys::exit();

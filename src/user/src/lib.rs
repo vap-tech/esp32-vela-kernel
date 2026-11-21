@@ -2,9 +2,10 @@
 //! Standalone U-mode userspace support library (`vela-user`).
 //! Provides thin syscall wrappers, bounded IPC message buffers, formatting
 //! helpers without `core::fmt` bloat, an explicit bump arena, and userspace
-//! sensor/protocol helpers (`ina226`, `sdcard`).
+//! sensor/protocol helpers (`ina226`, `sdcard`, `i2c`).
 
 pub mod arena;
+pub mod i2c;
 pub mod ina226;
 pub mod sdcard;
 pub mod sys;

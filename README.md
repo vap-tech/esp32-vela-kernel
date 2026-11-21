@@ -35,6 +35,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, `hart/aff` (`hp0`/`hp1` and affinity mask `1..3`), migrations, ticks, `user_cycles`, preemptions and stack size. |
 | `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
 | `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
+| `cat /proc/i2c`, `i2cdetect [bus]`, `cat /dev/i2c-N` | List the board I²C buses (`0` system `GPIO31`/`GPIO32`, `1` Ext.Port1 `GPIO0`/`GPIO1`) or scan one with address-only probes (found addresses, `state ok/bus_fault`). Tab5 Keyboard answers at `0x6d` on bus 1. |
 | `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
 | `smp [status/pin 0/pin 1/any]` | Verify dual-hart HP0+HP1 SMP execution, `HP1 -> HP0 -> HP1` thread migration, synchronous IPI PMP shootdown, and concurrent `RV32F` FPU + `Xespv2p1` PIE (`q0..q7`, `QACC`, `UA_STATE`, `XACC`) context preservation (`fpu_pie=ok`), or query/set shell hart affinity. |
@@ -100,6 +101,7 @@ Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 | Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` and `L1-ICache1` are enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Userspace `INA226` power driver (`I2C_TRANSFER`, `/proc/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
+| Per-bus I²C capabilities (`Authority::I2c(bus)`) and probe scan (`/dev/i2c-N`) | Address-only probes work on every address of both buses; data transfers are limited to `0x41` on the system bus and open on Ext.Port1 (no board devices). |
 | Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Raw LBA block access (`SD_ASSET_LBA = 2048` for `VELAIMG1` RLE streams); no FAT/VFS layer. |
 | Coordinated LP Sentinel sleep (`sentinel sleep`), DVFS (`40 MHz <-> 180 MHz`) and Tickless idle (`SYSTIMER`) | WFI + XTAL downshift with pre-sleep IRQ/generation re-check; full PMU HP power-domain power-down/reset resume is not used. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |

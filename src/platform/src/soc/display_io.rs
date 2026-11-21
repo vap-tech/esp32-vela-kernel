@@ -110,6 +110,32 @@ impl Bus {
         }
     }
 
+    /// Address-only probe (SMBus "quick write"): START, `addr << 1 | W`, sample ACK, STOP.
+    /// Returns `Ok(true)` when a device ACKs, `Ok(false)` on NACK, `Err(())` on a bus fault
+    /// (SCL held low or SDA stuck low at START).
+    ///
+    /// # Safety
+    /// Exclusive ownership of `self.sda` and `self.scl` pins on HP0 with IRQs masked.
+    pub unsafe fn probe(&self, addr: u8) -> Result<bool, ()> {
+        unsafe {
+            let result = (|| {
+                self.start()?;
+                let byte = addr << 1;
+                for shift in (0..8).rev() {
+                    self.bit(byte & (1 << shift) != 0)?;
+                }
+                // The ACK slot: a device pulls SDA low.
+                Ok(!self.bit(true)?)
+            })();
+            drive(self.sda, true);
+            pause();
+            let stop = self.clock();
+            drive(self.sda, false);
+            pause();
+            stop.and(result)
+        }
+    }
+
     /// Execute a multi-byte write (`tx`), optional repeated-start read (`rx`),
     /// and STOP condition on the open-drain bus. Sends master ACK (`SDA = 0`)
     /// after each received byte except the final byte (`NACK`, `SDA = 1`).

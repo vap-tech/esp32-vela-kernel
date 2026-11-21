@@ -7,6 +7,7 @@ pub enum Errno {
     Eperm = 1,
     Enoent = 2,
     Eio = 5,
+    Enxio = 6,
     Enoexec = 8,
     Ebadf = 9,
     Eagain = 11,
@@ -42,6 +43,7 @@ mod tests {
             Errno::Eperm => 1,
             Errno::Enoent => 2,
             Errno::Eio => 5,
+            Errno::Enxio => 6,
             Errno::Enoexec => 8,
             Errno::Ebadf => 9,
             Errno::Eagain => 11,
@@ -61,10 +63,11 @@ mod tests {
         }
     }
 
-    const ALL: [Errno; 19] = [
+    const ALL: [Errno; 20] = [
         Errno::Eperm,
         Errno::Enoent,
         Errno::Eio,
+        Errno::Enxio,
         Errno::Enoexec,
         Errno::Ebadf,
         Errno::Eagain,

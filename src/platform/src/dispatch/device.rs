@@ -254,26 +254,19 @@ impl Runtime {
         let tx_len = args.a3 as usize;
         let rx_ptr = args.a4 as usize;
         let rx_len = args.a5 as usize;
-        if (tx_len == 0 && rx_len == 0)
-            || tx_len > syscall::I2C_MAX_BYTES
-            || rx_len > syscall::I2C_MAX_BYTES
-        {
+        if tx_len > syscall::I2C_MAX_BYTES || rx_len > syscall::I2C_MAX_BYTES {
             return Err(Errno::Einval);
         }
+        // `tx_len == rx_len == 0` is an address-only probe, which needs READ only.
         let mut required_rights = 0u16;
         if tx_len > 0 {
             required_rights |= cap::WRITE;
         }
-        if rx_len > 0 {
+        if rx_len > 0 || tx_len == 0 {
             required_rights |= cap::READ;
         }
-        lifecycle::require_authority(
-            &self.processes,
-            current,
-            Handle(args.a0),
-            Authority::I2c,
-            required_rights,
-        )?;
+        let bus =
+            lifecycle::require_i2c_bus(&self.processes, current, Handle(args.a0), required_rights)?;
         let mut tx = [0u8; syscall::I2C_MAX_BYTES];
         if tx_len > 0 {
             copy_from_user(self.memory(), tx_ptr, &mut tx[..tx_len])?;
@@ -284,7 +277,7 @@ impl Runtime {
         let mut rx = [0u8; syscall::I2C_MAX_BYTES];
         // SAFETY: sole kernel owner of the Tab5 system I2C pins with IRQs masked.
         unsafe {
-            board::i2c_transfer(addr, &tx[..tx_len], &mut rx[..rx_len])?;
+            board::i2c_transfer(bus, addr, &tx[..tx_len], &mut rx[..rx_len])?;
         }
         if rx_len > 0 {
             copy_to_user_within(self.memory(), rx_ptr, rx_len, &rx[..rx_len])?;
