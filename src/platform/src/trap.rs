@@ -32,6 +32,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
                     | soc::dma::LINE
                     | soc::sentinel::LINE
                     | soc::smp::IPI_LINE
+                    | soc::gpio_irq::LINE
             )
             || frame.mepc.wrapping_sub(idle_pc) >= 8
         {

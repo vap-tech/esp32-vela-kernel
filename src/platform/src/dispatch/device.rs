@@ -14,7 +14,7 @@ use crate::{
     arch, board,
     dma::{DMA_CH_GDMA_AHB_CH1, prepare_dma_buffer},
     pmp,
-    runtime::{IRQ_SLOT_CONSOLE_RX, Runtime, device_wait},
+    runtime::{IRQ_SLOT_CONSOLE_RX, IRQ_SLOT_KBD, Runtime, device_wait},
     soc, syscall,
     usermem::{copy_from_user, copy_to_user_within},
 };
@@ -187,6 +187,9 @@ impl Runtime {
             .wait(object, &mut self.scheduler, deadline, |index| {
                 if index == IRQ_SLOT_CONSOLE_RX {
                     console.arm_rx_irq()
+                } else if index == IRQ_SLOT_KBD {
+                    // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
+                    unsafe { soc::gpio_irq::arm() }
                 } else {
                     true
                 }
@@ -209,6 +212,9 @@ impl Runtime {
         self.events.ack(object, |index| {
             if index == IRQ_SLOT_CONSOLE_RX {
                 let _ = console.arm_rx_irq();
+            } else if index == IRQ_SLOT_KBD {
+                // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
+                let _ = unsafe { soc::gpio_irq::arm() };
             }
         })?;
         Ok(0)

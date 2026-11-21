@@ -11,7 +11,7 @@ use super::Args;
 use crate::{
     arch, board,
     dma::DMA_CH_GDMA_AHB_CH1,
-    runtime::{IRQ_SLOT_CONSOLE_RX, Runtime},
+    runtime::{IRQ_SLOT_CONSOLE_RX, IRQ_SLOT_KBD, Runtime},
     soc, syscall,
     usermem::{copy_to_user, copy_to_user_within},
 };
@@ -264,7 +264,9 @@ impl Runtime {
             syscall::STATS_IRQ => {
                 if !matches!(
                     len,
-                    syscall::STATS_IRQ_ALL_BYTES | syscall::STATS_IRQ_SMP_BYTES
+                    syscall::STATS_IRQ_ALL_BYTES
+                        | syscall::STATS_IRQ_SMP_BYTES
+                        | syscall::STATS_IRQ_FULL_BYTES
                 ) {
                     return Err(Errno::Einval);
                 }
@@ -272,6 +274,7 @@ impl Runtime {
                 let shootdowns = self.harts[0]
                     .pmp_shootdowns
                     .saturating_add(self.harts[1].pmp_shootdowns);
+                let (kbd_arm_low, kbd_arm_wait) = soc::gpio_irq::arm_counts();
                 let counts = [
                     systimer,
                     usb_rx_interrupts,
@@ -280,8 +283,11 @@ impl Runtime {
                     self.harts[0].ipi_interrupts,
                     self.harts[1].ipi_interrupts,
                     shootdowns,
+                    self.events.interrupts(IRQ_SLOT_KBD),
+                    kbd_arm_low,
+                    kbd_arm_wait,
                 ];
-                let mut buffer = [0u8; syscall::STATS_IRQ_SMP_BYTES];
+                let mut buffer = [0u8; syscall::STATS_IRQ_FULL_BYTES];
                 for (i, count) in counts[..len / 8].iter().enumerate() {
                     buffer[i * 8..i * 8 + 8].copy_from_slice(&count.to_le_bytes());
                 }

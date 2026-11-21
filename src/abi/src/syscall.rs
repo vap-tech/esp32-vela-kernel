@@ -15,6 +15,7 @@ pub const STATS_CPU_SMP_BYTES: usize = 128; // full 2-hart HP0+HP1 SMP cpuinfo s
 pub const STATS_IRQ: u32 = 2; // u64 counts: systimer0, usb_rx, gdma_ahb_ch1, lp_sentinel (+ ipi_hp0, ipi_hp1, pmp_shootdowns)
 pub const STATS_IRQ_ALL_BYTES: usize = 32; // legacy 4-source IRQ table
 pub const STATS_IRQ_SMP_BYTES: usize = 56; // 7-source SMP IRQ table (+ ipi_hp0, ipi_hp1, pmp_shootdowns)
+pub const STATS_IRQ_FULL_BYTES: usize = 80; // 10-source table (+ kbd_gpio50, kbd_arm_low, kbd_arm_wait)
 pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
 pub const STATS_STREAMS_BYTES: usize = 36;
 pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
@@ -112,6 +113,7 @@ pub const AFFINITY_HP1: u32 = 2; // Pin thread to HP1 (hart 1)
 pub const AFFINITY_ANY: u32 = 3; // Allow migration/balancing across HP0 and HP1
 
 pub const IRQ_SLOT_CONSOLE_RX: u32 = 0; // USB Serial/JTAG RX packet interrupt slot (CLIC line 18)
+pub const IRQ_SLOT_KBD: u32 = 1; // Tab5 Keyboard INT (GPIO50, active-low level) slot (CLIC line 22)
 
 pub const DMA_CHANNEL_GDMA_AHB_CH1: u32 = 0; // GDMA-AHB channel 1 memory-to-memory copy
 pub const DMA_CHANNEL_DW_GDMA_SCANOUT: u32 = 1; // DW-GDMA channel 0 MIPI-DSI video scanout

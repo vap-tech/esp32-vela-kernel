@@ -121,11 +121,11 @@ fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
             0
         }
         b"/proc/interrupts" => {
-            let mut snap = [0u8; abi::STATS_IRQ_SMP_BYTES];
+            let mut snap = [0u8; abi::STATS_IRQ_FULL_BYTES];
             if sys::call(
                 abi::STATS,
                 snap.as_mut_ptr() as u32,
-                abi::STATS_IRQ_SMP_BYTES as u32,
+                abi::STATS_IRQ_FULL_BYTES as u32,
                 abi::STATS_IRQ,
                 0,
             ) != 0
@@ -133,7 +133,7 @@ fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
                 out.append(b"service unavailable\n");
                 return 2;
             }
-            let names: [&[u8]; 7] = [
+            let names: [&[u8]; 10] = [
                 b"systimer0 ",
                 b"usb_serial_jtag_rx ",
                 b"gdma_ahb_ch1 ",
@@ -141,6 +141,9 @@ fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
                 b"ipi_hp0 ",
                 b"ipi_hp1 ",
                 b"pmp_shootdowns ",
+                b"kbd_gpio50 ",
+                b"kbd_arm_low ",
+                b"kbd_arm_wait ",
             ];
             for (i, name) in names.into_iter().enumerate() {
                 let (lo, hi) = dword_le(&snap, i * 8);

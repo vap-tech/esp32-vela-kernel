@@ -1,8 +1,11 @@
 #![no_std]
 #![no_main]
 
-//! Tab5 Keyboard input service: polls the Character-mode FIFO on Ext.Port1 and forwards
+//! Tab5 Keyboard input service: drains the Character-mode FIFO on Ext.Port1 and forwards
 //! the characters to the shell's input endpoint, next to the USB console.
+//!
+//! The keyboard pulls `INT` (GPIO50) low while its queue is not empty. The kernel turns that
+//! level into an event, so the service sleeps in `EVENT_WAIT` and costs no CPU while idle.
 
 use vela_user::{
     Buffer, TextBuf,
@@ -12,9 +15,8 @@ use vela_user::{
 
 vela_user::entry!(main);
 
-/// Poll period in 10 ms ticks. An idle poll is one register read (~1 ms of bit-banged I2C),
-/// so 30 ms keeps the CPU cost at a few percent while the FIFO (32 events) never overflows.
-const POLL_TICKS: u32 = 3;
+/// Pause after a wake-up that found no event, so a stuck `INT` cannot spin the CPU.
+const WAKE_RETRY_TICKS: u32 = 1;
 /// How often to look for a keyboard that is absent or was unplugged.
 const RECHECK_TICKS: u32 = 200;
 /// Events forwarded per poll, so a flood cannot starve other tasks.
@@ -48,18 +50,26 @@ fn log_bad_length(len: u8, flushed: bool) {
 /// Consecutive bad length reads after which the queue is flushed.
 const BAD_LENGTH_FLUSH: u32 = 3;
 
-fn serve(bus: &mut SysBus, input_handle: u32) {
+fn serve(bus: &mut SysBus, input_handle: u32, int_event: u32) {
     let mut bad_length = 0u32;
+    // The firmware holds INT low until INT_STA is cleared, even once the queue is empty;
+    // while events remain it raises the line again within a few milliseconds.
+    let mut released = false;
+    let mut got_events = false;
     loop {
         let mut out = Buffer::new();
+        let mut drained = false;
+        let mut events = 0u32;
         for _ in 0..MAX_EVENTS_PER_POLL {
             match kbd::poll(bus) {
                 Ok(Poll::Empty) => {
                     bad_length = 0;
+                    drained = true;
                     break;
                 }
                 Ok(Poll::Event(event)) => {
                     bad_length = 0;
+                    events += 1;
                     let mut bytes = [0u8; kbd::MAX_OUT];
                     match kbd::translate(&event, &mut bytes) {
                         Some(n) => out.append(&bytes[..n]),
@@ -89,20 +99,48 @@ fn serve(bus: &mut SysBus, input_handle: u32) {
         if !out.is_empty() {
             let _ = out.send(input_handle);
         }
-        sys::sleep_ticks(POLL_TICKS);
+        if events > 0 {
+            got_events = true;
+            released = false;
+        }
+        if !drained {
+            // More events may be queued: keep draining without waiting for the line.
+            continue;
+        }
+        if !released {
+            if kbd::Bus::transfer(bus, &[kbd::REG_INT_STA, 0], &mut []).is_err() {
+                sys::write(b"[kbd] lost\n");
+                return;
+            }
+            released = true;
+            // Look once more: an event queued before the release would not raise INT again.
+            continue;
+        }
+        // Sleep until the keyboard raises INT: no timeout, no polling.
+        if sys::event_wait(int_event, 0) != 0 {
+            sys::write(b"[kbd] interrupt event lost\n");
+            return;
+        }
+        let had_events = core::mem::replace(&mut got_events, false);
+        released = false;
+        if !had_events {
+            // Woken with nothing to read (the line can rise a moment before the event is
+            // readable): retry shortly rather than hammer the I2C bus.
+            sys::sleep_ticks(WAKE_RETRY_TICKS);
+        }
     }
 }
 
-fn main(input_handle: u32, i2c_ext1: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
+fn main(input_handle: u32, i2c_ext1: u32, int_event: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     let mut bus = SysBus(i2c_ext1);
     loop {
         if let Ok(f0) = kbd::init(&mut bus) {
             let mut line = TextBuf::<64>::new();
             line.append(b"[kbd] Tab5 Keyboard 0x6d reg_f0=");
             line.hex8(f0);
-            line.append(b" character mode\n");
+            line.append(b" character mode, INT on GPIO50\n");
             sys::write(line.as_slice());
-            serve(&mut bus, input_handle);
+            serve(&mut bus, input_handle, int_event);
         }
         sys::sleep_ticks(RECHECK_TICKS);
     }

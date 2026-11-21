@@ -17,7 +17,7 @@ use crate::{
     arch, board,
     display::DisplayControl,
     dma::{DMA_CH_DW_GDMA_SCANOUT, DMA_CH_GDMA_AHB_CH1},
-    runtime::{BootLogs, HartState, IRQ_SLOT_CONSOLE_RX, RUNTIME, Runtime},
+    runtime::{BootLogs, HartState, IRQ_SLOT_CONSOLE_RX, IRQ_SLOT_KBD, RUNTIME, Runtime},
     sentinel::SentinelClient,
     soc,
 };
@@ -71,6 +71,9 @@ extern "C" fn rust_main() -> ! {
     events
         .register(IRQ_SLOT_CONSOLE_RX, soc::console::RX_LINE)
         .expect("register console RX IRQ slot");
+    events
+        .register(IRQ_SLOT_KBD, soc::gpio_irq::LINE)
+        .expect("register keyboard INT IRQ slot");
 
     let mut dma = DmaTable::new();
     dma.register(DMA_CH_GDMA_AHB_CH1, DmaController::GdmaAhb)
@@ -201,6 +204,15 @@ extern "C" fn rust_main() -> ! {
         cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
     )
     .unwrap();
+    let kbd_event = bind_event(
+        &mut runtime.events,
+        &mut runtime.processes,
+        &mut runtime.scheduler,
+        kbd_proc.slot,
+        IRQ_SLOT_KBD,
+        cap::READ | cap::WAIT | cap::ACK,
+    )
+    .unwrap();
     let mut install_i2c = |bus: u8| {
         runtime
             .processes
@@ -281,7 +293,7 @@ extern "C" fn rust_main() -> ! {
     runtime
         .start_loaded(
             kbd_proc,
-            [kbd_input.raw(), kbd_i2c_cap.raw(), 0, 0, 0, 0],
+            [kbd_input.raw(), kbd_i2c_cap.raw(), kbd_event.raw(), 0, 0, 0],
             2,
             2,
         )
@@ -312,6 +324,7 @@ extern "C" fn rust_main() -> ! {
         soc::timer::start(vela_trap_entry as *const () as usize);
         soc::smp::init_hp0_ipi();
         runtime.console.route_rx_irq();
+        soc::gpio_irq::route();
         if let Some(boot) = soc::sentinel::start() {
             runtime.sentinel.set_boot_info(boot.epoch, boot.hz);
         }

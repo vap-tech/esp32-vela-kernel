@@ -4,6 +4,7 @@ pub mod display_io;
 pub mod dma;
 pub mod dsi;
 pub mod flash;
+pub mod gpio_irq;
 pub mod psram;
 pub mod rng;
 pub mod scanout;

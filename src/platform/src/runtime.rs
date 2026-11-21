@@ -91,6 +91,7 @@ pub mod device_wait {
 }
 
 pub const IRQ_SLOT_CONSOLE_RX: usize = syscall::IRQ_SLOT_CONSOLE_RX as usize;
+pub const IRQ_SLOT_KBD: usize = syscall::IRQ_SLOT_KBD as usize;
 
 pub struct BootCell(pub UnsafeCell<MaybeUninit<Runtime>>);
 // SAFETY: Shared access across HP0 and HP1 is serialized by `soc::smp::KERNEL_LOCK`
@@ -107,6 +108,9 @@ impl Runtime {
     pub fn mask_irq_slot(&mut self, index: usize) {
         if index == IRQ_SLOT_CONSOLE_RX {
             self.console.mask_rx_irq();
+        } else if index == IRQ_SLOT_KBD {
+            // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
+            unsafe { soc::gpio_irq::mask() };
         }
     }
 
@@ -231,6 +235,19 @@ impl Runtime {
             if self
                 .events
                 .notify(IRQ_SLOT_CONSOLE_RX, &mut self.scheduler)
+                .is_some()
+            {
+                self.notify_remote_hart(false);
+                return self.scheduler.has_runnable_for(0);
+            }
+        }
+        // 1b. Same for the keyboard `INT` pin: it may have gone low while HP0 was not
+        //     waiting with the line armed.
+        if !self.events.is_masked(IRQ_SLOT_KBD) && unsafe { soc::gpio_irq::asserted() } {
+            unsafe { soc::gpio_irq::mask() };
+            if self
+                .events
+                .notify(IRQ_SLOT_KBD, &mut self.scheduler)
                 .is_some()
             {
                 self.notify_remote_hart(false);
