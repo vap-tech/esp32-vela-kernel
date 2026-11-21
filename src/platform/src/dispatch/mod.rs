@@ -82,6 +82,7 @@ impl Runtime {
             syscall::I2C_TRANSFER => self.sys_i2c_transfer(current, args),
             syscall::CLOCK_CONTROL => self.sys_clock_control(current, args, frame),
             syscall::CONSOLE_READ => self.sys_console_read(current, args),
+            syscall::CONSOLE_LOG => self.sys_console_log(current, args, frame),
             syscall::SLEEP => self.sys_sleep(args, switch),
             _ => Err(Errno::Enosys),
         };

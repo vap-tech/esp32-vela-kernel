@@ -8,11 +8,17 @@ use vela_kernel::{
 
 use crate::{board, dma::DMA_CH_DW_GDMA_SCANOUT, soc, syscall};
 
+/// `DisplayControl` stage at which `DISPLAY_MODE_CONSOLE` waits for the framebuffer.
+const CONSOLE_ATTACH_STAGE: u8 = 3;
+
 pub struct DisplayControl {
     mode: u8,
     stage: u8,
     active: bool,
     framebuffer: Option<Region>,
+    /// Owner of `framebuffer` when it is a userspace allocation (`DISPLAY_MODE_CONSOLE`).
+    /// The kernel only scans it out and never frees it.
+    external_owner: Option<Pid>,
     psram: soc::psram::Controller,
     scanout: soc::scanout::Scanout,
 }
@@ -31,6 +37,7 @@ impl DisplayControl {
             stage: u8::MAX,
             active: false,
             framebuffer: None,
+            external_owner: None,
             psram: soc::psram::Controller::new(),
             scanout: soc::scanout::Scanout::new(),
         }
@@ -97,7 +104,10 @@ impl DisplayControl {
 
     fn release_framebuffer(&mut self, allocator: &mut RegionAllocator, dma: &mut DmaTable) {
         self.stop_scanout_and_release_dma(allocator, dma);
-        if let Some(fb) = self.framebuffer.take() {
+        let external = self.external_owner.take();
+        if let Some(fb) = self.framebuffer.take()
+            && external.is_none()
+        {
             let _ = self.set_psram_region_mapped(fb, false);
             let _ = allocator.free(Pid::KERNEL, fb);
         }
@@ -157,6 +167,8 @@ impl DisplayControl {
     pub fn step(
         &mut self,
         arg: u32,
+        arg2: usize,
+        caller: Pid,
         allocator: &mut RegionAllocator,
         dma: &mut DmaTable,
     ) -> (Option<board::Diagnostic>, Result<u32, Errno>) {
@@ -168,11 +180,31 @@ impl DisplayControl {
                 Err(code) => (diag, Ok(0u32.wrapping_sub(code))),
             };
         }
+        if arg == syscall::DISPLAY_MODE_BACKLIGHT {
+            if !self.active {
+                return (None, Err(Errno::Ebusy));
+            }
+            let Ok(level) = u8::try_from(arg2) else {
+                return (None, Err(Errno::Einval));
+            };
+            // SAFETY: DisplayControl owns GPIO22 and LEDC0 on HP0 with MIE=0.
+            return if unsafe { board::set_backlight(level) } {
+                (None, Ok(0))
+            } else {
+                (None, Err(Errno::Eio))
+            };
+        }
         if arg == syscall::DISPLAY_MODE_OFF {
             self.power_off(allocator, dma);
             return (None, Ok(0));
         }
-        if matches!(arg, syscall::DISPLAY_MODE_BARS..=syscall::DISPLAY_MODE_BOOT) {
+        let starts_mode = matches!(arg, syscall::DISPLAY_MODE_BARS..=syscall::DISPLAY_MODE_BOOT)
+            || arg == syscall::DISPLAY_MODE_CONSOLE;
+        if starts_mode && self.external_owner.is_some() {
+            // A userspace console owns the scanout; `display off` detaches it first.
+            return (None, Err(Errno::Ebusy));
+        }
+        if starts_mode {
             // Always release any prior scanout and 2 MiB PSRAM framebuffer before starting
             // a new display mode so PSRAM MMU pages and framebuffer memory are freshly
             // mapped after CPLL 180 MHz lock in stage 2.
@@ -185,6 +217,25 @@ impl DisplayControl {
             return (None, Err(Errno::Einval));
         }
 
+        if u32::from(self.mode) == syscall::DISPLAY_MODE_CONSOLE
+            && self.stage == CONSOLE_ATTACH_STAGE
+        {
+            // Bring-up reached the point where the framebuffer is needed (CPLL is locked).
+            // The caller's own PSRAM region must be allocated after this point, as modes
+            // 4 and 5 do, so its MMU pages are mapped under the final clock.
+            let region = (arg == syscall::DISPLAY_MODE_STEP)
+                .then(|| allocator.find_owned(caller, arg2))
+                .flatten()
+                .filter(|r| r.size >= syscall::DISPLAY_FB_BYTES && allocator.is_psram(*r));
+            let Some(region) = region else {
+                return (None, Err(Errno::Einval));
+            };
+            self.framebuffer = Some(region);
+            self.external_owner = Some(caller);
+            // Skip the microSD image stages (3..43); resume at the DSI start stage.
+            self.stage = 43;
+        }
+
         let fb_base = self.framebuffer.map_or(0, |r| r.base);
         let was_running = self.scanout.is_running();
         // SAFETY: DisplayControl owns the display/PSRAM/scanout hardware under MIE=0.
@@ -195,7 +246,9 @@ impl DisplayControl {
         // Allocate and map the 2 MiB PSRAM framebuffer in stage 2 AFTER `board::display_step`
         // has locked CPLL 180 MHz (`clock::display_speed()`), matching the original hardware
         // bring-up sequence.
-        if self.mode >= 4 && self.stage == 2 && step.is_ok() {
+        let image_mode = (syscall::DISPLAY_MODE_DIAG..=syscall::DISPLAY_MODE_BOOT)
+            .contains(&u32::from(self.mode));
+        if image_mode && self.stage == 2 && step.is_ok() {
             let (fb_diag, fb_res) = self.ensure_framebuffer(allocator);
             if diag.is_none() {
                 diag = fb_diag;
@@ -224,7 +277,7 @@ impl DisplayControl {
                             );
                         }
                         let _ = allocator.set_in_flight(
-                            Pid::KERNEL,
+                            self.external_owner.unwrap_or(Pid::KERNEL),
                             fb,
                             Some(DMA_CH_DW_GDMA_SCANOUT as u8),
                         );

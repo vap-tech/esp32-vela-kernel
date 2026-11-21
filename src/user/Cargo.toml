@@ -34,3 +34,9 @@ name = "vela-kbd"
 path = "src/bin/kbd.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-fbcon"
+path = "src/bin/fbcon.rs"
+test = false
+bench = false

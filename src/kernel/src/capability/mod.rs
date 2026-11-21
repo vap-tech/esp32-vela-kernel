@@ -20,6 +20,8 @@ pub enum Authority {
     Display,
     Sentinel,
     IrqControl,
+    /// Read access to the ring of console output (`CONSOLE_LOG`).
+    ConsoleLog,
     /// One board I2C bus (`vela_abi::I2C_BUS_*`); policy per bus lives in the BSP.
     I2c(u8),
 }

@@ -4,7 +4,12 @@
 //! helpers without `core::fmt` bloat, an explicit bump arena, and userspace
 //! sensor/protocol helpers (`ina226`, `sdcard`, `i2c`, `kbd`).
 
+#[cfg(test)]
+extern crate std;
+
 pub mod arena;
+pub mod fbcon;
+pub mod font;
 pub mod i2c;
 pub mod ina226;
 pub mod kbd;

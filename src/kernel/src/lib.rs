@@ -1,6 +1,7 @@
 #![no_std]
 pub mod call;
 pub mod capability;
+pub mod console_log;
 pub mod dma;
 pub mod elf;
 pub mod errno;

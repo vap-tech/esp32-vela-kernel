@@ -83,6 +83,10 @@ pub const DISPLAY_MODE_DIAG: u32 = 4; // Full-screen 1280x720 PSRAM diagnostic a
 pub const DISPLAY_MODE_BOOT: u32 = 5; // Full-screen 1280x720 PSRAM boot artwork
 pub const DISPLAY_MODE_SDCARD_PROBE: u32 = 6; // Verify/provision microSD VELAIMG1 asset bundle
 pub const DISPLAY_MODE_OFF: u32 = 7; // Stop DSI/DW-GDMA scanout, disable backlight, release 2 MiB PSRAM framebuffer
+pub const DISPLAY_MODE_CONSOLE: u32 = 9; // Userspace-owned 720x1280 RGB565 framebuffer: stages 0..2, then DISPLAY_MODE_STEP with a2=PSRAM region base the caller owns (>= DISPLAY_FB_BYTES)
+pub const DISPLAY_MODE_BACKLIGHT: u32 = 10; // a2=0..=255 (0 = off); only after bring-up finished, otherwise -EBUSY
+pub const DISPLAY_CONSOLE_PREP_CALLS: u32 = 3; // DISPLAY_TEST calls (MODE_CONSOLE, then two STEPs) that run stages 0..2; the next STEP carries the framebuffer
+pub const DISPLAY_FB_BYTES: usize = 720 * 1280 * 2;
 pub const DISPLAY_MODE_SDCARD_BENCH: u32 = 8; // Raw multi-block SDMMC IDMA write+read+verify benchmark (a2=mib, default 100)
 pub const IPC_REPLY_RECV: u32 = 37; // a0=reply token (0=skip), a1=reply buf, a2=reply len, a3=recv handle, a4=recv buf, a5=recv cap -> a0=len, a1=next token
 pub const IRQ_ACK: u32 = 38; // a0=event handle (ACK); clear pending notification and re-arm hardware IRQ source
@@ -99,6 +103,9 @@ pub const FREQ_MODE_40MHZ: u32 = 1; // Pin 40 MHz XTAL (rejected with -EBUSY whi
 pub const FREQ_MODE_180MHZ: u32 = 2; // Pin 180 MHz CPLL
 pub const FREQ_MODE_QUERY: u32 = 3; // Query current cpu_mhz and FREQ_MODE_* without changing policy
 pub const THREAD_AFFINITY: u32 = 43; // a0=own TID (0=current thread), a1=affinity mask (0=query, 1=HP0, 2=HP1, 3=any) -> a0=affinity, a1=active hart
+
+pub const CONSOLE_LOG: u32 = 44; // a0=ConsoleLog handle (READ), a1=writable buffer, a2=capacity (<=128), a3=byte cursor -> a0=bytes copied, a1=next cursor (bytes overwritten before the cursor are skipped)
+pub const CONSOLE_LOG_BYTES: usize = 4096; // kernel ring of everything written to the console
 
 pub const AFFINITY_HP0: u32 = 1; // Pin thread to HP0 (hart 0)
 pub const AFFINITY_HP1: u32 = 2; // Pin thread to HP1 (hart 1)

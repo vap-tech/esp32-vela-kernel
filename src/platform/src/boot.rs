@@ -26,6 +26,7 @@ const PROCFS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/procfs.elf")
 const SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
 const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
+const FBCON_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fbcon.elf"));
 
 unsafe extern "C" {
     static _stack_top: u8;
@@ -129,6 +130,7 @@ extern "C" fn rust_main() -> ! {
     let (shell, _, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
     let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
     let (kbd_proc, _, _) = runtime.load_elf(KBD_ELF, false).expect("kbd ELF");
+    let (fbcon_proc, _, _) = runtime.load_elf(FBCON_ELF, false).expect("fbcon ELF");
 
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();
@@ -174,6 +176,20 @@ extern "C" fn rust_main() -> ! {
         .install(Capability {
             object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_EXT1)),
             rights: cap::READ | cap::WRITE,
+        })
+        .unwrap();
+    // The framebuffer console owns the screen and mirrors the console output ring.
+    let fbcon_caps = &mut runtime.processes.slot_mut(fbcon_proc.slot).capabilities;
+    let fbcon_display = fbcon_caps
+        .install(Capability {
+            object: Object::Authority(Authority::Display),
+            rights: cap::CONTROL,
+        })
+        .unwrap();
+    let fbcon_log = fbcon_caps
+        .install(Capability {
+            object: Object::Authority(Authority::ConsoleLog),
+            rights: cap::READ,
         })
         .unwrap();
     let rx_event = bind_event(
@@ -270,6 +286,14 @@ extern "C" fn rust_main() -> ! {
             2,
         )
         .unwrap();
+    runtime
+        .start_loaded(
+            fbcon_proc,
+            [fbcon_display.raw(), fbcon_log.raw(), 0, 0, 0, 0],
+            1,
+            1,
+        )
+        .unwrap();
 
     // SAFETY: isolated physical regions, no users executing yet.
     let (revision, initial_pmp, _) = runtime.pmp_images[procfs.slot.index()].unwrap();
@@ -280,7 +304,7 @@ extern "C" fn rust_main() -> ! {
 
     let _ = writeln!(
         runtime.console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[sched] preemptive scheduler online"
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[task] fbcon started (display console)\n[sched] preemptive scheduler online"
     );
 
     unsafe {

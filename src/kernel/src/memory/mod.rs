@@ -205,6 +205,14 @@ impl RegionPool {
             .any(|e| e.owner == owner && e.region == region)
     }
 
+    /// The allocation owned by `owner` that starts at `base`.
+    pub fn find_owned(&self, owner: Pid, base: usize) -> Option<Region> {
+        self.entries
+            .iter()
+            .find(|e| e.owner == owner && e.region.base == base)
+            .map(|e| e.region)
+    }
+
     pub fn is_in_flight(&self, region: Region) -> bool {
         self.entries
             .iter()
@@ -356,6 +364,13 @@ impl RegionAllocator {
         self.sram.owns(owner, region) || self.psram.owns(owner, region)
     }
 
+    /// The region `owner` allocated at exactly `base`, in either pool.
+    pub fn find_owned(&self, owner: Pid, base: usize) -> Option<Region> {
+        self.sram
+            .find_owned(owner, base)
+            .or_else(|| self.psram.find_owned(owner, base))
+    }
+
     pub fn owns_in(&self, class: MemoryClass, owner: Pid, region: Region) -> bool {
         match class {
             MemoryClass::Sram => self.sram.owns(owner, region),
@@ -457,6 +472,15 @@ mod tests {
         // Freed page can be allocated again.
         let r3 = alloc.allocate(Pid(3), PAGE).unwrap();
         assert_eq!(r3, r1);
+    }
+
+    #[test]
+    fn find_owned_requires_matching_owner_and_exact_base() {
+        let mut alloc = RegionAllocator::new(0x4ff5_f001, 0x4ff5_f001 + 32 * PAGE);
+        let r = alloc.allocate(Pid(1), PAGE).unwrap();
+        assert_eq!(alloc.find_owned(Pid(1), r.base), Some(r));
+        assert_eq!(alloc.find_owned(Pid(2), r.base), None);
+        assert_eq!(alloc.find_owned(Pid(1), r.base + 4), None);
     }
 
     #[test]

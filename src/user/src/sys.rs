@@ -94,6 +94,26 @@ pub fn i2c_transfer(handle: u32, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(
     if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
+/// Read console output from byte `cursor` on; returns the bytes copied and the next cursor.
+#[inline(always)]
+pub fn console_log(handle: u32, buffer: &mut [u8], cursor: u32) -> (usize, u32) {
+    let len = buffer.len().min(128) as u32;
+    let (count, next) = call6(
+        abi::CONSOLE_LOG,
+        handle,
+        buffer.as_mut_ptr() as u32,
+        len,
+        cursor,
+        0,
+        0,
+    );
+    if (count as i32) < 0 {
+        (0, cursor)
+    } else {
+        (count as usize, next)
+    }
+}
+
 #[inline(always)]
 pub fn exit() -> ! {
     call(abi::EXIT, 0, 0, 0, 0);

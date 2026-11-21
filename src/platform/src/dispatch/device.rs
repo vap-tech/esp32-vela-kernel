@@ -6,12 +6,12 @@ use vela_kernel::{
     id::{Handle, ProcSlot, Ticks},
     lifecycle,
     memory::MemoryClass,
-    task::Wait,
+    task::{Context, Wait},
 };
 
 use super::Args;
 use crate::{
-    board,
+    arch, board,
     dma::{DMA_CH_GDMA_AHB_CH1, prepare_dma_buffer},
     pmp,
     runtime::{IRQ_SLOT_CONSOLE_RX, Runtime, device_wait},
@@ -72,8 +72,14 @@ impl Runtime {
             };
             (d, mapped)
         } else {
-            self.display
-                .step(args.a1, &mut self.allocator, &mut self.dma)
+            let caller = self.processes.slot(current).id;
+            self.display.step(
+                args.a1,
+                args.a2 as usize,
+                caller,
+                &mut self.allocator,
+                &mut self.dma,
+            )
         };
         let after_rates = unsafe { soc::clock::rates_mhz() };
         if after_rates.cpu != before_rates.cpu {
@@ -283,6 +289,35 @@ impl Runtime {
             copy_to_user_within(self.memory(), rx_ptr, rx_len, &rx[..rx_len])?;
         }
         Ok(0)
+    }
+
+    /// Read console output from byte `a3` onward; returns the count and the next cursor.
+    pub(super) fn sys_console_log(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        frame: &mut arch::TrapFrame,
+    ) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::ConsoleLog,
+            cap::READ,
+        )?;
+        let pointer = args.a1 as usize;
+        let capacity = args.a2 as usize;
+        if capacity == 0 || capacity > 128 {
+            return Err(Errno::Einval);
+        }
+        if !self.writable(pointer, capacity) {
+            return Err(Errno::Efault);
+        }
+        let mut buffer = [0u8; 128];
+        let (count, next) = soc::console::log_read(args.a3, &mut buffer[..capacity]);
+        copy_to_user_within(self.memory(), pointer, capacity, &buffer[..count])?;
+        frame.set_return2(next);
+        Ok(count as u32)
     }
 
     pub(super) fn sys_console_read(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {

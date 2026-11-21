@@ -1,6 +1,17 @@
 // Adapted from esp32-p4; MIT, copyright 2026 vitalii petrenko.
 //! USB Serial/JTAG console; inherits the PHY setup from ROM.
 use core::{fmt, marker::PhantomData};
+use vela_kernel::console_log::LogRing;
+
+/// Everything written through `Console` (kernel logs and user `WRITE`), for `CONSOLE_LOG`.
+/// Console users are serialized by the kernel lock, so plain access is exclusive.
+static mut LOG: LogRing<{ crate::syscall::CONSOLE_LOG_BYTES }> = LogRing::new();
+
+/// Copy console output at `cursor` into `out`; see [`LogRing::read`].
+pub fn log_read(cursor: u32, out: &mut [u8]) -> (usize, u32) {
+    // SAFETY: serialized by the kernel lock; no reference outlives this call.
+    unsafe { (*core::ptr::addr_of!(LOG)).read(cursor, out) }
+}
 
 const FIFO: usize = crate::pac::USB_FIFO;
 const CONFIG: usize = crate::pac::USB_CONFIG;
@@ -45,6 +56,9 @@ impl Console {
 
     /// Return the actual number of user bytes submitted, with bounded polling.
     pub fn write_bytes(&mut self, bytes: &[u8]) -> usize {
+        // Mirror first: a display must show output even when no USB host drains the FIFO.
+        // SAFETY: serialized by the kernel lock; no reference outlives this call.
+        unsafe { (*core::ptr::addr_of_mut!(LOG)).push(bytes) };
         let mut written = 0;
         for &byte in bytes {
             if byte == b'\n' && !self.put(b'\r') {

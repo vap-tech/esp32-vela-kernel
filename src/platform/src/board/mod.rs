@@ -131,6 +131,22 @@ unsafe fn backlight(on: bool) {
     }
 }
 
+/// Set the Tab5 backlight (`GPIO22`): `0` turns it off, `1..=255` is the LEDC PWM duty.
+/// Returns `false` if the PWM did not latch the new duty.
+///
+/// # Safety
+/// Exclusive HP0 ownership of `GPIO22` and LEDC timer 0 / channel 0 with IRQs masked.
+pub unsafe fn set_backlight(level: u8) -> bool {
+    unsafe {
+        if level == 0 {
+            backlight(false);
+            true
+        } else {
+            io::backlight_pwm(22, level)
+        }
+    }
+}
+
 /// Disable the Tab5 display backlight (`GPIO22`) and return the MIPI-DSI host to
 /// low-power Command Mode with the high-speed lane clock gated.
 ///
