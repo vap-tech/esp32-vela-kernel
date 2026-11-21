@@ -19,6 +19,8 @@ pub struct DisplayControl {
     /// Owner of `framebuffer` when it is a userspace allocation (`DISPLAY_MODE_CONSOLE`).
     /// The kernel only scans it out and never frees it.
     external_owner: Option<Pid>,
+    /// The backlight was switched off with `DISPLAY_MODE_BACKLIGHT 0` (screen blanked).
+    blanked: bool,
     psram: soc::psram::Controller,
     scanout: soc::scanout::Scanout,
 }
@@ -38,6 +40,7 @@ impl DisplayControl {
             active: false,
             framebuffer: None,
             external_owner: None,
+            blanked: false,
             psram: soc::psram::Controller::new(),
             scanout: soc::scanout::Scanout::new(),
         }
@@ -73,6 +76,11 @@ impl DisplayControl {
         unsafe {
             self.scanout.tick();
         }
+    }
+
+    /// Whether the screen is blanked (backlight off while the scanout keeps running).
+    pub const fn blanked(&self) -> bool {
+        self.blanked
     }
 
     pub fn telemetry(&self) -> soc::scanout::StreamTelemetry {
@@ -118,6 +126,7 @@ impl DisplayControl {
     /// unified 32 MiB PSRAM pool.
     pub fn power_off(&mut self, allocator: &mut RegionAllocator, dma: &mut DmaTable) {
         self.release_framebuffer(allocator, dma);
+        self.blanked = false;
         // SAFETY: DisplayControl owns GPIO22 backlight and MIPI-DSI host on HP0 with MIE=0.
         unsafe {
             board::display_off();
@@ -189,6 +198,7 @@ impl DisplayControl {
             };
             // SAFETY: DisplayControl owns GPIO22 and LEDC0 on HP0 with MIE=0.
             return if unsafe { board::set_backlight(level) } {
+                self.blanked = level == 0;
                 (None, Ok(0))
             } else {
                 (None, Err(Errno::Eio))
@@ -210,6 +220,7 @@ impl DisplayControl {
             // mapped after CPLL 180 MHz lock in stage 2.
             self.release_framebuffer(allocator, dma);
             self.active = false;
+            self.blanked = false;
             self.scanout.set_mode(0);
             self.mode = arg as u8;
             self.stage = 0;

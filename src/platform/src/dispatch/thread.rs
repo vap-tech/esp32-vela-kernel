@@ -316,6 +316,13 @@ impl Runtime {
                 }
                 copy_to_user(self.memory(), ptr, &buffer)
             }
+            syscall::STATS_DISPLAY => {
+                if len != syscall::STATS_DISPLAY_BYTES {
+                    return Err(Errno::Einval);
+                }
+                let flags = u32::from(self.display.blanked());
+                copy_to_user(self.memory(), ptr, &flags.to_le_bytes())
+            }
             syscall::STATS_TASKS => {
                 if len != syscall::STATS_TASKS_BYTES {
                     return Err(Errno::Einval);

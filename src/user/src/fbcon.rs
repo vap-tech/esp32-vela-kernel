@@ -24,6 +24,10 @@ pub const FG: u16 = 0xdefb;
 pub const BG: u16 = 0x0000;
 const DEFAULT_COLOR: u8 = 7;
 
+/// Console inactivity (10 ms ticks) after which the backlight is switched off; the keyboard
+/// service dims its LEDs after the same time without a key.
+pub const IDLE_TICKS: u32 = 5 * 60 * 100;
+
 /// The 16 ANSI colours (RGB565): 0-7 normal, 8-15 bright. Index 0 is a dark grey so black
 /// text stays readable on the black background.
 pub const PALETTE: [u16; 16] = [

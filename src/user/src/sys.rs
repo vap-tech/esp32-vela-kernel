@@ -53,6 +53,20 @@ pub fn sleep() {
     sleep_ticks(1);
 }
 
+/// Whether the screen is blanked (backlight off). The keyboard service uses it to swallow
+/// the key that wakes the display.
+pub fn display_blanked() -> bool {
+    let mut flags = [0u8; abi::STATS_DISPLAY_BYTES];
+    let rc = call(
+        abi::STATS,
+        flags.as_mut_ptr() as u32,
+        abi::STATS_DISPLAY_BYTES as u32,
+        abi::STATS_DISPLAY,
+        0,
+    );
+    rc == 0 && flags[0] & 1 != 0
+}
+
 #[inline(always)]
 pub fn event_wait(handle: u32, timeout_ticks: u32) -> u32 {
     call(abi::EVENT_WAIT, handle, timeout_ticks, 0, 0)

@@ -228,6 +228,14 @@ pub fn apply_led<B: Bus>(bus: &mut B, command: LedCommand) -> Result<(), i32> {
     }
 }
 
+/// Overall RGB brightness (`0..=MAX_BRIGHTNESS`); `0` darkens both LEDs without touching the
+/// mode or the colours.
+pub fn read_brightness<B: Bus>(bus: &mut B) -> Result<u8, i32> {
+    let mut value = [0u8];
+    bus.transfer(&[REG_BRIGHTNESS], &mut value)?;
+    Ok(value[0])
+}
+
 pub fn read_led_status<B: Bus>(bus: &mut B) -> Result<LedStatus, i32> {
     let mut brightness = [0u8];
     let mut mode = [0u8];
@@ -584,5 +592,20 @@ mod tests {
         kb.present = false;
         assert_eq!(apply_led(&mut kb, LedCommand::Auto), Err(-6));
         assert_eq!(read_led_status(&mut kb), Err(-6));
+    }
+
+    #[test]
+    fn dimming_and_restoring_only_change_the_brightness() {
+        let mut kb = Fake::new();
+        apply_led(&mut kb, LedCommand::Colors([rgb(1, 2, 3), rgb(4, 5, 6)])).unwrap();
+        apply_led(&mut kb, LedCommand::Brightness(40)).unwrap();
+        let saved = read_brightness(&mut kb).unwrap();
+        assert_eq!(saved, 40);
+        let before = (kb.rgb, kb.rgb_mode);
+        apply_led(&mut kb, LedCommand::Brightness(0)).unwrap();
+        assert_eq!(read_brightness(&mut kb), Ok(0));
+        apply_led(&mut kb, LedCommand::Brightness(saved)).unwrap();
+        assert_eq!(read_brightness(&mut kb), Ok(40));
+        assert_eq!((kb.rgb, kb.rgb_mode), before, "colours and mode untouched");
     }
 }

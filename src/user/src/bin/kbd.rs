@@ -7,14 +7,22 @@
 //! The keyboard pulls `INT` (GPIO50) low while its queue is not empty. The kernel turns that
 //! level into an event, so the service sleeps in `EVENT_WAIT` and costs no CPU while idle.
 
+use vela_abi::syscall as abi;
 use vela_user::{
     Buffer, TextBuf,
-    kbd::{self, Poll, SysBus},
+    fbcon::IDLE_TICKS,
+    kbd::{self, LedCommand, Poll, SysBus},
     sys,
 };
 
 vela_user::entry!(main);
 
+/// Longest single `event_wait` (the kernel accepts 1..=6000 ticks); the idle deadline is
+/// reached over several waits.
+const MAX_WAIT_TICKS: u32 = 6000;
+/// A key that wakes a blanked screen is not typed; the service writes this no-op escape to
+/// the console instead, which is the activity that makes `vela-fbcon` light the panel.
+const WAKE_SEQUENCE: &[u8] = b"\x1b[m";
 /// Pause after a wake-up that found no event, so a stuck `INT` cannot spin the CPU.
 const WAKE_RETRY_TICKS: u32 = 1;
 /// How often to look for a keyboard that is absent or was unplugged.
@@ -50,7 +58,14 @@ fn log_bad_length(len: u8, flushed: bool) {
 /// Consecutive bad length reads after which the queue is flushed.
 const BAD_LENGTH_FLUSH: u32 = 3;
 
+fn now() -> u32 {
+    sys::call(abi::TICKS, 0, 0, 0, 0)
+}
+
 fn serve(bus: &mut SysBus, input_handle: u32, int_event: u32) {
+    // Brightness to restore while the LEDs are dimmed after a long time without a key.
+    let mut dimmed: Option<u8> = None;
+    let mut last_key = now();
     let mut bad_length = 0u32;
     // The firmware holds INT low until INT_STA is cleared, even once the queue is empty;
     // while events remain it raises the line again within a few milliseconds.
@@ -97,11 +112,20 @@ fn serve(bus: &mut SysBus, input_handle: u32, int_event: u32) {
         }
         // A full shell queue only drops keystrokes; the driver keeps running.
         if !out.is_empty() {
-            let _ = out.send(input_handle);
+            if sys::display_blanked() {
+                // The key only wakes the screen, it is not typed into the shell.
+                sys::write(WAKE_SEQUENCE);
+            } else {
+                let _ = out.send(input_handle);
+            }
         }
         if events > 0 {
             got_events = true;
             released = false;
+            last_key = now();
+            if let Some(brightness) = dimmed.take() {
+                let _ = kbd::apply_led(bus, LedCommand::Brightness(brightness));
+            }
         }
         if !drained {
             // More events may be queued: keep draining without waiting for the line.
@@ -116,8 +140,27 @@ fn serve(bus: &mut SysBus, input_handle: u32, int_event: u32) {
             // Look once more: an event queued before the release would not raise INT again.
             continue;
         }
-        // Sleep until the keyboard raises INT: no timeout, no polling.
-        if sys::event_wait(int_event, 0) != 0 {
+        // Sleep until the keyboard raises INT. While the LEDs are lit the wait is cut at the
+        // idle deadline so they can be dimmed; once dimmed there is no timeout at all.
+        let timeout = if dimmed.is_some() {
+            0
+        } else {
+            IDLE_TICKS
+                .saturating_sub(now().wrapping_sub(last_key))
+                .clamp(1, MAX_WAIT_TICKS)
+        };
+        let rc = sys::event_wait(int_event, timeout);
+        if rc == abi::ETIMEDOUT {
+            if dimmed.is_none() && now().wrapping_sub(last_key) >= IDLE_TICKS {
+                if let Ok(brightness) = kbd::read_brightness(bus) {
+                    if brightness > 0 && kbd::apply_led(bus, LedCommand::Brightness(0)).is_ok() {
+                        dimmed = Some(brightness);
+                    }
+                }
+            }
+            continue;
+        }
+        if rc != 0 {
             sys::write(b"[kbd] interrupt event lost\n");
             return;
         }

@@ -26,6 +26,8 @@ pub const STATS_SDCARD_BYTES: usize = 32;
 pub const STATS_SDCARD_EXT_BYTES: usize = 44;
 pub const STATS_RANDOM: u32 = 6; // hardware TRNG (0x5011_01a4 / 0x5011_01c0): cfg, last_raw, samples_lo, samples_hi, 8 random words
 pub const STATS_RANDOM_BYTES: usize = 48;
+pub const STATS_DISPLAY: u32 = 7; // u32 flags: bit0 = backlight switched off by DISPLAY_MODE_BACKLIGHT 0
+pub const STATS_DISPLAY_BYTES: usize = 4;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EBUSY: u32 = (-16i32) as u32;

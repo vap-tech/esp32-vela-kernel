@@ -8,7 +8,7 @@ use vela_abi::syscall as abi;
 use vela_user::{
     TextBuf,
     arena::Arena,
-    fbcon::{Console, FB_WORDS},
+    fbcon::{Console, FB_WORDS, IDLE_TICKS},
     sys,
 };
 
@@ -19,9 +19,9 @@ static mut CONSOLE: Console = Console::new();
 
 /// Console output is polled; one tick is 10 ms.
 const POLL_TICKS: u32 = 2;
+/// Log polling period while the backlight is off (10 ms ticks).
+const BLANKED_POLL_TICKS: u32 = 10;
 
-/// Blank the panel after this many ticks (10 ms each) without console activity.
-const IDLE_TICKS: u32 = 5 * 60 * 100;
 /// Backlight level restored on wake (matches the kernel's boot default).
 const BACKLIGHT_ON: u32 = 160;
 
@@ -147,6 +147,11 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
             set_backlight(display, 0);
             blanked = true;
         }
-        sys::sleep_ticks(POLL_TICKS);
+        // Nothing is drawn while the panel is dark, so look at the log less often.
+        sys::sleep_ticks(if blanked {
+            BLANKED_POLL_TICKS
+        } else {
+            POLL_TICKS
+        });
     }
 }
