@@ -25,6 +25,7 @@ use crate::{
 const PROCFS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/procfs.elf"));
 const SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
+const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
 
 unsafe extern "C" {
     static _stack_top: u8;
@@ -127,6 +128,7 @@ extern "C" fn rust_main() -> ! {
     let (procfs, _, _) = runtime.load_elf(PROCFS_ELF, false).expect("procfs ELF");
     let (shell, _, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
     let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
+    let (kbd_proc, _, _) = runtime.load_elf(KBD_ELF, false).expect("kbd ELF");
 
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();
@@ -156,6 +158,24 @@ extern "C" fn rust_main() -> ! {
         cap::SEND,
     )
     .unwrap();
+    // The Tab5 Keyboard service feeds the same shell input endpoint as the USB console.
+    let kbd_input = grant(
+        &mut runtime.processes,
+        shell.slot,
+        input,
+        kbd_proc.slot,
+        cap::SEND,
+    )
+    .unwrap();
+    let kbd_i2c_cap = runtime
+        .processes
+        .slot_mut(kbd_proc.slot)
+        .capabilities
+        .install(Capability {
+            object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_EXT1)),
+            rights: cap::READ | cap::WRITE,
+        })
+        .unwrap();
     let rx_event = bind_event(
         &mut runtime.events,
         &mut runtime.processes,
@@ -242,6 +262,14 @@ extern "C" fn rust_main() -> ! {
             2,
         )
         .unwrap();
+    runtime
+        .start_loaded(
+            kbd_proc,
+            [kbd_input.raw(), kbd_i2c_cap.raw(), 0, 0, 0, 0],
+            2,
+            2,
+        )
+        .unwrap();
 
     // SAFETY: isolated physical regions, no users executing yet.
     let (revision, initial_pmp, _) = runtime.pmp_images[procfs.slot.index()].unwrap();
@@ -252,7 +280,7 @@ extern "C" fn rust_main() -> ! {
 
     let _ = writeln!(
         runtime.console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)\n[sched] preemptive scheduler online"
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[sched] preemptive scheduler online"
     );
 
     unsafe {

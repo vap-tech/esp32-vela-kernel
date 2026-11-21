@@ -84,13 +84,6 @@ where
     summary
 }
 
-fn hex8<const N: usize>(out: &mut TextBuf<N>, value: u8) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.append(b"0x");
-    out.push(HEX[usize::from(value >> 4)]);
-    out.push(HEX[usize::from(value & 0xf)]);
-}
-
 fn pins<const N: usize>(out: &mut TextBuf<N>, info: &BusInfo) {
     out.append(b"sda=gpio");
     out.decimal(u32::from(info.sda));
@@ -131,9 +124,9 @@ where
     out.append(b"\ndata_access ");
     out.append(info.data_access);
     out.append(b"\nscan ");
-    hex8(out, ADDR_MIN);
+    out.hex8(ADDR_MIN);
     out.append(b"..");
-    hex8(out, ADDR_MAX);
+    out.hex8(ADDR_MAX);
     let mut addrs = [0u8; (ADDR_MAX - ADDR_MIN + 1) as usize];
     let mut n = 0;
     let summary = scan(probe, |addr| {
@@ -156,7 +149,7 @@ where
     }
     for &addr in &addrs[..n] {
         out.push(b' ');
-        hex8(out, addr);
+        out.hex8(addr);
     }
     out.push(b'\n');
 }

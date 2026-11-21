@@ -2,13 +2,15 @@
 //! Standalone U-mode userspace support library (`vela-user`).
 //! Provides thin syscall wrappers, bounded IPC message buffers, formatting
 //! helpers without `core::fmt` bloat, an explicit bump arena, and userspace
-//! sensor/protocol helpers (`ina226`, `sdcard`, `i2c`).
+//! sensor/protocol helpers (`ina226`, `sdcard`, `i2c`, `kbd`).
 
 pub mod arena;
 pub mod i2c;
 pub mod ina226;
+pub mod kbd;
 pub mod sdcard;
 pub mod sys;
+pub mod term;
 
 use vela_abi::syscall as abi;
 
@@ -307,6 +309,13 @@ impl<const N: usize> TextBuf<N> {
             self.push(b'-');
         }
         self.decimal(value.unsigned_abs());
+    }
+
+    pub fn hex8(&mut self, value: u8) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.append(b"0x");
+        self.push(HEX[usize::from(value >> 4)]);
+        self.push(HEX[usize::from(value & 0xf)]);
     }
 
     pub fn hex16(&mut self, value: u16) {

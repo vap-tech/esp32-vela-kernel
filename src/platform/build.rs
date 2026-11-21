@@ -111,10 +111,14 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         "../user/src/sys.rs",
         "../user/src/arena.rs",
         "../user/src/ina226.rs",
+        "../user/src/i2c.rs",
+        "../user/src/kbd.rs",
+        "../user/src/term.rs",
         "../user/src/sdcard.rs",
         "../user/src/bin/procfs.rs",
         "../user/src/bin/shell.rs",
         "../user/src/bin/console.rs",
+        "../user/src/bin/kbd.rs",
         "../abi/Cargo.toml",
         "../abi/src/lib.rs",
         "../abi/src/syscall.rs",
@@ -149,6 +153,7 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         ("vela-procfs", "procfs.elf"),
         ("vela-shell", "shell.elf"),
         ("vela-console", "console.elf"),
+        ("vela-kbd", "kbd.elf"),
     ] {
         std::fs::copy(
             user_target

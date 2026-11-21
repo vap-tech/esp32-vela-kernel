@@ -28,3 +28,9 @@ name = "vela-console"
 path = "src/bin/console.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-kbd"
+path = "src/bin/kbd.rs"
+test = false
+bench = false

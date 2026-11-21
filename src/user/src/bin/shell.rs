@@ -2,7 +2,7 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, arena::Arena, sys, word_le};
+use vela_user::{Buffer, TextBuf, arena::Arena, sys, term::EscapeFilter, word_le};
 
 vela_user::entry!(main);
 
@@ -1014,6 +1014,7 @@ fn main(
     let mut line = Buffer::new();
     let mut skip_lf = false;
     let mut overflow = false;
+    let mut escapes = EscapeFilter::new();
     sys::write(b"vela:/$ ");
     loop {
         let mut input = Buffer::new();
@@ -1022,6 +1023,9 @@ fn main(
         }
         for i in 0..input.len() {
             let byte = input.get(i);
+            if escapes.swallow(byte) {
+                continue;
+            }
             if byte == b'\n' && skip_lf {
                 skip_lf = false;
                 continue;

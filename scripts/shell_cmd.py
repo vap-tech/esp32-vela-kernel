@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Send shell commands to VELA on /dev/ttyACM0 and print the live output.
 
-usage: scripts/shell_cmd.py [-t SECONDS] [-w BOOT_WAIT] [--reset] CMD [CMD ...]
+usage: scripts/shell_cmd.py [-t SECONDS] [-w BOOT_WAIT] [--reset] [--listen SECONDS] CMD [CMD ...]
 Each CMD waits for the next `vela:/$ ` prompt (or SECONDS timeout).
 --reset pulses RTS (EN) with DTR low (GPIO0 high => normal boot) and logs the boot.
+--listen keeps printing whatever the board sends for SECONDS after the commands
+(e.g. to watch keystrokes from the Tab5 Keyboard).
 """
 
 import argparse
@@ -32,6 +34,7 @@ def main():
     ap.add_argument("-t", type=float, default=8.0, help="timeout per command")
     ap.add_argument("-w", type=float, default=0.0, help="initial wait (boot)")
     ap.add_argument("--reset", action="store_true")
+    ap.add_argument("--listen", type=float, default=0.0, help="keep printing for N seconds")
     ap.add_argument("cmds", nargs="*")
     a = ap.parse_args()
 
@@ -75,6 +78,10 @@ def main():
         print(f"\n[host] > {c}")
         os.write(fd, c.encode() + b"\n")
         read_until(a.t, PROMPT)
+    if a.listen:
+        print(f"\n[host] listening for {a.listen:g} s")
+        sys.stdout.flush()
+        read_until(a.listen)
     print("\n[host] done")
     sys.stdout.flush()
     try:
