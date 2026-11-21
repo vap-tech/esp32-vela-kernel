@@ -2,7 +2,7 @@ OUTPUT_ARCH(riscv)
 ENTRY(_start)
 MEMORY {
  ENTRY (rx) : ORIGIN = 0x30100000, LENGTH = 8K
- DISPLAY (rw) : ORIGIN = 0x4ff00000, LENGTH = 96K
+ DISPLAY (rw) : ORIGIN = 0x4ff00000, LENGTH = 144K
  BOOT_STACK (rw) : ORIGIN = 0x4ff26000, LENGTH = 8K
  UPPER (rwx) : ORIGIN = 0x4ff40000, LENGTH = 432K
  STACK (rw) : ORIGIN = 0x4ffac000, LENGTH = 80K
@@ -13,6 +13,10 @@ SECTIONS {
   _orbit_black = .; . += 256;
   . = ALIGN(64);
   _orbit_band = .; . += 720 * 64 * 2;
+  . = ALIGN(64);
+  _sdmmc_idma_chain = .; . += 16 * 256;
+  . = ALIGN(64);
+  _sdmmc_dma_buf = .; . += 32768;
  } > DISPLAY
  .entry : ALIGN(16) {
   _entry_start = .;

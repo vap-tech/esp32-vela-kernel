@@ -20,8 +20,11 @@ pub const STATS_STREAMS_BYTES: usize = 36;
 pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
 pub const STATS_TASK_WORDS: usize = 9;
 pub const STATS_TASKS_BYTES: usize = 8 * STATS_TASK_WORDS * 4;
-pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors
+pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors (+ clk_khz, bench_write_kib_s, bench_read_kib_s)
 pub const STATS_SDCARD_BYTES: usize = 32;
+pub const STATS_SDCARD_EXT_BYTES: usize = 44;
+pub const STATS_RANDOM: u32 = 6; // hardware TRNG (0x5011_01a4 / 0x5011_01c0): cfg, last_raw, samples_lo, samples_hi, 8 random words
+pub const STATS_RANDOM_BYTES: usize = 48;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EBUSY: u32 = (-16i32) as u32;
@@ -71,7 +74,7 @@ pub const SENTINEL_ARM_WAKE: u32 = 32; // a0=Sentinel handle (WAIT), a1=1..60000
 pub const SENTINEL_WAIT_WAKE: u32 = 33; // a0=Sentinel handle (WAIT), a1=token (0=current) -> a0=token, a1=elapsed ticks
 pub const SENTINEL_CANCEL_WAKE: u32 = 34; // a0=Sentinel handle (WAIT), a1=token (0=current) -> ACK or EALREADY
 pub const SENTINEL_PREPARE_SLEEP: u32 = 35; // a0=Sentinel handle (WAIT | CONTROL), a1=ms -> wake token
-pub const DISPLAY_TEST: u32 = 36; // a0=Display handle (CONTROL), a1=DISPLAY_MODE_* -> delay ticks / 0 / -errno
+pub const DISPLAY_TEST: u32 = 36; // a0=Display handle (CONTROL), a1=DISPLAY_MODE_*, a2=optional arg -> delay ticks / 0 / -errno
 pub const DISPLAY_MODE_STEP: u32 = 0; // advance in-flight display bring-up stage
 pub const DISPLAY_MODE_BARS: u32 = 1; // ST7121 MIPI-DSI hardware color bars
 pub const DISPLAY_MODE_ORBIT: u32 = 2; // DW-GDMA CH0 64-row Orbit band scanout
@@ -80,6 +83,7 @@ pub const DISPLAY_MODE_DIAG: u32 = 4; // Full-screen 1280x720 PSRAM diagnostic a
 pub const DISPLAY_MODE_BOOT: u32 = 5; // Full-screen 1280x720 PSRAM boot artwork
 pub const DISPLAY_MODE_SDCARD_PROBE: u32 = 6; // Verify/provision microSD VELAIMG1 asset bundle
 pub const DISPLAY_MODE_OFF: u32 = 7; // Stop DSI/DW-GDMA scanout, disable backlight, release 2 MiB PSRAM framebuffer
+pub const DISPLAY_MODE_SDCARD_BENCH: u32 = 8; // Raw multi-block SDMMC IDMA write+read+verify benchmark (a2=mib, default 100)
 pub const IPC_REPLY_RECV: u32 = 37; // a0=reply token (0=skip), a1=reply buf, a2=reply len, a3=recv handle, a4=recv buf, a5=recv cap -> a0=len, a1=next token
 pub const IRQ_ACK: u32 = 38; // a0=event handle (ACK); clear pending notification and re-arm hardware IRQ source
 pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot index -> bound event handle

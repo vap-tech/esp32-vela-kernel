@@ -298,7 +298,7 @@ fn sentinel_log(sentinel_cap: u32) {
     sys::write(out.as_slice());
 
     out.clear();
-    out.append(b" diagnostic_notices=");
+    out.append(b"diagnostic_notices=");
     out.decimal(notices);
     out.push(b'\n');
     sys::write(out.as_slice());
@@ -726,40 +726,101 @@ fn freq_command(text: &[u8], sentinel_cap: u32) -> bool {
     true
 }
 
+fn parse_u32_range(bytes: &[u8], min: u32, max: u32) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val = 0u32;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    (val >= min && val <= max).then_some(val)
+}
+
+fn sdcard_command(text: &[u8], display_cap: u32) -> bool {
+    if text == b"sdcard" {
+        let rc = sys::call(
+            abi::DISPLAY_TEST,
+            display_cap,
+            abi::DISPLAY_MODE_SDCARD_PROBE,
+            0,
+            0,
+        );
+        if rc == 0 {
+            sys::write(b"microSD assets verified\n");
+        } else {
+            let mut out = Buffer::new();
+            out.append(b"sdcard error ");
+            out.decimal(0u32.wrapping_sub(rc));
+            out.push(b'\n');
+            sys::write(out.as_slice());
+        }
+        return true;
+    }
+    let (mib, cmd_kib) = if text == b"sdcard bench" {
+        (100, 0)
+    } else if text.starts_with(b"sdcard bench ") {
+        let args = &text[13..];
+        let split = args.iter().position(|&b| b == b' ').unwrap_or(args.len());
+        let Some(m) = parse_u32_range(&args[..split], 1, 256) else {
+            sys::write(b"usage: sdcard bench [MiB 1..256] [cmd KiB 8..1024, default 64]\n");
+            return true;
+        };
+        let k = if split < args.len() {
+            let Some(k) = parse_u32_range(&args[split + 1..], 8, 1024) else {
+                sys::write(b"usage: sdcard bench [MiB 1..256] [cmd KiB 8..1024, default 64]\n");
+                return true;
+            };
+            k
+        } else {
+            0
+        };
+        (m, k)
+    } else {
+        return false;
+    };
+    let rc = sys::call(
+        abi::DISPLAY_TEST,
+        display_cap,
+        abi::DISPLAY_MODE_SDCARD_BENCH,
+        mib,
+        cmd_kib,
+    );
+    if rc == 0 {
+        sys::write(b"microSD benchmark complete\n");
+    } else {
+        let mut out = Buffer::new();
+        out.append(b"sdcard bench error ");
+        out.decimal(0u32.wrapping_sub(rc));
+        out.push(b'\n');
+        sys::write(out.as_slice());
+    }
+    true
+}
+
 fn command(line: &Buffer, caps: Caps) {
     let text = line.as_slice();
     if text.is_empty() {
         return;
     }
-    if wake_command(line, caps.sentinel) || freq_command(text, caps.sentinel) || smp_command(text) {
+    if wake_command(line, caps.sentinel)
+        || freq_command(text, caps.sentinel)
+        || smp_command(text)
+        || sdcard_command(text, caps.display)
+    {
         return;
     }
     match text {
         b"help" => {
             sys::write(
-                b"help | cat <path> | uptime | bench | smp [status/pin 0/pin 1/any] | freq [auto/40/180] | sdcard | run hello/pic/pic-psram/dma | memtest\n",
+                b"help | cat <path> | uptime | bench | smp [status/pin 0/pin 1/any] | freq [auto/40/180] | sdcard [bench [mib] [cmd_kib]] | run hello/pic/pic-psram/dma | memtest\n",
             );
             sys::write(
                 b"sentinel [hello/status/pause/resume/log/mark] | sentinel sleep/wake/arm/prepare <ms> | sentinel wait/cancel | display test/orbit/pixel/diag/boot/off\n",
             );
-        }
-        b"sdcard" => {
-            let rc = sys::call(
-                abi::DISPLAY_TEST,
-                caps.display,
-                abi::DISPLAY_MODE_SDCARD_PROBE,
-                0,
-                0,
-            );
-            if rc == 0 {
-                sys::write(b"microSD assets verified\n");
-            } else {
-                let mut out = Buffer::new();
-                out.append(b"sdcard error ");
-                out.decimal(0u32.wrapping_sub(rc));
-                out.push(b'\n');
-                sys::write(out.as_slice());
-            }
         }
         b"display off" => {
             let rc = sys::call(abi::DISPLAY_TEST, caps.display, abi::DISPLAY_MODE_OFF, 0, 0);

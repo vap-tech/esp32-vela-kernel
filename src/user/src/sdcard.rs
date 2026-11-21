@@ -1,8 +1,10 @@
 //! Pure SD / SDHC / SDXC protocol helpers (`CRC7`, `CRC16-CCITT`, CSD v1/v2 capacity
-//! decoding, and `VELAIMG1` asset LBA bounds checking).
+//! decoding for both SPI 16-byte CSD and SDMMC 136-bit R2 `RESP0..3`, and `VELAIMG1`
+//! / benchmark LBA bounds checking).
 
 pub const SECTOR_BYTES: usize = 512;
 pub const SD_ASSET_LBA: u32 = 2048; // 1 MiB offset on microSD card
+pub const BENCH_LBA: u32 = 16384; // 8 MiB offset on microSD card (non-overlapping with assets)
 
 /// Compute the 7-bit SD command CRC with trailing end bit (`(crc7 << 1) | 1`).
 pub const fn crc7(bytes: &[u8]) -> u8 {
@@ -70,6 +72,39 @@ pub const fn parse_csd_sectors(csd: &[u8; 16]) -> u32 {
     }
 }
 
+/// Extract total 512-byte sector count from a DWC-MSHC 136-bit R2 response (`RESP0..3`).
+pub const fn parse_csd_sectors_r2(r: &[u32; 4]) -> u32 {
+    let struct_a = (r[3] >> 30) & 3;
+    if struct_a == 1 {
+        let c_size = ((r[2] & 0x3f) << 16) | (r[1] >> 16);
+        let sectors = (c_size + 1).saturating_mul(1024);
+        if sectors >= 1024 {
+            return sectors;
+        }
+    } else if struct_a == 0 {
+        let read_bl_len = (r[2] >> 16) & 0xf;
+        let c_size = ((r[2] & 0x3ff) << 2) | (r[1] >> 30);
+        let c_size_mult = (r[1] >> 15) & 0x7;
+        if read_bl_len >= 9 && read_bl_len <= 11 {
+            let blocknr = (c_size + 1) << (c_size_mult + 2);
+            let block_len = 1u32 << read_bl_len;
+            let sectors = blocknr.saturating_mul(block_len) / 512;
+            if sectors > 0 {
+                return sectors;
+            }
+        }
+    }
+    let struct_b = (r[3] >> 22) & 3;
+    if struct_b == 1 {
+        let c_size = (r[1] >> 8) & 0x3f_ffff;
+        let sectors = (c_size + 1).saturating_mul(1024);
+        if sectors >= 1024 {
+            return sectors;
+        }
+    }
+    0
+}
+
 /// Check whether an asset bundle of `total_bytes` fits on a card of `card_sectors`
 /// starting at `asset_lba`.
 pub const fn asset_span_fits(asset_lba: u32, total_bytes: usize, card_sectors: u32) -> bool {
@@ -108,15 +143,23 @@ mod tests {
 
     #[test]
     fn parses_sdhc_8gb_and_sdsc_csd_capacities() {
-        // SDHC CSD v2.0 for an 8 GiB card: C_SIZE = 15199 (0x003b5f) -> 15200 * 1024 = 15,564,800 sectors (7600 MiB)
+        // SDHC CSD v2.0 for an 8 GiB card: C_SIZE = 15279 (0x003baf) -> 15280 * 1024 = 15,646,720 sectors (7640 MiB)
         let mut csd_v2 = [0u8; 16];
         csd_v2[0] = 0x40; // CSD_STRUCTURE = 1 (v2.0)
         csd_v2[7] = 0x00;
         csd_v2[8] = 0x3b;
-        csd_v2[9] = 0x5f;
+        csd_v2[9] = 0xaf;
         let sectors = parse_csd_sectors(&csd_v2);
-        assert_eq!(sectors, 15_564_800);
-        assert_eq!(sectors / 2048, 7600);
+        assert_eq!(sectors, 15_646_720);
+        assert_eq!(sectors / 2048, 7640);
+
+        // Matching DWC-MSHC 136-bit R2 response words (RESP3..0) for the same 8 GiB card:
+        let r2 = [0x0000_0000, 0x3baf_0000, 0x0000_0000, 0x4000_0000];
+        assert_eq!(parse_csd_sectors_r2(&r2), 15_646_720);
+
+        // Shifted Layout B (CRC stripped):
+        let r2_shifted = [0x0000_0000, 0x003b_af00, 0x0000_0000, 0x0040_0000];
+        assert_eq!(parse_csd_sectors_r2(&r2_shifted), 15_646_720);
 
         // Reject reserved CSD_STRUCTURE = 2 or 3
         let mut bad_csd = csd_v2;
@@ -125,9 +168,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_asset_bundle_lba_bounds() {
-        // 271,920 bytes = 532 sectors at LBA 2048 -> requires >= 2580 sectors
-        assert!(asset_span_fits(SD_ASSET_LBA, 271_920, 15_564_800));
+    fn validates_asset_bundle_and_bench_lba_bounds() {
+        // 271,920 bytes = 532 sectors at LBA 2048 -> ends at LBA 2580, well before BENCH_LBA (16384)
+        assert!(asset_span_fits(SD_ASSET_LBA, 271_920, 15_646_720));
+        assert!(SD_ASSET_LBA + 532 <= BENCH_LBA);
+        assert!(asset_span_fits(BENCH_LBA, 100 * 1024 * 1024, 15_646_720));
         assert!(asset_span_fits(SD_ASSET_LBA, 271_920, 2580));
         assert!(!asset_span_fits(SD_ASSET_LBA, 271_920, 2579));
         assert!(!asset_span_fits(u32::MAX - 10, 271_920, u32::MAX));

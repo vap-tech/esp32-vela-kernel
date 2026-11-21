@@ -5,6 +5,7 @@ pub mod dma;
 pub mod dsi;
 pub mod flash;
 pub mod psram;
+pub mod rng;
 pub mod scanout;
 pub mod sdcard;
 pub mod sentinel;

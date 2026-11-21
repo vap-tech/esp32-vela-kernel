@@ -354,7 +354,10 @@ impl Runtime {
                 copy_to_user(self.memory(), ptr, &buffer)
             }
             syscall::STATS_SDCARD => {
-                if len != syscall::STATS_SDCARD_BYTES {
+                if !matches!(
+                    len,
+                    syscall::STATS_SDCARD_BYTES | syscall::STATS_SDCARD_EXT_BYTES
+                ) {
                     return Err(Errno::Einval);
                 }
                 // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
@@ -363,7 +366,9 @@ impl Runtime {
                 let flags = u32::from(sd.ready)
                     | (u32::from(sd.sdhc) << 1)
                     | (u32::from(asset.verified) << 2)
-                    | (u32::from(asset.provisioned) << 3);
+                    | (u32::from(asset.provisioned) << 3)
+                    | (u32::from(sd.sdmmc_4bit) << 4)
+                    | (u32::from(sd.high_speed) << 5);
                 let words = [
                     flags,
                     sd.ocr,
@@ -373,8 +378,23 @@ impl Runtime {
                     sd.read_sectors,
                     sd.written_sectors,
                     sd.errors,
+                    sd.clk_khz,
+                    sd.bench_write_kib_s,
+                    sd.bench_read_kib_s,
                 ];
-                let mut buffer = [0u8; syscall::STATS_SDCARD_BYTES];
+                let mut buffer = [0u8; syscall::STATS_SDCARD_EXT_BYTES];
+                for (i, word) in words[..len / 4].iter().enumerate() {
+                    buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                copy_to_user(self.memory(), ptr, &buffer[..len])
+            }
+            syscall::STATS_RANDOM => {
+                if len != syscall::STATS_RANDOM_BYTES {
+                    return Err(Errno::Einval);
+                }
+                // SAFETY: serialized by KERNEL_LOCK with IRQs masked.
+                let words = unsafe { soc::rng::snapshot() };
+                let mut buffer = [0u8; syscall::STATS_RANDOM_BYTES];
                 for (i, word) in words.into_iter().enumerate() {
                     buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }

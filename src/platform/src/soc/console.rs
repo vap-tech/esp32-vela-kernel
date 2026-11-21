@@ -23,8 +23,15 @@ impl Console {
         unsafe {
             // SAFETY: Console owns FIFO/config; ROM PHY is preserved.
             // A battery-powered boot must not wait for a USB host.
-            let mut budget = 10_000;
+            // If the 64-byte EP1 TX FIFO is full, kick WR_DONE so the SIE ships the
+            // full packet while we poll for space during multi-chunk `write!` formatting.
+            let mut kicked = false;
+            let mut budget = 40_000;
             while crate::pac::read(CONFIG) & 2 == 0 {
+                if !kicked {
+                    kicked = true;
+                    crate::pac::write(CONFIG, 1);
+                }
                 if budget == 0 {
                     return false;
                 }
@@ -118,10 +125,11 @@ impl Console {
             crate::pac::write(FIFO + 0x10, RX_PACKET);
             core::arch::asm!("fence iorw, iorw", options(nostack));
             if crate::pac::read(CONFIG) & 4 != 0 {
-                self.mask_rx_irq();
+                crate::pac::write(FIFO + 0x10, 0);
+                crate::pac::write(FIFO + 0x14, RX_PACKET);
                 return false;
             }
+            true
         }
-        true
     }
 }

@@ -27,7 +27,7 @@ fn ticks_16m_to_ns(ticks_16m: u32) -> (u32, u32) {
     (ns as u32, (ns >> 32) as u32)
 }
 
-/// Render a virtual `/proc/*` file into `out`.
+/// Render a virtual `/proc/*` or `/dev/*` file into `out`.
 /// Returns `0` on success, `1` on ENOENT, `2` on kernel/device query failure.
 fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
     match path {
@@ -348,11 +348,11 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             0
         }
         b"/proc/sdcard" => {
-            let mut snap = [0u8; abi::STATS_SDCARD_BYTES];
+            let mut snap = [0u8; abi::STATS_SDCARD_EXT_BYTES];
             if sys::call(
                 abi::STATS,
                 snap.as_mut_ptr() as u32,
-                abi::STATS_SDCARD_BYTES as u32,
+                abi::STATS_SDCARD_EXT_BYTES as u32,
                 abi::STATS_SDCARD,
                 0,
             ) != 0
@@ -365,6 +365,8 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             let sdhc = (flags & 2) != 0;
             let verified = (flags & 4) != 0;
             let provisioned = (flags & 8) != 0;
+            let sdmmc_4bit = (flags & 16) != 0;
+            let high_speed = (flags & 32) != 0;
             let ocr = word_le(&snap, 4);
             let sectors = word_le(&snap, 8);
             let asset_lba = word_le(&snap, 12);
@@ -372,8 +374,21 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             let read_sectors = word_le(&snap, 20);
             let written_sectors = word_le(&snap, 24);
             let errors = word_le(&snap, 28);
+            let clk_khz = word_le(&snap, 32);
+            let bench_w_kib = word_le(&snap, 36);
+            let bench_r_kib = word_le(&snap, 40);
 
-            out.append(b"bus spi_gpio39_44\nrail ldo_vo4_3300mv\nstate ");
+            out.append(b"bus ");
+            out.append(if sdmmc_4bit {
+                b"sdmmc_4bit_idma_gpio39_44"
+            } else {
+                b"spi_gpio39_44"
+            });
+            out.append(b"\nrail ldo_vo4_3300mv\nclk_khz ");
+            out.decimal(clk_khz);
+            out.append(b"\nhigh_speed ");
+            out.decimal(u32::from(high_speed));
+            out.append(b"\nstate ");
             out.append(if ready { b"ready" } else { b"uninitialized" });
             out.append(b"\ntype ");
             out.append(if !ready {
@@ -401,8 +416,54 @@ fn render_path(path: &[u8], i2c_cap: u32, out: &mut TextBuf<512>) -> u8 {
             out.decimal(read_sectors);
             out.append(b"\nwritten_sectors ");
             out.decimal(written_sectors);
+            out.append(b"\nbench_write_kib_s ");
+            out.decimal(bench_w_kib);
+            out.append(b"\nbench_read_kib_s ");
+            out.decimal(bench_r_kib);
             out.append(b"\nerrors ");
             out.decimal(errors);
+            out.push(b'\n');
+            0
+        }
+        b"/dev/random" | b"/dev/urandom" => {
+            let mut snap = [0u8; abi::STATS_RANDOM_BYTES];
+            if sys::call(
+                abi::STATS,
+                snap.as_mut_ptr() as u32,
+                abi::STATS_RANDOM_BYTES as u32,
+                abi::STATS_RANDOM,
+                0,
+            ) != 0
+            {
+                out.append(b"service unavailable\n");
+                return 2;
+            }
+            let cfg = word_le(&snap, 0);
+            let last_raw = word_le(&snap, 4);
+            let (s_lo, s_hi) = dword_le(&snap, 8);
+            out.append(b"device ");
+            out.append(path);
+            out.append(b"\nsource esp32p4_lp_trng_0x501101a4\nrng_cfg ");
+            out.hex16(cfg as u16);
+            out.append(b"\nlast_raw ");
+            out.hex32(last_raw);
+            out.append(b"\nhw_samples ");
+            out.decimal64(s_lo, s_hi);
+            out.append(b"\nentropy_256b ");
+            for i in 0..8 {
+                if i > 0 {
+                    out.push(b' ');
+                }
+                out.hex32(word_le(&snap, 16 + i * 4));
+            }
+            out.push(b'\n');
+            0
+        }
+        b"/dev/zero" => {
+            out.append(b"device /dev/zero\nsource kernel_zero_stream\nzero_256b");
+            for _ in 0..8 {
+                out.append(b" 0x00000000");
+            }
             out.push(b'\n');
             0
         }

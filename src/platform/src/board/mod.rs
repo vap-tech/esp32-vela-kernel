@@ -8,7 +8,7 @@ use crate::soc::{
     dsi,
     psram::{self, Probe as PsramProbe},
     scanout::{Scanout, Snapshot as ScanoutSnapshot},
-    sdcard::Probe as SdProbe,
+    sdcard::{self, BenchReport as SdBenchReport, Probe as SdProbe},
 };
 use core::fmt;
 use vela_kernel::errno::Errno;
@@ -47,11 +47,29 @@ pub unsafe fn i2c_transfer(addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), Err
 /// without changing the current MIPI-DSI display or framebuffer state.
 ///
 /// # Safety
-/// Exclusive HP0 ownership of microSD SPI (`GPIO39..44`) and Flash staging ROM reads
+/// Exclusive HP0 ownership of microSD (`SDHOST` / `GPIO39..44`) and Flash staging ROM reads
 /// with machine interrupts masked.
 pub unsafe fn sdcard_probe() -> (Option<Diagnostic>, Result<u32, u32>) {
     match unsafe { images::probe_and_verify() } {
         Ok(probe) => (Some(Diagnostic::Sdcard(probe)), Ok(0)),
+        Err(code) => (None, Err(code)),
+    }
+}
+
+/// Run the raw multi-block microSD write + read + verify benchmark (`1..=256 MiB`)
+/// at `BENCH_LBA` (`LBA 16384`), invoking `keepalive()` between bursts so the LP
+/// Sentinel heartbeat remains healthy.
+///
+/// # Safety
+/// Exclusive HP0 ownership of `SDHOST` (`0x5008_3000`) and `GPIO39..44` with IRQs masked.
+pub unsafe fn sdcard_bench<F: FnMut()>(
+    mib: u32,
+    cmd_kib: u32,
+    keepalive: F,
+) -> (Option<Diagnostic>, Result<u32, u32>) {
+    let mib = if mib == 0 { 100 } else { mib.clamp(1, 256) };
+    match unsafe { sdcard::bench(mib, cmd_kib, keepalive) } {
+        Ok(report) => (Some(Diagnostic::SdcardBench(report)), Ok(0)),
         Err(code) => (None, Err(code)),
     }
 }
@@ -61,6 +79,7 @@ pub enum Diagnostic {
     Psram(PsramProbe),
     Scanout(ScanoutSnapshot),
     Sdcard(SdProbe),
+    SdcardBench(SdBenchReport),
 }
 
 impl fmt::Display for Diagnostic {
@@ -69,6 +88,7 @@ impl fmt::Display for Diagnostic {
             Self::Psram(probe) => probe.fmt(f),
             Self::Scanout(snapshot) => snapshot.fmt(f),
             Self::Sdcard(probe) => probe.fmt(f),
+            Self::SdcardBench(report) => report.fmt(f),
         }
     }
 }

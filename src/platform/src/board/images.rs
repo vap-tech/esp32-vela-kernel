@@ -74,24 +74,32 @@ pub unsafe fn status() -> AssetStatus {
     }
 }
 
+unsafe fn current_sd_probe() -> SdProbe {
+    let t = unsafe { sdcard::telemetry() };
+    SdProbe {
+        sdhc: t.sdhc,
+        sdmmc_4bit: t.sdmmc_4bit,
+        high_speed: t.high_speed,
+        clk_khz: t.clk_khz,
+        ocr: t.ocr,
+        sectors: t.sectors,
+        asset_lba: SD_ASSET_LBA,
+        provisioned: unsafe { SD_BUNDLE_PROVISIONED },
+    }
+}
+
 /// Probe the Tab5 microSD card and ensure the `VELAIMG1` asset bundle at `SD_ASSET_LBA`
 /// is provisioned and verified (`CRC32` + pixel counts for both streams).
 ///
 /// # Safety
-/// Exclusive HP0 ownership of microSD SPI (`GPIO39..44`) and Flash staging ROM reads
+/// Exclusive HP0 ownership of microSD (`SDHOST` / `GPIO39..44`) and Flash staging ROM reads
 /// with machine interrupts masked.
 pub unsafe fn probe_and_verify() -> Result<SdProbe, u32> {
     unsafe {
-        let (_, sdhc, ocr, sectors) = sdcard::ensure_initialized()?;
+        let _ = sdcard::ensure_initialized()?;
         let _ = ensure_sd_asset_ready(&DIAGNOSTIC)?;
         verify_stream_on_sd(&BOOT)?;
-        Ok(SdProbe {
-            sdhc,
-            ocr,
-            sectors,
-            asset_lba: SD_ASSET_LBA,
-            provisioned: SD_BUNDLE_PROVISIONED,
-        })
+        Ok(current_sd_probe())
     }
 }
 
@@ -99,27 +107,46 @@ unsafe fn read_sd_words(byte_offset: u32, out: &mut [u32]) -> Result<(), u32> {
     if byte_offset as usize % 4 != 0 {
         return Err(13);
     }
-    let mut byte_pos = byte_offset as usize;
+    let byte_pos = byte_offset as usize;
     let total_bytes = out.len() * 4;
     let end_pos = byte_pos.checked_add(total_bytes).ok_or(13u32)?;
+    let first_sector = (byte_pos / SECTOR_BYTES) as u32;
+    let last_sector = ((end_pos.saturating_sub(1)) / SECTOR_BYTES) as u32;
+    let sector_count = (last_sector - first_sector + 1) as usize;
+
+    // Fast path: multi-block IDMA burst when the entire span fits in the 32 KiB DMA buffer.
+    if total_bytes > 0 && sector_count <= 64 {
+        let lba = SD_ASSET_LBA
+            .checked_add(first_sector)
+            .ok_or(sdcard::ERR_SD_READ)?;
+        let ptr = unsafe { sdcard::read_sectors_dma(lba, sector_count)? };
+        let start_in_dma = byte_pos % SECTOR_BYTES;
+        let slice = unsafe { core::slice::from_raw_parts(ptr.add(start_in_dma), total_bytes) };
+        for (slot, chunk) in out.iter_mut().zip(slice.chunks_exact(4)) {
+            *slot = u32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        return Ok(());
+    }
+
+    let mut cur_pos = byte_pos;
     let mut sector_buf = [0u8; SECTOR_BYTES];
     let mut out_idx = 0usize;
 
-    while byte_pos < end_pos {
-        let sector_idx = (byte_pos / SECTOR_BYTES) as u32;
+    while cur_pos < end_pos {
+        let sector_idx = (cur_pos / SECTOR_BYTES) as u32;
         let lba = SD_ASSET_LBA
             .checked_add(sector_idx)
             .ok_or(sdcard::ERR_SD_READ)?;
         unsafe {
             sdcard::read_sector(lba, &mut sector_buf)?;
         }
-        let in_sector = byte_pos % SECTOR_BYTES;
-        let avail = (SECTOR_BYTES - in_sector).min(end_pos - byte_pos);
+        let in_sector = cur_pos % SECTOR_BYTES;
+        let avail = (SECTOR_BYTES - in_sector).min(end_pos - cur_pos);
         for chunk in sector_buf[in_sector..in_sector + avail].chunks_exact(4) {
             out[out_idx] = u32::from_le_bytes(chunk.try_into().unwrap());
             out_idx += 1;
         }
-        byte_pos += avail;
+        cur_pos += avail;
     }
     Ok(())
 }
@@ -258,7 +285,7 @@ unsafe fn verify_stream_on_sd(asset: &'static Asset) -> Result<(), u32> {
 
 unsafe fn ensure_sd_asset_ready(asset: &'static Asset) -> Result<Option<SdProbe>, u32> {
     unsafe {
-        let (first_init, sdhc, ocr, sectors) = sdcard::ensure_initialized()?;
+        let (first_init, _, _, sectors) = sdcard::ensure_initialized()?;
         let total_sectors = ((bundle_total_bytes()? + SECTOR_BYTES - 1) / SECTOR_BYTES) as u32;
         if SD_ASSET_LBA
             .checked_add(total_sectors)
@@ -295,13 +322,7 @@ unsafe fn ensure_sd_asset_ready(asset: &'static Asset) -> Result<Option<SdProbe>
         }
 
         let probe = if first_init || provisioned {
-            Some(SdProbe {
-                sdhc,
-                ocr,
-                sectors,
-                asset_lba: SD_ASSET_LBA,
-                provisioned: SD_BUNDLE_PROVISIONED,
-            })
+            Some(current_sd_probe())
         } else {
             None
         };
@@ -314,7 +335,7 @@ unsafe fn ensure_sd_asset_ready(asset: &'static Asset) -> Result<Option<SdProbe>
 /// 4 KiB RLE chunks sequentially from the Tab5 microSD card.
 ///
 /// # Safety
-/// Exclusive HP0 ownership of microSD SPI (`GPIO39..44`), Flash staging ROM reads,
+/// Exclusive HP0 ownership of microSD (`SDHOST` / `GPIO39..44`), Flash staging ROM reads,
 /// and the mapped PSRAM framebuffer window (`frame_direct_base..+FRAME_BYTES`) with IRQs masked.
 pub unsafe fn draw_rows(
     asset: &'static Asset,

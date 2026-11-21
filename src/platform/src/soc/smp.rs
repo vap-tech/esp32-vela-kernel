@@ -101,6 +101,26 @@ pub fn set_hp1_online() {
     HP1_ONLINE.store(true, Ordering::Release);
 }
 
+/// The interrupt matrix is not guaranteed to be reset between firmware runs: a stale
+/// peripheral source mapped to [`IPI_LINE`] (observed: source 31) keeps the level-triggered
+/// CLIC line pending forever and livelocks the hart in an IPI storm. Unmap every source on
+/// `core` that targets [`IPI_LINE`] except our own `FROM_CPU` source.
+unsafe fn release_stale_ipi_line(core: usize, own_from_cpu: usize) {
+    let base = INTR_MATRIX_BASE + core * INTR_MATRIX_CORE_STRIDE;
+    let own = INTR_FROM_CPU0_OFFSET / 4 + own_from_cpu;
+    for src in 0..128usize {
+        if src == own {
+            continue;
+        }
+        let reg = base + src * 4;
+        unsafe {
+            if read(reg) & 0x3f == IPI_LINE {
+                write(reg, 0);
+            }
+        }
+    }
+}
+
 /// Route `FROM_CPU1` (`HP1 -> HP0`) to `HP0` CLIC line [`IPI_LINE`] (`21`).
 ///
 /// # Safety
@@ -110,6 +130,7 @@ pub unsafe fn init_hp0_ipi() {
         // Clear any pending FROM_CPU0 / FROM_CPU1 level before routing.
         write(FROM_CPU_BASE, 0);
         write(FROM_CPU_BASE + 4, 0);
+        release_stale_ipi_line(0, 1);
         // Route FROM_CPU1 (line 1) to HP0 (core 0) CLIC line 21.
         write(INTR_MATRIX_BASE + INTR_FROM_CPU0_OFFSET + 4, IPI_LINE);
         // Enable CLIC line 21 (non-vectored, level-triggered, priority 1).
@@ -130,6 +151,7 @@ pub unsafe fn init_hp1_clic_and_ipi(vector: usize) {
         }
         write(CLIC_BASE, (read(CLIC_BASE) & !0x1e) | (3 << 1));
         write(CLIC_BASE + 8, 0x1f00_0000);
+        release_stale_ipi_line(1, 0);
         // Route FROM_CPU0 (line 0) to HP1 (core 1) CLIC line 21.
         write(
             INTR_MATRIX_BASE + INTR_MATRIX_CORE_STRIDE + INTR_FROM_CPU0_OFFSET,
