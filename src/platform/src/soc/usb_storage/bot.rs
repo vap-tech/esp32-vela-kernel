@@ -78,13 +78,12 @@ enum Phase {
         done: u32,
     },
     EjectPending,
-    Ejected,
     ResetRequired,
 }
 
 pub(super) trait Media {
     fn read(&mut self, lba: u32, data: &mut [u8; SECTOR]) -> bool;
-    fn write(&mut self, lba: u32, data: &[u8; SECTOR]) -> bool;
+    fn write(&mut self, lba: u32, data: &[u8]) -> bool;
     fn sync(&mut self) -> bool;
 }
 
@@ -95,6 +94,7 @@ pub(super) struct Msc<'a, B: UsbBus> {
     phase: Phase,
     sectors: u32,
     writable: bool,
+    ejected: bool,
     prevented: bool,
     sense: (u8, u8),
     block: [u8; SECTOR],
@@ -110,6 +110,7 @@ impl<'a, B: UsbBus> Msc<'a, B> {
             phase: Phase::Command,
             sectors,
             writable,
+            ejected: false,
             prevented: false,
             sense: (0, 0),
             block: [0; SECTOR],
@@ -118,7 +119,7 @@ impl<'a, B: UsbBus> Msc<'a, B> {
     }
 
     pub fn ejected(&self) -> bool {
-        matches!(self.phase, Phase::Ejected)
+        self.ejected
     }
 
     pub fn transferring(&self) -> bool {
@@ -169,6 +170,10 @@ impl<'a, B: UsbBus> Msc<'a, B> {
 
     fn start(&mut self, cmd: Command, media: &mut impl Media) {
         let cdb = &cmd.cdb[..cmd.cdb_len];
+        if self.ejected && !matches!(cdb[0], 0x03 | 0x12) {
+            self.fail(cmd, (2, 0x3a)); // NOT READY / MEDIUM NOT PRESENT.
+            return;
+        }
         let mut response = [0; 36];
         match (cdb[0], cdb.len()) {
             (0x12, 6) if cdb[1] == 0 && cdb[2] == 0 => {
@@ -270,8 +275,9 @@ impl<'a, B: UsbBus> Msc<'a, B> {
         }
     }
 
-    /// Advance one BOT step. At most one sector is passed to the backend.
-    pub fn step(&mut self, media: &mut impl Media) -> bool {
+    /// Advance one BOT step. A write is submitted only after a whole batch or
+    /// the final sector of the command has been received.
+    pub fn step(&mut self, media: &mut impl Media, staging: &mut [u8]) -> bool {
         let mut packet = [0; PACKET];
         match self.phase {
             Phase::Command => match self.output.read(&mut packet) {
@@ -347,18 +353,29 @@ impl<'a, B: UsbBus> Msc<'a, B> {
                         }
                         let next = offset + n as u32;
                         if let Data::Write(lba) = data {
-                            let within = offset as usize % SECTOR;
-                            self.block[within..within + n].copy_from_slice(&packet[..n]);
-                            if within + n == SECTOR
-                                && !media.write(lba + offset / SECTOR as u32, &self.block)
+                            // Only a writable session may reach this state. The staging
+                            // buffer holds an integral number of packets and sectors.
+                            if staging.is_empty() || !staging.len().is_multiple_of(SECTOR) {
+                                self.require_reset();
+                                return true;
+                            }
+                            let within = offset as usize % staging.len();
+                            let filled = within + n;
+                            staging[within..filled].copy_from_slice(&packet[..n]);
+                            if (filled == staging.len() || next == cmd.len)
+                                && !media.write(
+                                    lba + (next - filled as u32) / SECTOR as u32,
+                                    &staging[..filled],
+                                )
                             {
                                 self.sense = (3, 0x0c);
+                                let committed = next - filled as u32;
                                 if next == cmd.len {
-                                    self.status(cmd, offset + n as u32 - SECTOR as u32, 1);
+                                    self.status(cmd, committed, 1);
                                 } else {
                                     self.phase = Phase::Data {
                                         cmd,
-                                        data: Data::Discard(next - SECTOR as u32),
+                                        data: Data::Discard(committed),
                                         offset: next,
                                     };
                                 }
@@ -416,7 +433,7 @@ impl<'a, B: UsbBus> Msc<'a, B> {
                     false
                 }
             }
-            Phase::EjectPending | Phase::Ejected | Phase::ResetRequired => false,
+            Phase::EjectPending | Phase::ResetRequired => false,
         }
     }
 
@@ -466,7 +483,11 @@ impl<B: UsbBus> UsbClass<B> for Msc<'_, B> {
 
     fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
         if addr == self.input.address() && matches!(self.phase, Phase::EjectPending) {
-            self.phase = Phase::Ejected;
+            // Keep the LUN available for REQUEST SENSE while it has no media.
+            // A USB or BOT reset must never restore access to an ejected card.
+            self.ejected = true;
+            self.cached_lba = None;
+            self.phase = Phase::Command;
         }
     }
 }
@@ -536,17 +557,19 @@ mod tests {
 
     #[derive(Default)]
     struct Disk {
-        writes: Vec<(u32, [u8; SECTOR])>,
+        reads: usize,
+        writes: Vec<(u32, Vec<u8>)>,
         flushes: usize,
     }
 
     impl Media for Disk {
         fn read(&mut self, _: u32, data: &mut [u8; SECTOR]) -> bool {
+            self.reads += 1;
             data.fill(0xa5);
             true
         }
-        fn write(&mut self, lba: u32, data: &[u8; SECTOR]) -> bool {
-            self.writes.push((lba, *data));
+        fn write(&mut self, lba: u32, data: &[u8]) -> bool {
+            self.writes.push((lba, data.to_vec()));
             true
         }
         fn sync(&mut self) -> bool {
@@ -592,33 +615,74 @@ mod tests {
             let mut msc = Msc::new(&bus, 8, writable);
             let _device = UsbDeviceBuilder::new(&bus, UsbVidPid(1, 2)).build();
             let mut disk = Disk::default();
+            let mut staging = [0; 4 * SECTOR];
             command(
                 &wire,
                 &[0x2a, 0, 0, 0, 0, lba, 0, 0, 1, 0],
                 bytes,
                 direction,
             );
-            assert!(msc.step(&mut disk));
+            assert!(msc.step(&mut disk, &mut staging));
             if !direction {
                 for i in 0..bytes / PACKET as u32 {
                     send(&wire, &[0xa5; PACKET]);
-                    assert!(msc.step(&mut disk));
+                    assert!(msc.step(&mut disk, &mut staging));
                     if i + 1 != bytes / PACKET as u32 {
                         assert!(disk.writes.is_empty());
                     }
                 }
             } else {
-                assert!(msc.step(&mut disk)); // end failed IN phase with a ZLP
+                assert!(msc.step(&mut disk, &mut staging)); // end failed IN phase with a ZLP
             }
-            assert!(msc.step(&mut disk)); // CSW
+            assert!(msc.step(&mut disk, &mut staging)); // CSW
             assert_eq!(disk.writes.len(), expected);
             if expected == 1 {
-                assert_eq!(disk.writes[0], (u32::from(lba), [0xa5; SECTOR]));
+                assert_eq!(disk.writes[0].0, u32::from(lba));
+                assert_eq!(disk.writes[0].1, [0xa5; SECTOR]);
                 assert_csw(&wire, 0, 0);
             } else {
                 assert_csw(&wire, bytes, 1);
             }
         }
+    }
+
+    #[test]
+    fn writes_128_kib_as_one_batch_and_flushes_the_tail() {
+        const BATCH: usize = 128 * 1024;
+        const BLOCKS: u16 = (BATCH / SECTOR + 1) as u16;
+        let wire = Arc::new(Mutex::new(Wire::default()));
+        let bus = UsbBusAllocator::new(Bus(wire.clone()));
+        let mut msc = Msc::new(&bus, 4096, true);
+        let _device = UsbDeviceBuilder::new(&bus, UsbVidPid(1, 2)).build();
+        let mut disk = Disk::default();
+        let mut staging = std::vec![0; BATCH];
+        let [hi, lo] = BLOCKS.to_be_bytes();
+        let bytes = usize::from(BLOCKS) * SECTOR;
+        command(
+            &wire,
+            &[0x2a, 0, 0, 0, 0, 7, 0, hi, lo, 0],
+            bytes as u32,
+            false,
+        );
+        assert!(msc.step(&mut disk, &mut staging));
+        for offset in (0..bytes).step_by(PACKET) {
+            let packet = [(offset / SECTOR) as u8; PACKET];
+            send(&wire, &packet);
+            assert!(msc.step(&mut disk, &mut staging));
+            if offset + PACKET < BATCH {
+                assert!(disk.writes.is_empty());
+            }
+        }
+        assert!(msc.step(&mut disk, &mut staging));
+        assert_csw(&wire, 0, 0);
+        assert_eq!(disk.writes.len(), 2);
+        assert_eq!(disk.writes[0].0, 7);
+        assert_eq!(disk.writes[0].1.len(), BATCH);
+        for (i, sector) in disk.writes[0].1.chunks_exact(SECTOR).enumerate() {
+            assert_eq!(sector, [i as u8; SECTOR]);
+        }
+        assert_eq!(disk.writes[1].0, 7 + (BATCH / SECTOR) as u32);
+        assert_eq!(disk.writes[1].1, [0; SECTOR]);
     }
 
     #[test]
@@ -628,24 +692,46 @@ mod tests {
         let mut msc = Msc::new(&bus, 8, true);
         let _device = UsbDeviceBuilder::new(&bus, UsbVidPid(1, 2)).build();
         let mut disk = Disk::default();
+        let mut staging = [0; 4 * SECTOR];
         command(&wire, &[0x1e, 0, 0, 0, 1, 0], 0, false);
-        assert!(msc.step(&mut disk));
-        assert!(msc.step(&mut disk));
+        assert!(msc.step(&mut disk, &mut staging));
+        assert!(msc.step(&mut disk, &mut staging));
         command(&wire, &[0x1b, 0, 0, 0, 2, 0], 0, false);
-        assert!(msc.step(&mut disk));
-        assert!(msc.step(&mut disk));
+        assert!(msc.step(&mut disk, &mut staging));
+        assert!(msc.step(&mut disk, &mut staging));
         assert_csw(&wire, 0, 1);
         assert_eq!(disk.flushes, 0);
         command(&wire, &[0x1e, 0, 0, 0, 0, 0], 0, false);
-        assert!(msc.step(&mut disk));
-        assert!(msc.step(&mut disk));
+        assert!(msc.step(&mut disk, &mut staging));
+        assert!(msc.step(&mut disk, &mut staging));
         command(&wire, &[0x1b, 0, 0, 0, 2, 0], 0, false);
-        assert!(msc.step(&mut disk));
+        assert!(msc.step(&mut disk, &mut staging));
         assert_eq!(disk.flushes, 1);
-        assert!(msc.step(&mut disk));
+        assert!(msc.step(&mut disk, &mut staging));
         assert_csw(&wire, 0, 0);
         assert!(!msc.ejected());
         msc.endpoint_in_complete(msc.input.address());
         assert!(msc.ejected());
+
+        // Linux may still probe the same LUN. Fail its read cleanly and return
+        // sense data without touching the media, even after transport reset.
+        msc.reset();
+        command(&wire, &[0x28, 0, 0, 0, 0, 7, 0, 0, 1, 0], 512, true);
+        assert!(msc.step(&mut disk, &mut staging));
+        assert!(msc.transferring());
+        assert!(msc.step(&mut disk, &mut staging)); // terminate IN data with a ZLP
+        assert!(msc.step(&mut disk, &mut staging));
+        assert_csw(&wire, 512, 1);
+        assert!(!msc.transferring());
+        command(&wire, &[0x03, 0, 0, 0, 18, 0], 18, true);
+        assert!(msc.step(&mut disk, &mut staging));
+        assert!(msc.step(&mut disk, &mut staging));
+        assert!(msc.step(&mut disk, &mut staging));
+        let packets = &wire.lock().unwrap().to_host;
+        let sense = &packets[packets.len() - 2];
+        assert_eq!(sense.len(), 18);
+        assert_eq!((sense[2], sense[12]), (2, 0x3a));
+        assert_eq!(disk.reads, 0);
+        assert!(disk.writes.is_empty());
     }
 }

@@ -357,7 +357,16 @@ impl Runtime {
                 if len != syscall::STATS_DISPLAY_BYTES {
                     return Err(Errno::Einval);
                 }
-                let flags = u32::from(self.display.blanked());
+                let mut flags = 0;
+                if self.display.blanked() {
+                    flags |= syscall::DISPLAY_FLAG_BLANKED;
+                }
+                if self.sd_export_owner.is_some() {
+                    flags |= syscall::DISPLAY_FLAG_SD_EXPORT;
+                    if self.usb_storage.writable() {
+                        flags |= syscall::DISPLAY_FLAG_SD_EXPORT_RW;
+                    }
+                }
                 copy_to_user(self.memory(), ptr, &flags.to_le_bytes())
             }
             syscall::STATS_TASKS => {

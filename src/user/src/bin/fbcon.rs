@@ -8,7 +8,7 @@ use vela_abi::syscall as abi;
 use vela_user::{
     TextBuf,
     arena::Arena,
-    fbcon::{Console, FB_WORDS, IDLE_TICKS},
+    fbcon::{COLS, Console, FB_WORDS, IDLE_TICKS, PALETTE, draw_cell},
     sys,
 };
 
@@ -88,6 +88,31 @@ fn bring_up(display: u32) -> Result<usize, u32> {
     }
 }
 
+/// SAFETY: `fb` points to this service's complete, writable framebuffer.
+unsafe fn render_export(fb: *mut u32, writable: bool) {
+    let mode: &[u8] = if writable {
+        b"Read and write"
+    } else {
+        b"Read only"
+    };
+    let lines: &[(usize, &[u8], u16)] = &[
+        (8, b"USB SD export", PALETTE[14]),
+        (10, mode, PALETTE[15]),
+        (
+            12,
+            b"Eject the disk on your computer to return.",
+            PALETTE[7],
+        ),
+    ];
+    unsafe { fb.write_bytes(0, FB_WORDS) };
+    for &(row, text, color) in lines {
+        let left = (COLS - text.len()) / 2;
+        for (i, &ch) in text.iter().enumerate() {
+            unsafe { draw_cell(fb, left + i, row, ch, color, false) };
+        }
+    }
+}
+
 fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     let fb = match bring_up(display) {
         Ok(fb) => fb as *mut u32,
@@ -109,7 +134,29 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
     let mut measured = false;
     let mut last_activity = now();
     let mut blanked = false;
+    let mut showing_export = false;
     loop {
+        let flags = sys::display_flags();
+        if flags & abi::DISPLAY_FLAG_SD_EXPORT != 0 {
+            if !showing_export {
+                // SAFETY: `fb` is still the console's owned scanout buffer.
+                unsafe { render_export(fb, flags & abi::DISPLAY_FLAG_SD_EXPORT_RW != 0) };
+                showing_export = true;
+                if blanked {
+                    set_backlight(display, BACKLIGHT_ON);
+                    blanked = false;
+                }
+            }
+            sys::sleep_ticks(POLL_TICKS);
+            continue;
+        }
+        if showing_export {
+            // SAFETY: clear the overlay, then let the saved console grid redraw.
+            unsafe { fb.write_bytes(0, FB_WORDS) };
+            console.framebuffer_cleared();
+            last_activity = now();
+            showing_export = false;
+        }
         let mut active = false;
         loop {
             let (count, next) = sys::console_log(log_handle, &mut buffer, cursor);

@@ -24,10 +24,16 @@ const SYS_CLOCK: usize = 0x500e_6018;
 const PHY_CLOCK: usize = 0x5011_1044;
 const OTG_RESET: usize = 0x5011_1048;
 const DCTL: usize = DWC + 0x804;
+// BOT has no separate host acknowledgement for removal. Keep serving the
+// empty LUN until it has been idle for 500 ms, with a 3 s upper bound.
+const EJECT_IDLE_TICKS: u64 = 50;
+const EJECT_LIMIT_TICKS: u64 = 300;
+const USB_DISCONNECT_TICKS: u64 = 25;
 const DISCONNECT: u32 = 1 << 1;
 const PULL_OVERRIDE: u32 = 0b1_1111 << 12;
 const PULL_UP_DP: u32 = (1 << 12) | (1 << 13);
 const SECTOR: usize = sdcard::SECTOR_BYTES;
+pub const WRITE_BATCH_BYTES: usize = 128 * 1024;
 
 // USB stack entry points are private to this module and run with KERNEL_LOCK
 // held and MIE masked. The driver only polls, so no IRQ shares its state.
@@ -63,7 +69,8 @@ struct Session {
     device: UsbDevice<'static, Bus>,
     msc: Msc<'static, Bus>,
     attach_at: u64,
-    detach_at: Option<u64>,
+    ejected_at: Option<u64>,
+    disconnected_at: Option<u64>,
     last_progress: u64,
     attached: bool,
     previous_phy: u32,
@@ -85,11 +92,15 @@ impl UsbStorage {
 
     /// Start an export. Writable sessions require a card and return on host eject.
     /// SAFETY: KERNEL_LOCK held, MIE masked, exclusive ownership of OTG11.
-    pub unsafe fn start(&mut self, writable: bool) -> Result<(), Errno> {
+    pub unsafe fn start(
+        &mut self,
+        writable: bool,
+        service: &mut impl FnMut(),
+    ) -> Result<(), Errno> {
         if self.session.is_some() {
             return Err(Errno::Ebusy);
         }
-        let sectors = unsafe { sdcard::ensure_initialized() }
+        let sectors = unsafe { sdcard::ensure_initialized_with(service) }
             .map(|(_, _, _, sectors)| sectors)
             .unwrap_or(0);
         if writable && sectors == 0 {
@@ -140,7 +151,8 @@ impl UsbStorage {
                 device,
                 msc,
                 attach_at,
-                detach_at: None,
+                ejected_at: None,
+                disconnected_at: None,
                 last_progress: 0,
                 attached: false,
                 previous_phy,
@@ -173,9 +185,22 @@ impl UsbStorage {
     /// Service a bounded number of transport steps per syscall.
     /// Return 0 for idle, 1 for activity, and 2 after the host accepted the eject CSW.
     /// SAFETY: KERNEL_LOCK held with MIE masked.
-    pub unsafe fn poll(&mut self) -> Result<u32, Errno> {
+    pub unsafe fn poll(
+        &mut self,
+        staging: &mut [u8],
+        service: &mut impl FnMut(),
+    ) -> Result<u32, Errno> {
         let session = self.session.as_mut().ok_or(Errno::Einval)?;
         let now = unsafe { timer::uptime_ticks() }.ok_or(Errno::Eio)?;
+        if let Some(disconnected_at) = session.disconnected_at {
+            return Ok(
+                if now.saturating_sub(disconnected_at) >= USB_DISCONNECT_TICKS {
+                    2
+                } else {
+                    0
+                },
+            );
+        }
         unsafe {
             if !session.attached {
                 if now < session.attach_at {
@@ -187,18 +212,19 @@ impl UsbStorage {
             update(USB_WRAP, PULL_OVERRIDE, PULL_UP_DP);
         }
         let mut activity = false;
-        let mut media = SdMedia { accessed: false };
+        let mut media = SdMedia {
+            accessed: false,
+            service,
+        };
         for _ in 0..8 {
             activity |= session.device.poll(&mut [&mut session.msc]);
-            if session.msc.ejected() || session.detach_at.is_some() {
-                // Give the host time to finish its SCSI status handling.
-                let detach_at = *session.detach_at.get_or_insert(now.saturating_add(25));
-                return Ok(if now >= detach_at { 2 } else { 0 });
+            if session.msc.ejected() {
+                session.ejected_at.get_or_insert(now);
             }
             if session.device.state() != UsbDeviceState::Configured {
                 break;
             }
-            activity |= session.msc.step(&mut media);
+            activity |= session.msc.step(&mut media, staging);
             if media.accessed {
                 break; // At most one SD transfer per syscall.
             }
@@ -206,28 +232,45 @@ impl UsbStorage {
         if activity {
             session.last_progress = now;
         }
+        if let Some(ejected_at) = session.ejected_at {
+            let quiet_since = session.last_progress.max(ejected_at);
+            if now.saturating_sub(ejected_at) >= EJECT_LIMIT_TICKS
+                || (!session.msc.transferring()
+                    && now.saturating_sub(quiet_since) >= EJECT_IDLE_TICKS)
+            {
+                // Leave USB-C electrically detached before the other controller
+                // takes over the same port. Do not reassert the OTG pull-up.
+                unsafe {
+                    update(DCTL, 0, DISCONNECT);
+                    update(USB_WRAP, PULL_OVERRIDE, 1 << 12);
+                }
+                session.disconnected_at = Some(now);
+                return Ok(0);
+            }
+        }
         Ok(u32::from(
             activity || (session.msc.transferring() && now <= session.last_progress),
         ))
     }
 }
 
-struct SdMedia {
+struct SdMedia<'a, F> {
     accessed: bool,
+    service: &'a mut F,
 }
-impl Media for SdMedia {
+impl<F: FnMut()> Media for SdMedia<'_, F> {
     fn read(&mut self, lba: u32, data: &mut [u8; SECTOR]) -> bool {
         self.accessed = true;
-        unsafe { sdcard::read_export_sector(lba, data).is_ok() }
+        unsafe { sdcard::read_export_sector(lba, data, self.service).is_ok() }
     }
 
-    fn write(&mut self, lba: u32, data: &[u8; SECTOR]) -> bool {
+    fn write(&mut self, lba: u32, data: &[u8]) -> bool {
         self.accessed = true;
-        unsafe { sdcard::write_export_sector(lba, data).is_ok() }
+        unsafe { sdcard::write_export_sectors(lba, data, self.service).is_ok() }
     }
 
     fn sync(&mut self) -> bool {
         self.accessed = true;
-        unsafe { sdcard::sync_export() }
+        unsafe { sdcard::sync_export(self.service) }
     }
 }

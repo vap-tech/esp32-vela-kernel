@@ -75,6 +75,7 @@ pub struct Runtime {
     pub sentinel: SentinelClient,
     pub display: DisplayControl,
     pub usb_storage: soc::usb_storage::UsbStorage,
+    pub sd_export_buffer: Option<Region>,
     pub sd_export_owner: Option<Pid>,
     pub sd_export_interrupted: bool,
     pub sd_epoch: u32,

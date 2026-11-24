@@ -80,6 +80,7 @@ const SDHOST_BMOD: usize = SDHOST + 0x080;
 const SDHOST_PLDMND: usize = SDHOST + 0x084;
 const SDHOST_DBADDR: usize = SDHOST + 0x088;
 const SDHOST_IDSTS: usize = SDHOST + 0x08c;
+const IDSTS_DESCRIPTOR_UNAVAILABLE: u32 = 1 << 4;
 const SDHOST_IDINTEN: usize = SDHOST + 0x090;
 const SDHOST_CARDTHRCTL: usize = SDHOST + 0x100;
 
@@ -413,7 +414,7 @@ unsafe fn power_ldo_vo4() {
 /// Power-cycle `LDO_VO4` (`0 V` -> `3.3 V`) while clamping `GPIO39..44` LOW so the
 /// microSD rail discharges completely and any card previously locked in SPI mode
 /// resets back to native 4-bit SD bus mode.
-unsafe fn power_cycle_ldo_vo4() {
+unsafe fn power_cycle_ldo_vo4(service: &mut impl FnMut()) {
     unsafe {
         for pin in [PIN_D0, PIN_D1, PIN_D2, PIN_D3, PIN_CLK, PIN_CMD] {
             io::latch(pin, false);
@@ -428,7 +429,10 @@ unsafe fn power_cycle_ldo_vo4() {
         // Turn off LDO_VO4 (xpd = 0 at bit 8, tieh = 0 at bit 14) and discharge rail for 150 ms.
         update(0x5011_51d8, (1 << 14) | (7 << 9) | (3 << 7), 1 << 7);
         update(0x5011_51dc, 0xf780_0000, 0);
-        delay_us(150_000);
+        for _ in 0..15 {
+            delay_us(10_000);
+            service();
+        }
 
         // Drive D3/CS HIGH before re-applying Vdd so power-on sees native SD mode.
         io::latch(PIN_D3, true);
@@ -570,8 +574,15 @@ unsafe fn sdmmc_set_clock(host_div: u32, card_div: u32) -> Result<u32, ()> {
 
 /// Wait until the card releases `SD_D0` (`DATA_BUSY` and `DATA_STATE_MC_BUSY` clear).
 unsafe fn sdmmc_wait_not_busy(max_loops: u32) -> bool {
+    unsafe { sdmmc_wait_not_busy_with(max_loops, &mut || {}) }
+}
+
+unsafe fn sdmmc_wait_not_busy_with(max_loops: u32, service: &mut impl FnMut()) -> bool {
     unsafe {
-        for _ in 0..max_loops {
+        for i in 0..max_loops {
+            if i & 0x3fff == 0 {
+                service();
+            }
             if (read(SDHOST_STATUS) & (STATUS_DATA_BUSY | STATUS_DATA_SM_BUSY)) == 0 {
                 return true;
             }
@@ -702,9 +713,10 @@ unsafe fn sdmmc_transfer_idma(
     block_size: usize,
     is_write: bool,
     multi_block: bool,
+    service: &mut impl FnMut(),
 ) -> Result<(), ()> {
     unsafe {
-        if !sdmmc_wait_not_busy(2_000_000) {
+        if !sdmmc_wait_not_busy_with(2_000_000, service) {
             return Err(());
         }
         sdmmc_prepare_idma(buf_addr, total_bytes, block_size)?;
@@ -730,7 +742,10 @@ unsafe fn sdmmc_transfer_idma(
             INT_CMD_DONE | INT_DTO
         };
         let mut seen = 0u32;
-        for _ in 0..4_000_000 {
+        for i in 0..4_000_000 {
+            if i & 0x3fff == 0 {
+                service();
+            }
             let rint = read(SDHOST_RINTSTS);
             if (rint & (CMD_ERR_MASK | DATA_ERR_MASK)) != 0 {
                 STATE.dbg_rint = rint;
@@ -758,7 +773,7 @@ unsafe fn sdmmc_transfer_idma(
             STATE.dbg_rint = resp0;
             return Err(());
         }
-        if is_write && !sdmmc_wait_not_busy(4_000_000) {
+        if is_write && !sdmmc_wait_not_busy_with(4_000_000, service) {
             return Err(());
         }
         Ok(())
@@ -810,10 +825,12 @@ fn parse_csd_sectors_r2(r: &[u32; 4]) -> u32 {
 }
 
 /// Initialize the hardware 4-bit SDMMC Host Controller (`0x5008_3000`) and identify the card.
-unsafe fn try_init_sdmmc_4bit() -> Result<(bool, bool, u32, u32, u32, u32), ()> {
+unsafe fn try_init_sdmmc_4bit(
+    service: &mut impl FnMut(),
+) -> Result<(bool, bool, u32, u32, u32, u32), ()> {
     unsafe {
         STATE.dbg_step = 1;
-        power_cycle_ldo_vo4();
+        power_cycle_ldo_vo4(service);
         configure_pins_sdmmc_init();
         delay_us(500);
 
@@ -895,6 +912,7 @@ unsafe fn try_init_sdmmc_4bit() -> Result<(bool, bool, u32, u32, u32, u32), ()> 
         let mut ocr = 0u32;
         let mut card_ready = false;
         for _ in 0..500 {
+            service();
             STATE.dbg_step = 61;
             let _ = sdmmc_send_cmd(55, 0, CMD_RESP_EXPECT | CMD_CHECK_CRC | CMD_WAIT_PRVDATA)?;
             STATE.dbg_step = 62;
@@ -971,7 +989,7 @@ unsafe fn try_init_sdmmc_4bit() -> Result<(bool, bool, u32, u32, u32, u32), ()> 
         STATE.dbg_step = 15;
         let dma_bus = dma_buf_bus_addr();
         let dma_direct = dma_buf_direct_ptr();
-        if sdmmc_transfer_idma(6, 0x80ff_fff1, dma_bus, 64, 64, false, false).is_ok() {
+        if sdmmc_transfer_idma(6, 0x80ff_fff1, dma_bus, 64, 64, false, false, service).is_ok() {
             let status_byte16 = dma_direct.add(16).read_volatile();
             if (status_byte16 & 0x0f) == 1 {
                 delay_us(100);
@@ -1220,7 +1238,7 @@ unsafe fn read_csd_spi(slow: bool) -> Result<[u8; 16], ()> {
     }
 }
 
-unsafe fn try_init_spi() -> Result<(bool, u32, u32), u32> {
+unsafe fn try_init_spi(service: &mut impl FnMut()) -> Result<(bool, u32, u32), u32> {
     unsafe {
         power_ldo_vo4();
         configure_pins_spi();
@@ -1275,6 +1293,7 @@ unsafe fn try_init_spi() -> Result<(bool, u32, u32), u32> {
         let acmd41_arg = if v2_card { 0x4000_0000 } else { 0 };
         let mut ready = false;
         for _ in 0..500 {
+            service();
             cs_select();
             let r55 = send_cmd_spi(55, 0, true);
             cs_deselect();
@@ -1341,11 +1360,19 @@ unsafe fn try_init_spi() -> Result<(bool, u32, u32), u32> {
 /// # Safety
 /// Exclusive HP0 ownership of `LDO_VO4`, `SDHOST`, and `GPIO39..44` with IRQs masked.
 pub unsafe fn ensure_initialized() -> Result<(bool, bool, u32, u32), u32> {
+    unsafe { ensure_initialized_with(&mut || {}) }
+}
+
+/// Same exclusive SD ownership as `ensure_initialized`. The callback may
+/// service unrelated hardware while we wait, with kernel interrupts masked.
+pub unsafe fn ensure_initialized_with(
+    service: &mut impl FnMut(),
+) -> Result<(bool, bool, u32, u32), u32> {
     unsafe {
         if STATE.ready {
             return Ok((false, STATE.sdhc, STATE.ocr, STATE.sectors));
         }
-        if let Ok((sdhc, high_speed, clk_khz, rca, ocr, sectors)) = try_init_sdmmc_4bit() {
+        if let Ok((sdhc, high_speed, clk_khz, rca, ocr, sectors)) = try_init_sdmmc_4bit(service) {
             STATE.ready = true;
             STATE.sdhc = sdhc;
             STATE.sdmmc_4bit = true;
@@ -1356,7 +1383,7 @@ pub unsafe fn ensure_initialized() -> Result<(bool, bool, u32, u32), u32> {
             STATE.sectors = sectors;
             return Ok((true, sdhc, ocr, sectors));
         }
-        match try_init_spi() {
+        match try_init_spi(service) {
             Ok((sdhc, ocr, sectors)) => {
                 STATE.ready = true;
                 STATE.sdhc = sdhc;
@@ -1388,37 +1415,71 @@ pub unsafe fn exported() -> bool {
     unsafe { EXPORTED }
 }
 
-pub unsafe fn read_export_sector(lba: u32, out: &mut [u8; SECTOR_BYTES]) -> Result<(), u32> {
+pub unsafe fn read_export_sector(
+    lba: u32,
+    out: &mut [u8; SECTOR_BYTES],
+    service: &mut impl FnMut(),
+) -> Result<(), u32> {
     unsafe {
         if !EXPORTED || !STATE.ready {
             return Err(ERR_SD_READ);
         }
-        let ptr = read_sectors(lba, 1)?;
+        let ptr = read_sectors(lba, 1, service)?;
         core::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), SECTOR_BYTES);
         Ok(())
     }
 }
 
-/// Write one complete sector on the card owned by USB. Both SD transports
-/// wait for the card to finish programming before returning success.
-pub unsafe fn write_export_sector(lba: u32, data: &[u8; SECTOR_BYTES]) -> Result<(), u32> {
+/// Commit one bounded USB batch. Large SDMMC writes use one CMD25 while
+/// the CPU feeds the 32 KiB DMA ring from the kernel-owned PSRAM staging buffer.
+pub unsafe fn write_export_sectors(
+    lba: u32,
+    data: &[u8],
+    service: &mut impl FnMut(),
+) -> Result<(), u32> {
+    let count = data.len() / SECTOR_BYTES;
+    if count == 0 || count > 256 || !data.len().is_multiple_of(SECTOR_BYTES) {
+        return Err(ERR_SD_WRITE);
+    }
     unsafe {
-        if !EXPORTED || !STATE.ready || lba >= STATE.sectors {
+        if !EXPORTED
+            || !STATE.ready
+            || lba
+                .checked_add(count as u32)
+                .is_none_or(|end| end > STATE.sectors)
+        {
             return Err(ERR_SD_WRITE);
         }
-        core::ptr::copy_nonoverlapping(data.as_ptr(), dma_buf_direct_ptr(), SECTOR_BYTES);
-        fence();
-        write_sectors(lba, 1)
+        if STATE.sdmmc_4bit && data.len() > BENCH_CHUNK_BYTES {
+            return sdmmc_stream(lba, count as u32, true, service, |seg, offset, len| {
+                core::ptr::copy_nonoverlapping(
+                    data[offset..offset + len].as_ptr(),
+                    dma_buf_direct_ptr().add(seg * SEG_BYTES),
+                    len,
+                );
+                Ok(())
+            });
+        }
+        for (i, chunk) in data.chunks(BENCH_CHUNK_BYTES).enumerate() {
+            core::ptr::copy_nonoverlapping(chunk.as_ptr(), dma_buf_direct_ptr(), chunk.len());
+            fence();
+            write_sectors(
+                lba + (i * BENCH_CHUNK_SECTORS) as u32,
+                chunk.len() / SECTOR_BYTES,
+                service,
+            )?;
+        }
+        Ok(())
     }
 }
 
 /// The driver has no dirty write cache. Confirm that the current card is ready.
-pub unsafe fn sync_export() -> bool {
+pub unsafe fn sync_export(service: &mut impl FnMut()) -> bool {
     unsafe {
         EXPORTED
             && STATE.ready
             && if STATE.sdmmc_4bit {
-                sdmmc_wait_not_busy(4_000_000)
+                sdmmc_wait_not_busy_with(4_000_000, service)
             } else {
                 // SPI writes already include the card's busy response before deselect.
                 true
@@ -1435,10 +1496,14 @@ pub unsafe fn read_sectors_dma(lba: u32, count: usize) -> Result<*const u8, u32>
     if unsafe { EXPORTED } {
         return Err(ERR_SD_READ);
     }
-    unsafe { read_sectors(lba, count) }
+    unsafe { read_sectors(lba, count, &mut || {}) }
 }
 
-unsafe fn read_sectors(lba: u32, count: usize) -> Result<*const u8, u32> {
+unsafe fn read_sectors(
+    lba: u32,
+    count: usize,
+    service: &mut impl FnMut(),
+) -> Result<*const u8, u32> {
     if count == 0 || count > BENCH_CHUNK_SECTORS {
         return Err(ERR_SD_READ);
     }
@@ -1469,6 +1534,7 @@ unsafe fn read_sectors(lba: u32, count: usize) -> Result<*const u8, u32> {
                 SECTOR_BYTES,
                 false,
                 count > 1,
+                service,
             );
             if res.is_ok() {
                 STATE.read_sectors = STATE.read_sectors.saturating_add(count as u32);
@@ -1479,6 +1545,7 @@ unsafe fn read_sectors(lba: u32, count: usize) -> Result<*const u8, u32> {
             return Err(ERR_SD_READ);
         }
         for i in 0..count {
+            service();
             let slot = &mut *(dma_ptr.add(i * SECTOR_BYTES) as *mut [u8; SECTOR_BYTES]);
             read_sector_spi(lba + i as u32, slot)?;
         }
@@ -1495,10 +1562,10 @@ pub unsafe fn write_sectors_dma(lba: u32, count: usize) -> Result<(), u32> {
     if unsafe { EXPORTED } {
         return Err(ERR_SD_WRITE);
     }
-    unsafe { write_sectors(lba, count) }
+    unsafe { write_sectors(lba, count, &mut || {}) }
 }
 
-unsafe fn write_sectors(lba: u32, count: usize) -> Result<(), u32> {
+unsafe fn write_sectors(lba: u32, count: usize, service: &mut impl FnMut()) -> Result<(), u32> {
     if count == 0 || count > BENCH_CHUNK_SECTORS {
         return Err(ERR_SD_WRITE);
     }
@@ -1529,6 +1596,7 @@ unsafe fn write_sectors(lba: u32, count: usize) -> Result<(), u32> {
                 SECTOR_BYTES,
                 true,
                 count > 1,
+                service,
             );
             if res.is_ok() {
                 STATE.written_sectors = STATE.written_sectors.saturating_add(count as u32);
@@ -1539,6 +1607,7 @@ unsafe fn write_sectors(lba: u32, count: usize) -> Result<(), u32> {
             return Err(ERR_SD_WRITE);
         }
         for i in 0..count {
+            service();
             let slot = &*(dma_ptr.add(i * SECTOR_BYTES) as *const [u8; SECTOR_BYTES]);
             write_sector_spi(lba + i as u32, slot)?;
         }
@@ -1784,37 +1853,39 @@ unsafe fn desc_done(idx: usize) -> bool {
 ///
 /// The descriptor chain walks the 32 KiB `DMA_BUF` as a ring of `NSEG` segments. While the IDMAC
 /// transfers segment `k`, the CPU refills (write) / verifies (read) the segments it has already
-/// finished. Pattern word `g` = f(seed, absolute word index of the LBA), so data landing at the
-/// wrong LBA is detected as well. Returns `ERR_SD_OVERRUN` if the CPU falls a full ring behind.
-unsafe fn sdmmc_stream<F: FnMut()>(
+/// finished. Write descriptors for later laps stay CPU-owned until their data is ready.
+unsafe fn sdmmc_stream(
     lba: u32,
     sectors: u32,
     is_write: bool,
-    seed: u32,
-    keepalive: &mut F,
+    keepalive: &mut impl FnMut(),
+    mut segment: impl FnMut(usize, usize, usize) -> Result<(), u32>,
 ) -> Result<(), u32> {
     let err = if is_write { ERR_SD_WRITE } else { ERR_SD_READ };
     let total_bytes = sectors as usize * SECTOR_BYTES;
-    let laps = total_bytes / SEG_BYTES;
-    let ndesc = laps * DESCS_PER_SEG;
-    if laps == 0 || ndesc > IDMA_DESCS || total_bytes % SEG_BYTES != 0 {
+    let laps = total_bytes.div_ceil(SEG_BYTES);
+    let ndesc = total_bytes.div_ceil(IDMA_DESC_MAX_BYTES);
+    if laps == 0 || ndesc > IDMA_DESCS {
         return Err(err);
     }
     unsafe {
-        let word_base = lba.wrapping_mul((SECTOR_BYTES / 4) as u32);
+        let segment_len = |lap: usize| (total_bytes - lap * SEG_BYTES).min(SEG_BYTES);
         let buf = dma_buf_bus_addr();
-        if !sdmmc_wait_not_busy(2_000_000) {
+        if !sdmmc_wait_not_busy_with(2_000_000, keepalive) {
             return Err(err);
         }
         if is_write {
             for seg in 0..NSEG.min(laps) {
-                fill_seg(seg, word_base.wrapping_add((seg * SEG_WORDS) as u32), seed);
+                segment(seg, seg * SEG_BYTES, segment_len(seg))?;
             }
         }
         for i in 0..ndesc {
             let seg = (i / DESCS_PER_SEG) % NSEG;
             let addr = buf + seg * SEG_BYTES + (i % DESCS_PER_SEG) * IDMA_DESC_MAX_BYTES;
-            let mut des0 = DES0_OWN | DES0_CH;
+            let mut des0 = DES0_CH;
+            if !is_write || i < NSEG * DESCS_PER_SEG {
+                des0 |= DES0_OWN;
+            }
             if i == 0 {
                 des0 |= DES0_FD;
             }
@@ -1825,7 +1896,7 @@ unsafe fn sdmmc_stream<F: FnMut()>(
             }
             idma_chain_direct_ptr(i).write_volatile(IdmaDesc {
                 des0,
-                des1: IDMA_DESC_MAX_BYTES as u32,
+                des1: (total_bytes - i * IDMA_DESC_MAX_BYTES).min(IDMA_DESC_MAX_BYTES) as u32,
                 des2: addr as u32,
                 des3: if i + 1 == ndesc {
                     0
@@ -1839,7 +1910,7 @@ unsafe fn sdmmc_stream<F: FnMut()>(
         let arg = if STATE.sdhc {
             lba
         } else {
-            lba * SECTOR_BYTES as u32
+            lba.checked_mul(SECTOR_BYTES as u32).ok_or(err)?
         };
         let mut flags = CMD_RESP_EXPECT
             | CMD_CHECK_CRC
@@ -1863,7 +1934,7 @@ unsafe fn sdmmc_stream<F: FnMut()>(
         };
 
         for lap in 0..laps {
-            let last_desc = lap * DESCS_PER_SEG + DESCS_PER_SEG - 1;
+            let last_desc = ((lap + 1) * DESCS_PER_SEG).min(ndesc) - 1;
             let mut spins = 0u32;
             while !desc_done(last_desc) {
                 let rint = read(SDHOST_RINTSTS);
@@ -1871,39 +1942,48 @@ unsafe fn sdmmc_stream<F: FnMut()>(
                     STATE.dbg_rint = rint;
                     return abort(err);
                 }
+                if is_write && read(SDHOST_IDSTS) & IDSTS_DESCRIPTOR_UNAVAILABLE != 0 {
+                    write(SDHOST_IDSTS, IDSTS_DESCRIPTOR_UNAVAILABLE);
+                    write(SDHOST_PLDMND, 1);
+                }
                 spins += 1;
+                if spins & 0x3fff == 0 {
+                    keepalive();
+                }
                 if spins > 60_000_000 {
                     STATE.dbg_rint = 0xeeee_0000 | rint;
                     return abort(err);
                 }
             }
             let ahead = lap + NSEG;
-            // The segment refilled/verified now is next touched by the IDMAC when descriptor
-            // group `ahead` starts, i.e. once group `ahead - 1` has completed.
-            let guard = (ahead - 1) * DESCS_PER_SEG + DESCS_PER_SEG - 1;
             if is_write {
                 if ahead < laps {
-                    fill_seg(
-                        lap % NSEG,
-                        word_base.wrapping_add((ahead * SEG_WORDS) as u32),
-                        seed,
-                    );
-                    if desc_done(guard) {
-                        return abort(ERR_SD_OVERRUN);
+                    if let Err(code) = segment(lap % NSEG, ahead * SEG_BYTES, segment_len(ahead)) {
+                        return abort(code);
                     }
+                    fence();
+                    let first = ahead * DESCS_PER_SEG;
+                    let end = (first + DESCS_PER_SEG).min(ndesc);
+                    // Publish the first descriptor last. A controller that caught
+                    // up can resume only after the whole segment is visible.
+                    for idx in (first + 1..end).rev() {
+                        let flags = idma_chain_direct_ptr(idx).cast::<u32>();
+                        flags.write_volatile(flags.read_volatile() | DES0_OWN);
+                    }
+                    fence();
+                    let flags = idma_chain_direct_ptr(first).cast::<u32>();
+                    flags.write_volatile(flags.read_volatile() | DES0_OWN);
+                    fence();
+                    write(SDHOST_PLDMND, 1);
                 }
             } else {
-                let ok = check_seg(
-                    lap % NSEG,
-                    word_base.wrapping_add((lap * SEG_WORDS) as u32),
-                    seed,
-                );
-                if ahead - 1 < laps && desc_done(guard) {
-                    return abort(ERR_SD_OVERRUN);
+                fence();
+                if let Err(code) = segment(lap % NSEG, lap * SEG_BYTES, segment_len(lap)) {
+                    return abort(code);
                 }
-                if !ok {
-                    STATE.errors = STATE.errors.saturating_add(1);
-                    return abort(ERR_SD_CRC);
+                let guard = ahead * DESCS_PER_SEG - 1;
+                if guard < ndesc && desc_done(guard) {
+                    return abort(ERR_SD_OVERRUN);
                 }
             }
             if (lap & 31) == 31 {
@@ -1913,7 +1993,10 @@ unsafe fn sdmmc_stream<F: FnMut()>(
 
         let wanted = INT_CMD_DONE | INT_DTO | INT_ACD;
         let mut seen = 0u32;
-        for _ in 0..8_000_000 {
+        for i in 0..8_000_000 {
+            if i & 0x3fff == 0 {
+                keepalive();
+            }
             let rint = read(SDHOST_RINTSTS);
             if (rint & (CMD_ERR_MASK | DATA_ERR_MASK)) != 0 {
                 STATE.dbg_rint = rint;
@@ -1928,10 +2011,15 @@ unsafe fn sdmmc_stream<F: FnMut()>(
             STATE.dbg_rint = seen;
             return abort(err);
         }
+        let response = read(SDHOST_RESP0);
+        if response & 0xfdf9_0000 != 0 {
+            STATE.dbg_rint = response;
+            return abort(err);
+        }
         write(SDHOST_RINTSTS, 0xffff_ffff);
         write(SDHOST_IDSTS, 0xffff_ffff);
         fence();
-        if is_write && !sdmmc_wait_not_busy(40_000_000) {
+        if is_write && !sdmmc_wait_not_busy_with(40_000_000, keepalive) {
             return abort(err);
         }
         if is_write {
@@ -2008,7 +2096,15 @@ pub unsafe fn bench<F: FnMut()>(
         for m in 0..cmds {
             let lba = BENCH_LBA + m * cmd_sectors;
             if streaming {
-                sdmmc_stream(lba, cmd_sectors, true, seed, &mut keepalive)?;
+                sdmmc_stream(lba, cmd_sectors, true, &mut keepalive, |seg, offset, _| {
+                    fill_seg(
+                        seg,
+                        lba.wrapping_mul((SECTOR_BYTES / 4) as u32)
+                            .wrapping_add((offset / 4) as u32),
+                        seed,
+                    );
+                    Ok(())
+                })?;
             } else {
                 bench_chunked_spi(lba, cmd_sectors, true, seed)?;
                 keepalive();
@@ -2024,7 +2120,18 @@ pub unsafe fn bench<F: FnMut()>(
         for m in 0..cmds {
             let lba = BENCH_LBA + m * cmd_sectors;
             if streaming {
-                sdmmc_stream(lba, cmd_sectors, false, seed, &mut keepalive)?;
+                sdmmc_stream(lba, cmd_sectors, false, &mut keepalive, |seg, offset, _| {
+                    if check_seg(
+                        seg,
+                        lba.wrapping_mul((SECTOR_BYTES / 4) as u32)
+                            .wrapping_add((offset / 4) as u32),
+                        seed,
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(ERR_SD_CRC)
+                    }
+                })?;
             } else {
                 bench_chunked_spi(lba, cmd_sectors, false, seed)?;
                 keepalive();

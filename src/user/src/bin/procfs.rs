@@ -346,6 +346,7 @@ fn render_path(path: &[u8], i2c: I2cCaps, out: &mut TextBuf<512>) -> u8 {
                 3 => b"pixel",
                 4 => b"diag",
                 5 => b"boot",
+                abi::DISPLAY_MODE_CONSOLE => b"console",
                 _ => b"none",
             };
             let frames = word_le(&snap, 4);

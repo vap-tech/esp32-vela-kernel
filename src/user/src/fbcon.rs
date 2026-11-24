@@ -104,6 +104,13 @@ impl Console {
         }
     }
 
+    /// Tell the renderer that the raster was cleared while keeping the text grid.
+    pub fn framebuffer_cleared(&mut self) {
+        self.drawn
+            .as_flattened_mut()
+            .fill(b' ' as u16 | (DEFAULT_COLOR as u16) << 9);
+    }
+
     /// Cursor position as `(column, row)`; a pending wrap reports the last column.
     pub fn cursor(&self) -> (usize, usize) {
         (self.col.min(COLS - 1), self.row)
@@ -374,6 +381,19 @@ mod tests {
     fn render(console: &mut Console, fb: &mut [u32]) -> usize {
         // SAFETY: `fb` is a full-size raster.
         unsafe { console.render(fb.as_mut_ptr()) }
+    }
+
+    #[test]
+    fn repaint_restores_console_after_clearing_the_export_screen() {
+        let mut console = Console::new();
+        let mut fb = raster();
+        console.write(b"Vela");
+        let count = render(&mut console, &mut fb);
+        let original = fb.clone();
+        fb.fill(0);
+        console.framebuffer_cleared();
+        assert_eq!(render(&mut console, &mut fb), count);
+        assert_eq!(fb, original);
     }
 
     #[test]

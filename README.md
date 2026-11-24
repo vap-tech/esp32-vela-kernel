@@ -502,10 +502,17 @@ the model and capacity with `lsblk` before partitioning or formatting.
 
 For writable export, unmount every partition on Linux and use the desktop's
 Eject action or `sudo eject -s /dev/sdX` on the **whole Tab5 disk**. Vela
-acknowledges eject after card writes have completed, switches back to its
-USB console, and reopens the ext4 partition on the next file request.
+acknowledges eject after card writes have completed. It reports an empty LUN
+while the host finishes probing, then switches back to the USB console and
+reopens the ext4 partition on the next file request.
+Writable export groups sectors into up to 128 KiB in PSRAM. SDMMC sends a batch
+as one CMD25 through its 32 KiB DMA ring (the last short batch is also committed
+before SCSI success). USB-C still operates at Full Speed.
 Writable export has no timeout. After an unexpected USB disconnect, reconnect
 and eject the disk before trying to access it from Vela.
+
+The Tab5 screen shows the export mode and how to eject. It returns to the
+framebuffer console when Vela takes the card back.
 
 USB-C switches from Serial/JTAG to Full-Speed USB OTG during export. Reopen
 the console when it reconnects. The `ttyACM` number can change, so use the

@@ -56,6 +56,10 @@ pub fn sleep() {
 /// Whether the screen is blanked (backlight off). The keyboard service uses it to swallow
 /// the key that wakes the display.
 pub fn display_blanked() -> bool {
+    display_flags() & abi::DISPLAY_FLAG_BLANKED != 0
+}
+
+pub fn display_flags() -> u32 {
     let mut flags = [0u8; abi::STATS_DISPLAY_BYTES];
     let rc = call(
         abi::STATS,
@@ -64,7 +68,11 @@ pub fn display_blanked() -> bool {
         abi::STATS_DISPLAY,
         0,
     );
-    rc == 0 && flags[0] & 1 != 0
+    if rc == 0 {
+        u32::from_le_bytes(flags)
+    } else {
+        0
+    }
 }
 
 #[inline(always)]

@@ -3,7 +3,7 @@ use vela_kernel::{
     dma::DmaDirection,
     errno::Errno,
     event::WaitOutcome,
-    id::{Handle, ProcSlot, Ticks},
+    id::{Handle, Pid, ProcSlot, Ticks},
     lifecycle,
     memory::MemoryClass,
     task::{Context, Wait},
@@ -20,6 +20,13 @@ use crate::{
 };
 
 impl Runtime {
+    fn release_sd_export_buffer(&mut self) {
+        if let Some(region) = self.sd_export_buffer.take() {
+            let _ = self.display.set_psram_region_mapped(region, false);
+            let _ = self.allocator.free(Pid::KERNEL, region);
+        }
+    }
+
     pub(crate) fn stop_sd_export(&mut self, host_ejected: bool) {
         self.sd_export_interrupted = !host_ejected && self.usb_storage.writable();
         // SAFETY: device ownership changes are serialized by KERNEL_LOCK.
@@ -28,6 +35,7 @@ impl Runtime {
             // An interrupted writer may still have dirty state on the host.
             soc::sdcard::set_exported(self.sd_export_interrupted);
         };
+        self.release_sd_export_buffer();
         self.sd_export_owner = None;
         self.sd_partition = None;
         self.sd_epoch = (self.sd_epoch % i32::MAX as u32) + 1;
@@ -47,15 +55,45 @@ impl Runtime {
                 if self.sd_export_interrupted && args.a1 == syscall::SD_EXPORT_START {
                     return Err(Errno::Ebusy);
                 }
+                if self.sd_export_owner.is_some() {
+                    return Err(Errno::Ebusy);
+                }
+                let writable = args.a1 == syscall::SD_EXPORT_START_RW;
+                if writable {
+                    self.ensure_psram_pool()?;
+                    let region = self.allocator.allocate_in(
+                        MemoryClass::Psram,
+                        Pid::KERNEL,
+                        soc::usb_storage::WRITE_BATCH_BYTES,
+                    )?;
+                    self.sd_export_buffer = Some(region);
+                    if !self.display.set_psram_region_mapped(region, true) {
+                        self.release_sd_export_buffer();
+                        return Err(Errno::Eio);
+                    }
+                    // SAFETY: the mapped PSRAM region is exclusively kernel-owned.
+                    unsafe { core::ptr::write_bytes(region.base as *mut u8, 0, region.size) };
+                }
                 // SAFETY: all USB device transfers use bounded, serialized polling.
-                unsafe {
-                    self.usb_storage
-                        .start(args.a1 == syscall::SD_EXPORT_START_RW)?
-                };
+                let display = &mut self.display;
+                if let Err(error) =
+                    unsafe { self.usb_storage.start(writable, &mut || display.tick()) }
+                {
+                    self.release_sd_export_buffer();
+                    return Err(error);
+                }
                 self.sd_export_owner = Some(owner);
             }
             syscall::SD_EXPORT_POLL if self.sd_export_owner == Some(owner) => {
-                return match unsafe { self.usb_storage.poll() } {
+                // SAFETY: this PSRAM allocation belongs to the kernel, has
+                // no user mappings, and is initialized before forming a slice.
+                let staging = if let Some(region) = self.sd_export_buffer {
+                    unsafe { core::slice::from_raw_parts_mut(region.base as *mut u8, region.size) }
+                } else {
+                    &mut []
+                };
+                let display = &mut self.display;
+                return match unsafe { self.usb_storage.poll(staging, &mut || display.tick()) } {
                     Ok(syscall::SD_EXPORT_EJECTED) => {
                         self.stop_sd_export(true);
                         Ok(syscall::SD_EXPORT_EJECTED)

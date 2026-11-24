@@ -119,6 +119,7 @@ extern "C" fn rust_main() -> ! {
             sentinel: SentinelClient::new(),
             display: DisplayControl::new(),
             usb_storage: soc::usb_storage::UsbStorage::new(),
+            sd_export_buffer: None,
             sd_export_owner: None,
             sd_export_interrupted: false,
             sd_epoch: 1,
