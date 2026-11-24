@@ -1,6 +1,6 @@
 use crate::{
     capability::Object,
-    id::{Handle, ProcSlot, ThreadSlot, Ticks, Tid},
+    id::{Handle, Pid, ProcSlot, ThreadSlot, Ticks, Tid},
 };
 
 /// Architecture-owned saved CPU state: the only view the kernel crate has of
@@ -40,6 +40,9 @@ pub enum State {
 pub enum Wait {
     None,
     Sleep,
+    ProcessExit {
+        pid: Pid,
+    },
     Receive {
         endpoint: usize,
         handle: Handle,
@@ -83,7 +86,7 @@ pub struct Thread<C: Copy> {
 }
 
 impl<C: Copy> Thread<C> {
-    /// Compact ABI state code: 0=term, 1=run, 2=ready, 3=sleep, 4=recv, 5=reply, 6=event, 7=dev.
+    /// Compact ABI state code: 0=term, 1=run, 2=ready, 3=sleep, 4=recv, 5=reply, 6=event, 7=dev, 8=child.
     pub const fn state_code(&self) -> u8 {
         match self.state {
             State::Terminated => 0,
@@ -95,6 +98,7 @@ impl<C: Copy> Thread<C> {
                 Wait::Reply { .. } => 5,
                 Wait::Event { .. } => 6,
                 Wait::Device { .. } | Wait::None => 7,
+                Wait::ProcessExit { .. } => 8,
             },
         }
     }

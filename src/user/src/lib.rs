@@ -8,6 +8,7 @@
 extern crate std;
 
 pub mod arena;
+pub mod boot_cfg;
 pub mod ext4;
 pub mod fbcon;
 pub mod file;
@@ -15,6 +16,7 @@ pub mod font;
 pub mod i2c;
 pub mod ina226;
 pub mod kbd;
+pub mod mount;
 pub mod sdcard;
 pub mod sys;
 pub mod term;
@@ -94,6 +96,7 @@ impl Buffer {
         }
     }
 
+    #[inline(never)]
     pub fn append(&mut self, slice: &[u8]) {
         for &byte in slice {
             self.push(byte);
@@ -108,30 +111,12 @@ impl Buffer {
         self.len >= offset && &self.bytes[offset..self.len] == expected
     }
 
-    pub fn delay_ms(&self, offset: usize) -> Option<u32> {
-        if offset >= self.len {
-            return None;
-        }
-        let mut value = 0u32;
-        for &byte in &self.bytes[offset..self.len] {
-            if !byte.is_ascii_digit() {
-                return None;
-            }
-            value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
-            if value > 60_000 {
-                return None;
-            }
-        }
-        (value != 0).then_some(value)
-    }
-
+    #[inline(never)]
     pub fn word(&self, offset: usize) -> u32 {
-        u32::from(self.get(offset))
-            | (u32::from(self.get(offset + 1)) << 8)
-            | (u32::from(self.get(offset + 2)) << 16)
-            | (u32::from(self.get(offset + 3)) << 24)
+        word_le(self.as_slice(), offset)
     }
 
+    #[inline(never)]
     pub fn decimal(&mut self, mut number: u32) {
         let mut digits = [0u8; 10];
         let mut count = 0;
@@ -156,6 +141,7 @@ impl Buffer {
         self.push(b'0' + (number % 10) as u8);
     }
 
+    #[inline(never)]
     pub fn decimal64(&mut self, mut low: u32, mut high: u32) {
         let mut digits = [0u8; 20];
         let mut count = 0;
@@ -251,9 +237,17 @@ pub fn div64(low: u32, high: u32, divisor: u32) -> (u32, u32, u32) {
     (qlow, qhigh, remainder)
 }
 
+#[inline(never)]
 pub fn word_le(bytes: &[u8], offset: usize) -> u32 {
-    let b = |i: usize| bytes.get(offset + i).copied().unwrap_or(0);
-    u32::from(b(0)) | (u32::from(b(1)) << 8) | (u32::from(b(2)) << 16) | (u32::from(b(3)) << 24)
+    let mut value = 0u32;
+    let mut i = 0;
+    while i < 4 {
+        if let Some(&b) = bytes.get(offset + i) {
+            value |= u32::from(b) << (i * 8);
+        }
+        i += 1;
+    }
+    value
 }
 
 pub fn dword_le(bytes: &[u8], offset: usize) -> (u32, u32) {
@@ -288,12 +282,14 @@ impl<const N: usize> TextBuf<N> {
         }
     }
 
+    #[inline(never)]
     pub fn append(&mut self, slice: &[u8]) {
         for &b in slice {
             self.push(b);
         }
     }
 
+    #[inline(never)]
     pub fn decimal(&mut self, mut number: u32) {
         let mut digits = [0u8; 10];
         let mut count = 0;
@@ -348,6 +344,7 @@ impl<const N: usize> TextBuf<N> {
         self.push(b'0' + (number % 10) as u8);
     }
 
+    #[inline(never)]
     pub fn decimal64(&mut self, mut low: u32, mut high: u32) {
         let mut digits = [0u8; 20];
         let mut count = 0;

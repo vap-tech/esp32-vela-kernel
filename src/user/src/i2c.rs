@@ -134,7 +134,7 @@ where
         n += 1;
     });
     // Summary first: if a pathological bus answers everywhere, only the tail of the
-    // address list is truncated by the fixed-size procfs buffer.
+    // address list is truncated by the fixed-size sysd buffer.
     out.append(b"\ncount ");
     out.decimal(u32::from(summary.found));
     out.append(b"\nstate ");

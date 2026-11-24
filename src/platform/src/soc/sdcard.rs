@@ -19,13 +19,11 @@
 //!   and `CMD6` High-Speed `40 MHz` switch from `PLL_160M / 4`).
 //! - Chained 8-descriptor IDMAC engine (`8 × 4096 B = 32 KiB` = `64` sectors per multi-block
 //!   `CMD18` read / `CMD25` write with hardware `send_auto_stop` `CMD12` and CRC verification).
-//! - Non-destructive raw write + read + verify benchmark (`BENCH_LBA = 16384`, 8 MiB offset,
-//!   up to `256 MiB`) seeded by the `ESP32-P4` hardware TRNG (`soc::rng`).
 use core::fmt;
 
 use crate::{
     pac::{read, write},
-    soc::{display_io as io, rng, timer},
+    soc::display_io as io,
 };
 
 const PIN_D0: usize = 39; // SD_D0 / MISO
@@ -142,7 +140,6 @@ const DES0_CH: u32 = 1 << 4;
 const DES0_OWN: u32 = 1 << 31;
 
 pub const SECTOR_BYTES: usize = 512;
-pub const BENCH_LBA: u32 = 16384; // 8 MiB offset (well past VELAIMG1 assets at LBA 2048..2580)
 const BENCH_CHUNK_SECTORS: usize = 64; // 32 KiB per multi-block CMD18/CMD25 IDMA burst
 const BENCH_CHUNK_BYTES: usize = BENCH_CHUNK_SECTORS * SECTOR_BYTES;
 const IDMA_DESC_MAX_BYTES: usize = 4096;
@@ -151,7 +148,6 @@ const IDMA_DESCS: usize = 256;
 /// Streaming benchmark: the 32 KiB `DMA_BUF` is a ring of `NSEG` 8 KiB segments that the CPU
 /// refills (write) or verifies (read) while the IDMAC is already working on later segments.
 const SEG_BYTES: usize = 8192;
-const SEG_WORDS: usize = SEG_BYTES / 4;
 const NSEG: usize = BENCH_CHUNK_BYTES / SEG_BYTES;
 const DESCS_PER_SEG: usize = SEG_BYTES / IDMA_DESC_MAX_BYTES;
 
@@ -160,7 +156,6 @@ pub const ERR_SD_INIT: u32 = 19;
 pub const ERR_SD_READ: u32 = 20;
 pub const ERR_SD_CRC: u32 = 21;
 pub const ERR_SD_WRITE: u32 = 22;
-const DEFAULT_CMD_KIB: u32 = 64; // < 10 ms scheduler tick per blocking command
 pub const ERR_SD_OVERRUN: u32 = 23; // CPU could not keep ahead of the IDMAC ring
 
 #[repr(C, align(16))]
@@ -248,57 +243,6 @@ impl fmt::Display for Probe {
             unsafe { STATE.dbg_rint },
             unsafe { read(SDHOST_STATUS) },
             unsafe { read(PERI_CLK_CTRL02_REG) },
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct BenchReport {
-    pub mib: u32,
-    pub cmd_kib: u32,
-    pub lba: u32,
-    pub sectors: u32,
-    pub sdmmc_4bit: bool,
-    pub clk_khz: u32,
-    pub write_ms: u32,
-    pub write_kib_s: u32,
-    pub read_ms: u32,
-    pub read_kib_s: u32,
-    pub seed: u32,
-}
-
-impl fmt::Display for BenchReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let w_mib_x100 = (self.write_kib_s * 100 + 512) / 1024;
-        let r_mib_x100 = (self.read_kib_s * 100 + 512) / 1024;
-        f.write_str("[sdcard-bench] ")?;
-        write!(
-            f,
-            "size={}MiB cmd={}KiB lba={}..{} ({} sectors) bus=",
-            self.mib,
-            self.cmd_kib,
-            self.lba,
-            self.lba + self.sectors,
-            self.sectors,
-        )?;
-        f.write_str(if self.sdmmc_4bit {
-            "sdmmc_4bit_idma"
-        } else {
-            "spi_1bit"
-        })?;
-        write!(
-            f,
-            " clk={}MHz write={}ms ({}.{:02}MiB/s, {}KiB/s) read={}ms ({}.{:02}MiB/s, {}KiB/s) trng_seed={:#010x} verify=ok\n",
-            self.clk_khz / 1000,
-            self.write_ms,
-            w_mib_x100 / 100,
-            w_mib_x100 % 100,
-            self.write_kib_s,
-            self.read_ms,
-            r_mib_x100 / 100,
-            r_mib_x100 % 100,
-            self.read_kib_s,
-            self.seed,
         )
     }
 }
@@ -1833,36 +1777,6 @@ pub unsafe fn write_sector(lba: u32, data: &[u8; SECTOR_BYTES]) -> Result<(), u3
 }
 
 #[inline(always)]
-fn pattern_word(seed: u32, g: u32) -> u32 {
-    let x = g.wrapping_mul(0x9e37_79b1) ^ seed;
-    x ^ (x >> 15)
-}
-
-/// Fill ring segment `seg` with the benchmark pattern starting at absolute word index `word_base`.
-unsafe fn fill_seg(seg: usize, word_base: u32, seed: u32) {
-    unsafe {
-        let p = (dma_buf_direct_ptr() as *mut u32).add(seg * SEG_WORDS);
-        for i in 0..SEG_WORDS {
-            p.add(i)
-                .write_volatile(pattern_word(seed, word_base.wrapping_add(i as u32)));
-        }
-    }
-}
-
-/// Verify ring segment `seg` against the benchmark pattern.
-unsafe fn check_seg(seg: usize, word_base: u32, seed: u32) -> bool {
-    unsafe {
-        let p = (dma_buf_direct_ptr() as *const u32).add(seg * SEG_WORDS);
-        for i in 0..SEG_WORDS {
-            if p.add(i).read_volatile() != pattern_word(seed, word_base.wrapping_add(i as u32)) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-#[inline(always)]
 unsafe fn desc_done(idx: usize) -> bool {
     unsafe { (idma_chain_direct_ptr(idx) as *const u32).read_volatile() & DES0_OWN == 0 }
 }
@@ -2046,142 +1960,5 @@ unsafe fn sdmmc_stream(
             STATE.read_sectors = STATE.read_sectors.saturating_add(sectors);
         }
         Ok(())
-    }
-}
-
-/// SPI-fallback benchmark step: `STREAM_SECTORS` sectors via 64-sector buffers.
-unsafe fn bench_chunked_spi(lba: u32, sectors: u32, is_write: bool, seed: u32) -> Result<(), u32> {
-    unsafe {
-        let word_base = lba.wrapping_mul((SECTOR_BYTES / 4) as u32);
-        let mut done = 0u32;
-        while done < sectors {
-            let n = (sectors - done).min(BENCH_CHUNK_SECTORS as u32);
-            let wb = word_base.wrapping_add(done * (SECTOR_BYTES / 4) as u32);
-            if is_write {
-                for seg in 0..NSEG {
-                    fill_seg(seg, wb.wrapping_add((seg * SEG_WORDS) as u32), seed);
-                }
-                write_sectors_dma(lba + done, n as usize)?;
-            } else {
-                read_sectors_dma(lba + done, n as usize)?;
-                for seg in 0..(n as usize * SECTOR_BYTES / SEG_BYTES) {
-                    if !check_seg(seg, wb.wrapping_add((seg * SEG_WORDS) as u32), seed) {
-                        return Err(ERR_SD_CRC);
-                    }
-                }
-            }
-            done += n;
-        }
-        Ok(())
-    }
-}
-
-/// Run a raw multi-block write + read + verify benchmark of `mib` MiB (`1..=256 MiB`)
-/// starting at `BENCH_LBA` (`LBA 16384`). On the 4-bit SDMMC path each MiB is a single
-/// `CMD25` / `CMD18` streamed through the IDMAC descriptor ring (see [`sdmmc_stream`]); the
-/// whole payload is verified word by word. The pattern is seeded by the hardware TRNG (`soc::rng`).
-///
-/// Invokes `keepalive()` periodically so the LP Sentinel heartbeat stays healthy.
-///
-/// # Safety
-/// Exclusive HP0 ownership of `SDHOST` and `DMA_BUF` with machine interrupts masked.
-pub unsafe fn bench<F: FnMut()>(
-    mib: u32,
-    cmd_kib: u32,
-    mut keepalive: F,
-) -> Result<BenchReport, u32> {
-    let mib = mib.clamp(1, 256);
-    // Command length: multiple of the 8 KiB ring segment, at most 1 MiB, dividing the total.
-    let cmd_kib = if cmd_kib == 0 {
-        DEFAULT_CMD_KIB
-    } else {
-        cmd_kib
-    };
-    if cmd_kib % 8 != 0 || cmd_kib > 1024 || (mib * 1024) % cmd_kib != 0 {
-        return Err(ERR_SD_WRITE);
-    }
-    let cmd_sectors = cmd_kib * 2;
-    let cmds = mib * 1024 / cmd_kib;
-    let total_sectors = mib.saturating_mul(2048);
-    unsafe {
-        let _ = ensure_initialized()?;
-        check_legacy_write_range(BENCH_LBA, total_sectors)?;
-        let seed = rng::next_u32();
-        let streaming = STATE.sdmmc_4bit;
-
-        keepalive();
-        let w_start_16m = timer::counter_16mhz().unwrap_or(0);
-        for m in 0..cmds {
-            let lba = BENCH_LBA + m * cmd_sectors;
-            if streaming {
-                sdmmc_stream(lba, cmd_sectors, true, &mut keepalive, |seg, offset, _| {
-                    fill_seg(
-                        seg,
-                        lba.wrapping_mul((SECTOR_BYTES / 4) as u32)
-                            .wrapping_add((offset / 4) as u32),
-                        seed,
-                    );
-                    Ok(())
-                })?;
-            } else {
-                bench_chunked_spi(lba, cmd_sectors, true, seed)?;
-                keepalive();
-            }
-        }
-        let w_elapsed_16m = timer::counter_16mhz()
-            .unwrap_or(w_start_16m)
-            .saturating_sub(w_start_16m)
-            .max(1);
-
-        keepalive();
-        let r_start_16m = timer::counter_16mhz().unwrap_or(0);
-        for m in 0..cmds {
-            let lba = BENCH_LBA + m * cmd_sectors;
-            if streaming {
-                sdmmc_stream(lba, cmd_sectors, false, &mut keepalive, |seg, offset, _| {
-                    if check_seg(
-                        seg,
-                        lba.wrapping_mul((SECTOR_BYTES / 4) as u32)
-                            .wrapping_add((offset / 4) as u32),
-                        seed,
-                    ) {
-                        Ok(())
-                    } else {
-                        Err(ERR_SD_CRC)
-                    }
-                })?;
-            } else {
-                bench_chunked_spi(lba, cmd_sectors, false, seed)?;
-                keepalive();
-            }
-        }
-        let r_elapsed_16m = timer::counter_16mhz()
-            .unwrap_or(r_start_16m)
-            .saturating_sub(r_start_16m)
-            .max(1);
-        keepalive();
-
-        let total_kib = u64::from(mib) * 1024;
-        let write_ms = ((w_elapsed_16m * 1000 + 8_000_000) / 16_000_000).max(1) as u32;
-        let read_ms = ((r_elapsed_16m * 1000 + 8_000_000) / 16_000_000).max(1) as u32;
-        let write_kib_s = ((total_kib * 16_000_000 + w_elapsed_16m / 2) / w_elapsed_16m) as u32;
-        let read_kib_s = ((total_kib * 16_000_000 + r_elapsed_16m / 2) / r_elapsed_16m) as u32;
-
-        STATE.bench_write_kib_s = write_kib_s;
-        STATE.bench_read_kib_s = read_kib_s;
-
-        Ok(BenchReport {
-            mib,
-            cmd_kib,
-            lba: BENCH_LBA,
-            sectors: total_sectors,
-            sdmmc_4bit: STATE.sdmmc_4bit,
-            clk_khz: STATE.clk_khz,
-            write_ms,
-            write_kib_s,
-            read_ms,
-            read_kib_s,
-            seed,
-        })
     }
 }

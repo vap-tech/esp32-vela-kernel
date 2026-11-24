@@ -1,7 +1,7 @@
 use crate::{
     call::CallTable,
     errno::Errno,
-    id::{ProcSlot, ThreadSlot, Ticks, Tid},
+    id::{Pid, ProcSlot, ThreadSlot, Ticks, Tid},
     stats::{HZ, LoadAverage, Snapshot},
     task::{Context, Region, State, Thread, Wait},
 };
@@ -474,6 +474,18 @@ impl<C: Context> Scheduler<C> {
         self.task_mut(task).context.set_return2(a1);
         self.wake(task);
     }
+    /// Wake callers blocked on this exact process after its final thread exits.
+    pub fn wake_process_exit(&mut self, pid: Pid) {
+        for i in 0..TASKS {
+            let slot = ThreadSlot(i);
+            if self.tasks[i].state == State::Blocked
+                && self.tasks[i].wait == (Wait::ProcessExit { pid })
+            {
+                self.wake_with(slot, pid.raw());
+            }
+        }
+    }
+
     /// Advance kernel time, expire all elapsed thread deadlines in a single
     /// O(TASKS) pass, and update 5-second load samples.
     pub fn tick(&mut self, uptime: Ticks, calls: &mut CallTable) {

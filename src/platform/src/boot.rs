@@ -23,8 +23,8 @@ use crate::{
 };
 
 const EXT4FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ext4fs.elf"));
-const PROCFS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/procfs.elf"));
-const SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
+const SYSD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sysd.elf"));
+const INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
 const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
 const FBCON_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fbcon.elf"));
@@ -135,54 +135,66 @@ extern "C" fn rust_main() -> ! {
         })
     };
 
-    // Keep room in SRAM for service stacks and DMA by placing the shell image in PSRAM.
-    let (procfs, _, _) = runtime.load_elf(PROCFS_ELF, false).expect("procfs ELF");
-    let (shell, _, _) = runtime
-        .load_elf_in(SHELL_ELF, MemoryClass::Psram, false)
-        .expect("shell ELF");
+    // Keep room in SRAM for service stacks and DMA by placing init in PSRAM.
+    let (sysd, _, _) = runtime.load_elf(SYSD_ELF, false).expect("sysd ELF");
+    let (init_proc, _, _) = runtime
+        .load_elf_in(INIT_ELF, MemoryClass::Psram, false)
+        .expect("init ELF");
     let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
     let (kbd_proc, _, _) = runtime.load_elf(KBD_ELF, false).expect("kbd ELF");
     let (ext4fs, _, _) = runtime.load_elf(EXT4FS_ELF, false).expect("ext4fs ELF");
     let (fbcon_proc, _, _) = runtime.load_elf(FBCON_ELF, false).expect("fbcon ELF");
 
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
-    let request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, procfs.slot).unwrap();
-    let reply = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
-    let input = create_endpoint(&mut runtime.ipc, &mut runtime.processes, shell.slot).unwrap();
-    let shell_request = grant(
-        &mut runtime.processes,
-        procfs.slot,
-        request,
-        shell.slot,
-        cap::SEND,
-    )
-    .unwrap();
-    let proc_reply = grant(
-        &mut runtime.processes,
-        shell.slot,
-        reply,
-        procfs.slot,
-        cap::SEND,
-    )
-    .unwrap();
-    let fs_request =
-        create_endpoint(&mut runtime.ipc, &mut runtime.processes, ext4fs.slot).unwrap();
-    let fs_object = runtime
+    let vfs_request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, sysd.slot).unwrap();
+    let vfs_object = runtime
         .processes
-        .slot(ext4fs.slot)
+        .slot(sysd.slot)
         .capabilities
-        .get(fs_request, cap::CONTROL)
+        .get(vfs_request, cap::CONTROL)
         .unwrap()
         .object;
-    let shell_fs = runtime
+    let init_vfs = runtime
         .processes
-        .slot_mut(shell.slot)
+        .slot_mut(init_proc.slot)
         .capabilities
         .install(Capability {
-            object: fs_object,
+            object: vfs_object,
             rights: cap::SEND | cap::PASS_ON_SPAWN,
         })
         .unwrap();
+
+    // `init` owns the terminal input endpoint and delegates RECEIVE to spawned children (e.g. shell),
+    // keeping `console` and `kbd` connected even if the child restarts.
+    let input_owner =
+        create_endpoint(&mut runtime.ipc, &mut runtime.processes, init_proc.slot).unwrap();
+    let input_object = runtime
+        .processes
+        .slot(init_proc.slot)
+        .capabilities
+        .get(input_owner, cap::CONTROL)
+        .unwrap()
+        .object;
+    let init_input = runtime
+        .processes
+        .slot_mut(init_proc.slot)
+        .capabilities
+        .install(Capability {
+            object: input_object,
+            rights: cap::RECEIVE | cap::PASS_ON_SPAWN,
+        })
+        .unwrap();
+
+    let fs_request =
+        create_endpoint(&mut runtime.ipc, &mut runtime.processes, ext4fs.slot).unwrap();
+    let sysd_ext4 = grant(
+        &mut runtime.processes,
+        ext4fs.slot,
+        fs_request,
+        sysd.slot,
+        cap::SEND,
+    )
+    .unwrap();
     let storage = runtime
         .processes
         .slot_mut(ext4fs.slot)
@@ -192,19 +204,20 @@ extern "C" fn rust_main() -> ! {
             rights: cap::READ,
         })
         .unwrap();
+
     let console_input = grant(
         &mut runtime.processes,
-        shell.slot,
-        input,
+        init_proc.slot,
+        input_owner,
         console_proc.slot,
         cap::SEND,
     )
     .unwrap();
-    // The Tab5 Keyboard service feeds the same shell input endpoint as the USB console.
+    // The Tab5 Keyboard service feeds the same terminal input endpoint as the USB console.
     let kbd_input = grant(
         &mut runtime.processes,
-        shell.slot,
-        input,
+        init_proc.slot,
+        input_owner,
         kbd_proc.slot,
         cap::SEND,
     )
@@ -250,55 +263,57 @@ extern "C" fn rust_main() -> ! {
         cap::READ | cap::WAIT | cap::ACK,
     )
     .unwrap();
-    let mut install_i2c = |bus: u8| {
-        runtime
-            .processes
-            .slot_mut(procfs.slot)
-            .capabilities
-            .install(Capability {
-                object: Object::Authority(Authority::I2c(bus)),
-                rights: cap::READ | cap::WRITE,
-            })
-            .unwrap()
-    };
-    let procfs_i2c_cap = install_i2c(crate::syscall::I2C_BUS_SYSTEM);
-    let procfs_i2c_ext_cap = install_i2c(crate::syscall::I2C_BUS_EXT1);
-    let shell_caps = &mut runtime.processes.slot_mut(shell.slot).capabilities;
-    let spawn_cap = shell_caps
+
+    let sysd_caps = &mut runtime.processes.slot_mut(sysd.slot).capabilities;
+    let sysd_i2c_system = sysd_caps
         .install(Capability {
-            object: Object::Authority(Authority::ProcessSpawn),
-            rights: cap::EXECUTE | cap::GRANT | cap::CONTROL,
+            object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_SYSTEM)),
+            rights: cap::READ | cap::WRITE,
         })
         .unwrap();
-    let display_cap = shell_caps
+    let sysd_i2c_ext1 = sysd_caps
+        .install(Capability {
+            object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_EXT1)),
+            rights: cap::READ | cap::WRITE,
+        })
+        .unwrap();
+    let sysd_display = sysd_caps
         .install(Capability {
             object: Object::Authority(Authority::Display),
-            rights: cap::CONTROL | cap::GRANT,
+            rights: cap::CONTROL,
         })
         .unwrap();
-    let sentinel_cap = shell_caps
+    let sysd_sentinel = sysd_caps
         .install(Capability {
             object: Object::Authority(Authority::Sentinel),
-            rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL | cap::GRANT,
+            rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL,
         })
         .unwrap();
-    let _irq_cap = shell_caps
+
+    let init_caps = &mut runtime.processes.slot_mut(init_proc.slot).capabilities;
+    let spawn_cap = init_caps
         .install(Capability {
-            object: Object::Authority(Authority::IrqControl),
-            rights: cap::CONTROL | cap::GRANT,
+            object: Object::Authority(Authority::ProcessSpawn),
+            rights: cap::EXECUTE | cap::CONTROL | cap::PASS_ON_SPAWN,
+        })
+        .unwrap();
+    let display_cap = init_caps
+        .install(Capability {
+            object: Object::Authority(Authority::Display),
+            rights: cap::CONTROL | cap::PASS_ON_SPAWN,
         })
         .unwrap();
 
     runtime
         .start_loaded(
-            procfs,
+            sysd,
             [
-                request.raw(),
-                proc_reply.raw(),
-                procfs_i2c_cap.raw(),
-                procfs_i2c_ext_cap.raw(),
-                0,
-                0,
+                vfs_request.raw(),
+                sysd_ext4.raw(),
+                sysd_i2c_system.raw(),
+                sysd_i2c_ext1.raw(),
+                sysd_display.raw(),
+                sysd_sentinel.raw(),
             ],
             0,
             1,
@@ -306,14 +321,14 @@ extern "C" fn rust_main() -> ! {
         .unwrap();
     runtime
         .start_loaded(
-            shell,
+            init_proc,
             [
-                shell_fs.raw(),
-                shell_request.raw(),
-                input.raw(),
+                init_vfs.raw(),
+                init_input.raw(),
                 spawn_cap.raw(),
                 display_cap.raw(),
-                sentinel_cap.raw(),
+                0,
+                0,
             ],
             1,
             1,
@@ -349,15 +364,15 @@ extern "C" fn rust_main() -> ! {
         .start_loaded(ext4fs, [fs_request.raw(), storage.raw(), 0, 0, 0, 0], 1, 1)
         .unwrap();
 
-    let (revision, initial_pmp, _) = runtime.pmp_images[procfs.slot.index()].unwrap();
+    let (revision, initial_pmp, _) = runtime.pmp_images[sysd.slot.index()].unwrap();
     assert!(unsafe { initial_pmp.activate_initial() }, "PMP readback");
-    runtime.pmp_images[procfs.slot.index()] = Some((revision, initial_pmp, 1));
-    runtime.harts[0].active_space = Some((procfs.slot, revision));
+    runtime.pmp_images[sysd.slot.index()] = Some((revision, initial_pmp, 1));
+    runtime.harts[0].active_space = Some((sysd.slot, revision));
     runtime.scheduler.activate_initial_on(0, ThreadSlot(0));
 
     let _ = writeln!(
         runtime.console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] procfs started\n[task] shell started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[task] fbcon started (display console)\n[sched] preemptive scheduler online"
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] sysd started (/proc /sys /dev /sd)\n[task] init started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[task] fbcon started (display console)\n[sched] preemptive scheduler online"
     );
 
     unsafe {
@@ -385,7 +400,7 @@ extern "C" fn rust_main() -> ! {
         arch::restore_extended_context(&runtime.ext_contexts[0]);
         let initial_ctx = &raw const runtime.scheduler.tasks[0].context;
         soc::smp::mark_hart_in_user(0);
-        // Kick HP1 so it picks up any runnable thread (e.g. console/shell) immediately.
+        // Kick HP1 so it picks up any runnable thread (e.g. console/init) immediately.
         soc::smp::send_ipi(1);
         arch::enter(initial_ctx);
     }

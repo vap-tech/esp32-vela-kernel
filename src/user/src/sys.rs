@@ -1,6 +1,5 @@
 use vela_abi::syscall as abi;
 
-#[inline(always)]
 pub fn call6(number: u32, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) -> (u32, u32) {
     #[cfg(target_arch = "riscv32")]
     {
@@ -27,12 +26,11 @@ pub fn call6(number: u32, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) 
     }
 }
 
-#[inline(always)]
 pub fn call(number: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
     call6(number, a0, a1, a2, a3, 0, 0).0
 }
 
-#[inline(always)]
+#[inline(never)]
 pub fn write(bytes: &[u8]) {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -43,12 +41,10 @@ pub fn write(bytes: &[u8]) {
     }
 }
 
-#[inline(always)]
 pub fn sleep_ticks(ticks: u32) {
     call(abi::SLEEP, ticks, 0, 0, 0);
 }
 
-#[inline(always)]
 pub fn sleep() {
     sleep_ticks(1);
 }
@@ -75,27 +71,22 @@ pub fn display_flags() -> u32 {
     }
 }
 
-#[inline(always)]
 pub fn event_wait(handle: u32, timeout_ticks: u32) -> u32 {
     call(abi::EVENT_WAIT, handle, timeout_ticks, 0, 0)
 }
 
-#[inline(always)]
 pub fn irq_ack(handle: u32) -> u32 {
     call(abi::IRQ_ACK, handle, 0, 0, 0)
 }
 
-#[inline(always)]
 pub fn irq_bind(irq_ctl_handle: u32, slot: u32) -> u32 {
     call(abi::IRQ_BIND, irq_ctl_handle, slot, 0, 0)
 }
 
-#[inline(always)]
 pub fn irq_unbind(event_handle: u32) -> u32 {
     call(abi::IRQ_UNBIND, event_handle, 0, 0, 0)
 }
 
-#[inline(always)]
 pub fn i2c_transfer(handle: u32, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), i32> {
     let tx_ptr = if tx.is_empty() { 0 } else { tx.as_ptr() as u32 };
     let rx_ptr = if rx.is_empty() {
@@ -117,7 +108,6 @@ pub fn i2c_transfer(handle: u32, addr: u8, tx: &[u8], rx: &mut [u8]) -> Result<(
 }
 
 /// Read console output from byte `cursor` on; returns the bytes copied and the next cursor.
-#[inline(always)]
 pub fn console_log(handle: u32, buffer: &mut [u8], cursor: u32) -> (usize, u32) {
     let len = buffer.len().min(128) as u32;
     let (count, next) = call6(
@@ -136,7 +126,6 @@ pub fn console_log(handle: u32, buffer: &mut [u8], cursor: u32) -> (usize, u32) 
     }
 }
 
-#[inline(always)]
 pub fn exit() -> ! {
     call(abi::EXIT, 0, 0, 0, 0);
     loop {
@@ -144,7 +133,6 @@ pub fn exit() -> ! {
     }
 }
 
-#[inline(always)]
 pub fn process_exit() -> ! {
     call(abi::PROCESS_EXIT, 0, 0, 0, 0);
     loop {
@@ -168,7 +156,6 @@ macro_rules! entry {
     };
 }
 
-#[inline(always)]
 pub fn rdcycle64() -> u64 {
     #[cfg(target_arch = "riscv32")]
     {

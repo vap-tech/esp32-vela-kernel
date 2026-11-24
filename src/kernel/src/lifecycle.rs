@@ -220,21 +220,48 @@ pub fn grant(
     })
 }
 
-/// Resolve an explicitly passable endpoint into the capability a child receives.
-pub fn endpoint_for_spawn(
+/// Resolve an explicitly passable capability into the attenuated capability a child receives.
+/// `GRANT` is never delegated; `PASS_ON_SPAWN` requires `allow_repass` (boot-privileged spawner
+/// with `ProcessSpawn(CONTROL)`), and endpoint / `ProcessSpawn` ownership (`CONTROL`) is never
+/// transferred to a spawned child.
+pub fn capability_for_spawn(
     processes: &Processes,
     ipc: &Ipc,
     parent: ProcSlot,
+    allow_repass: bool,
     handle: Handle,
+    rights: u16,
 ) -> Result<Capability, Errno> {
     let source = processes
         .slot(parent)
         .capabilities
-        .get(handle, cap::SEND | cap::PASS_ON_SPAWN)?;
-    ipc.resolve(source.object)?;
+        .get(handle, cap::PASS_ON_SPAWN)?;
+    if rights == 0 || rights & !source.rights != 0 || rights & cap::GRANT != 0 {
+        return Err(Errno::Eperm);
+    }
+    if rights & cap::PASS_ON_SPAWN != 0 && !allow_repass {
+        return Err(Errno::Eperm);
+    }
+    match source.object {
+        Object::Endpoint { .. } => {
+            if rights & cap::CONTROL != 0 {
+                return Err(Errno::Eperm);
+            }
+            ipc.resolve(source.object)?;
+        }
+        Object::Authority(Authority::ProcessSpawn) => {
+            if rights & cap::CONTROL != 0 {
+                return Err(Errno::Eperm);
+            }
+        }
+        Object::Authority(_) => {}
+        Object::Memory { .. } | Object::Event { .. } | Object::DmaChannel { .. } => {
+            return Err(Errno::Eperm);
+        }
+    }
     Ok(Capability {
         object: source.object,
-        rights: cap::SEND,
+        rights,
     })
 }
 
@@ -1015,6 +1042,7 @@ pub fn terminate_current_thread<C: Context>(
             }
         }
     }
+    scheduler.wake_process_exit(owner);
     Some(ReapedProcess {
         slot: process,
         pid: owner,
@@ -1210,7 +1238,48 @@ mod tests {
     }
 
     #[test]
-    fn spawn_can_pass_only_an_explicit_live_send_endpoint() {
+    fn foreground_waiter_wakes_only_after_its_child_is_reaped() {
+        let mut h = harness();
+        let parent = ThreadSlot(0);
+        let child = ProcSlot(1);
+        let child_pid = h.processes.slot(child).id;
+        let unrelated = ThreadSlot(2);
+        let stack = h.scheduler.task(ThreadSlot(1)).stack;
+        let sibling_id = h
+            .scheduler
+            .create_thread(child, TestCtx::default(), stack, CODE.base, 1, 1)
+            .unwrap();
+        let sibling = h.scheduler.find_by_id(sibling_id).unwrap();
+        h.scheduler.current = parent;
+        h.scheduler.block(Wait::ProcessExit { pid: child_pid });
+        h.scheduler.current = unrelated;
+        h.scheduler.block(Wait::ProcessExit {
+            pid: h.processes.slot(ProcSlot(0)).id,
+        });
+
+        let terminate = |h: &mut Harness, slot| {
+            h.scheduler.current = slot;
+            terminate_current_thread(
+                &mut h.processes,
+                &mut h.ipc,
+                &mut h.calls,
+                &mut h.events,
+                &mut h.allocator,
+                &mut h.scheduler,
+                |_, _, _| {},
+                deliver_checked,
+            )
+        };
+        assert!(terminate(&mut h, ThreadSlot(1)).is_none());
+        assert_eq!(h.scheduler.task(parent).state, State::Blocked);
+        assert_eq!(terminate(&mut h, sibling).unwrap().pid, child_pid);
+        assert_eq!(h.scheduler.task(parent).state, State::Ready);
+        assert_eq!(h.scheduler.task(parent).context.a0, child_pid.raw());
+        assert_eq!(h.scheduler.task(unrelated).state, State::Blocked);
+    }
+
+    #[test]
+    fn spawn_capability_passing_enforces_attenuation_and_liveness() {
         let mut h = harness();
         let owner = ProcSlot(0);
         let parent = ProcSlot(1);
@@ -1218,7 +1287,7 @@ mod tests {
         let endpoint = create_endpoint(&mut h.ipc, &mut h.processes, owner).unwrap();
         let delegated = grant(&mut h.processes, owner, endpoint, parent, cap::SEND).unwrap();
         assert_eq!(
-            endpoint_for_spawn(&h.processes, &h.ipc, parent, delegated).err(),
+            capability_for_spawn(&h.processes, &h.ipc, parent, false, delegated, cap::SEND).err(),
             Some(Errno::Eperm)
         );
         let object = h
@@ -1237,7 +1306,34 @@ mod tests {
                 rights: cap::SEND | cap::PASS_ON_SPAWN,
             })
             .unwrap();
-        let cap = endpoint_for_spawn(&h.processes, &h.ipc, parent, passable).unwrap();
+        // Normal spawner cannot delegate PASS_ON_SPAWN or CONTROL.
+        assert_eq!(
+            capability_for_spawn(
+                &h.processes,
+                &h.ipc,
+                parent,
+                false,
+                passable,
+                cap::SEND | cap::PASS_ON_SPAWN,
+            )
+            .err(),
+            Some(Errno::Eperm)
+        );
+        // Boot-privileged spawner (init) may delegate PASS_ON_SPAWN one hop to shell.
+        let repass = capability_for_spawn(
+            &h.processes,
+            &h.ipc,
+            parent,
+            true,
+            passable,
+            cap::SEND | cap::PASS_ON_SPAWN,
+        )
+        .unwrap();
+        assert_eq!(repass.object, object);
+        assert_eq!(repass.rights, cap::SEND | cap::PASS_ON_SPAWN);
+        // Attenuated child receives SEND only and cannot pass further.
+        let cap =
+            capability_for_spawn(&h.processes, &h.ipc, parent, false, passable, cap::SEND).unwrap();
         assert_eq!(cap.object, object);
         assert_eq!(cap.rights, cap::SEND);
         let inherited = h
@@ -1247,13 +1343,40 @@ mod tests {
             .install(cap)
             .unwrap();
         assert_eq!(
-            endpoint_for_spawn(&h.processes, &h.ipc, child, inherited).err(),
+            capability_for_spawn(&h.processes, &h.ipc, child, false, inherited, cap::SEND).err(),
             Some(Errno::Eperm)
         );
+        // ProcessSpawn CONTROL can never be passed on spawn, even by init.
+        let spawn_auth = h
+            .processes
+            .slot_mut(parent)
+            .capabilities
+            .install(Capability {
+                object: Object::Authority(Authority::ProcessSpawn),
+                rights: cap::EXECUTE | cap::CONTROL | cap::PASS_ON_SPAWN,
+            })
+            .unwrap();
+        assert_eq!(
+            capability_for_spawn(
+                &h.processes,
+                &h.ipc,
+                parent,
+                true,
+                spawn_auth,
+                cap::EXECUTE | cap::CONTROL,
+            )
+            .err(),
+            Some(Errno::Eperm)
+        );
+        let child_spawn =
+            capability_for_spawn(&h.processes, &h.ipc, parent, true, spawn_auth, cap::EXECUTE)
+                .unwrap();
+        assert_eq!(child_spawn.rights, cap::EXECUTE);
+        // Closed endpoints cannot be passed.
         let index = h.ipc.resolve(object).unwrap();
         h.ipc.close(index);
         assert_eq!(
-            endpoint_for_spawn(&h.processes, &h.ipc, parent, passable).err(),
+            capability_for_spawn(&h.processes, &h.ipc, parent, false, passable, cap::SEND).err(),
             Some(Errno::Epipe)
         );
     }

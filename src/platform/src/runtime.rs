@@ -703,21 +703,6 @@ impl Runtime {
         *self.processes.slot_mut(loaded.slot) = Process::EMPTY;
     }
 
-    pub fn spawn_elf_in(
-        &mut self,
-        bytes: &[u8],
-        code_class: MemoryClass,
-        dma_driver: bool,
-    ) -> Result<Pid, Errno> {
-        let (loaded, arg0, arg1) = self.load_elf_in(bytes, code_class, dma_driver)?;
-        if let Err(e) = self.start_loaded(loaded, [arg0, arg1, 0, 0, 0, 0], 1, 1) {
-            self.abort_loaded(loaded);
-            return Err(e);
-        }
-        self.notify_remote_hart(false);
-        Ok(loaded.pid)
-    }
-
     pub fn complete_dma(&mut self, success: bool) {
         let (owner_opt, region_opt) = self.dma.finish(DMA_CH_GDMA_AHB_CH1, success);
         let alive_proc = owner_opt.and_then(|owner| self.processes.find_alive(owner));

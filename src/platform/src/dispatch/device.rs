@@ -3,7 +3,7 @@ use vela_kernel::{
     dma::DmaDirection,
     errno::Errno,
     event::WaitOutcome,
-    id::{Handle, Pid, ProcSlot, Ticks},
+    id::{Handle, Pid, ProcSlot},
     lifecycle,
     memory::MemoryClass,
     task::{Context, Wait},
@@ -181,43 +181,14 @@ impl Runtime {
                 hart.cycles.sync_clock(now_16m, before_rates.cpu);
             }
         }
-        let (diag, result) = if args.a1 == syscall::DISPLAY_MODE_SDCARD_BENCH {
-            // Boost to 180 MHz CPLL during the SDMMC benchmark so descriptor setup and
-            // verification never bottleneck the 4-bit 40 MHz SDMMC IDMAC engine.
-            let _ = self.apply_cpu_speed(true);
-            let sentinel = &mut self.sentinel;
-            let scheduler = &mut self.scheduler;
-            let processes = &self.processes;
-            let sentinel_irqs = &mut self.sentinel_interrupts;
-            // SAFETY: serialized by KERNEL_LOCK with MIE=0 on HP0.
-            let (d, res) = unsafe {
-                board::sdcard_bench(args.a2, args.a3, || {
-                    if soc::sentinel::has_pending_irq() {
-                        *sentinel_irqs += 1;
-                        if let Some(reply) = soc::sentinel::acknowledge(sentinel.epoch()) {
-                            sentinel.handle_reply(reply, scheduler, processes);
-                        }
-                    }
-                    if let Some(now) = soc::timer::uptime_ticks().map(Ticks) {
-                        sentinel.tick(now);
-                    }
-                })
-            };
-            let mapped = match res {
-                Ok(v) => Ok(v),
-                Err(code) => Ok(0u32.wrapping_sub(code)),
-            };
-            (d, mapped)
-        } else {
-            let caller = self.processes.slot(current).id;
-            self.display.step(
-                args.a1,
-                args.a2 as usize,
-                caller,
-                &mut self.allocator,
-                &mut self.dma,
-            )
-        };
+        let caller = self.processes.slot(current).id;
+        let (diag, result) = self.display.step(
+            args.a1,
+            args.a2 as usize,
+            caller,
+            &mut self.allocator,
+            &mut self.dma,
+        );
         let after_rates = unsafe { soc::clock::rates_mhz() };
         if after_rates.cpu != before_rates.cpu {
             if let Some(now_16m) = unsafe { soc::timer::counter_16mhz() } {

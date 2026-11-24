@@ -61,10 +61,22 @@ pub const CAP_REVOKE: u32 = 17; // a0=owner handle (CONTROL) -> revokes all peer
 pub const MEM_CAP: u32 = 18; // a0=owned region base -> memory capability handle
 pub const MEM_GRANT: u32 = 19; // a0=memory handle (GRANT), a1=target PID, a2=R/RW -> peer handle + PMP mapping
 
+/// Capability right bitmasks (mirror `vela_kernel::capability`).
+pub const CAP_READ: u32 = 1;
+pub const CAP_WRITE: u32 = 2;
+pub const CAP_EXECUTE: u32 = 4;
+pub const CAP_SEND: u32 = 8;
+pub const CAP_RECEIVE: u32 = 16;
+pub const CAP_GRANT_RIGHT: u32 = 32;
+pub const CAP_WAIT: u32 = 64;
+pub const CAP_ACK: u32 = 128;
+pub const CAP_CONTROL: u32 = 256;
+pub const CAP_PASS_ON_SPAWN: u32 = 512;
+
 pub const IPC_CALL: u32 = 20; // a0=endpoint handle (SEND), a1=req, a2=len, a3=reply buf, a4=cap, a5=timeout ticks
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
 pub const THREAD_PRIORITY: u32 = 22; // a0=own TID, a1=priority 0..ceiling
-pub const SPAWN_HELLO: u32 = 23; // a0=ProcessSpawn handle (EXECUTE), a1=selector (0=hello, 1=pic, 2=dma, 3=pic-psram) -> PID
+// 23: reserved (retired SPAWN_HELLO bring-up syscall)
 pub const EVENT_WAIT: u32 = 24; // a0=event handle (WAIT | ACK), a1=timeout ticks (0=infinite, 1..=6000)
 pub const DMA_COPY: u32 = 25; // a0=DMA channel capability handle (READ|WRITE|WAIT) or legacy len (a1=0), a1=len (4..=2048); block until IRQ
 pub const SENTINEL_STATUS: u32 = 26; // a0=Sentinel handle (READ) -> a0=version (0 until READY), a1=epoch
@@ -89,11 +101,11 @@ pub const DISPLAY_MODE_DIAG: u32 = 4; // Full-screen 1280x720 PSRAM diagnostic a
 pub const DISPLAY_MODE_BOOT: u32 = 5; // Full-screen 1280x720 PSRAM boot artwork
 pub const DISPLAY_MODE_SDCARD_PROBE: u32 = 6; // Verify/provision microSD VELAIMG1 asset bundle
 pub const DISPLAY_MODE_OFF: u32 = 7; // Stop DSI/DW-GDMA scanout, disable backlight, release 2 MiB PSRAM framebuffer
+// 8: reserved (retired raw SDMMC benchmark)
 pub const DISPLAY_MODE_CONSOLE: u32 = 9; // Userspace-owned 720x1280 RGB565 framebuffer: stages 0..2, then DISPLAY_MODE_STEP with a2=PSRAM region base the caller owns (>= DISPLAY_FB_BYTES)
 pub const DISPLAY_MODE_BACKLIGHT: u32 = 10; // a2=0..=255 (0 = off); only after bring-up finished, otherwise -EBUSY
 pub const DISPLAY_CONSOLE_PREP_CALLS: u32 = 3; // DISPLAY_TEST calls (MODE_CONSOLE, then two STEPs) that run stages 0..2; the next STEP carries the framebuffer
 pub const DISPLAY_FB_BYTES: usize = 720 * 1280 * 2;
-pub const DISPLAY_MODE_SDCARD_BENCH: u32 = 8; // Raw multi-block SDMMC IDMA write+read+verify benchmark (a2=mib, default 100)
 pub const IPC_REPLY_RECV: u32 = 37; // a0=reply token (0=skip), a1=reply buf, a2=reply len, a3=recv handle, a4=recv buf, a5=recv cap -> a0=len, a1=next token
 pub const IRQ_ACK: u32 = 38; // a0=event handle (ACK); clear pending notification and re-arm hardware IRQ source
 pub const IRQ_BIND: u32 = 39; // a0=IrqControl handle (CONTROL), a1=irq slot index -> bound event handle
@@ -125,11 +137,40 @@ pub const DMA_CHANNEL_DW_GDMA_SCANOUT: u32 = 1; // DW-GDMA channel 0 MIPI-DSI vi
 
 pub const SD_PARTITION: u32 = 45; // a0=read capability, a1=relative LBA, a2=512-byte dst; dst=0 queries sector count
 /// a0=ProcessSpawn capability, a1=ELF, a2=ELF length, a3=argument bytes,
-/// a4=argument length, a5=optional send capability to pass -> PID.
-/// Child entry receives (local send handle, argument pointer, argument length).
+/// a4=argument length, a5=optional pointer to `SpawnCaps` (0 = none) -> PID.
+/// Child entry receives `(cap0, arg_ptr, arg_len, cap1, cap2, cap3)`.
 pub const SPAWN_IMAGE: u32 = 46;
 pub const SPAWN_ARG_MAX: usize = 80;
 pub const SPAWN_IMAGE_MAX: usize = 8192;
+pub const SPAWN_CAPS_MAX: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpawnCap {
+    pub handle: u32,
+    pub rights: u32,
+}
+
+impl SpawnCap {
+    pub const EMPTY: Self = Self {
+        handle: 0,
+        rights: 0,
+    };
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpawnCaps {
+    pub count: u32,
+    pub caps: [SpawnCap; SPAWN_CAPS_MAX],
+}
+
+impl SpawnCaps {
+    pub const EMPTY: Self = Self {
+        count: 0,
+        caps: [SpawnCap::EMPTY; SPAWN_CAPS_MAX],
+    };
+}
 
 pub const SD_EXPORT: u32 = 47; // a0=Display control, a1=SD_EXPORT_* operation
 pub const SD_EXPORT_START: u32 = 0;
@@ -138,3 +179,7 @@ pub const SD_EXPORT_STOP: u32 = 2;
 pub const SD_EXPORT_START_RW: u32 = 3;
 pub const SD_EXPORT_EJECTED: u32 = 2;
 pub const SD_PARTITION_EPOCH: u32 = 1; // SD_PARTITION a3 selects media epoch query (a2 must be 0)
+
+/// Like SPAWN_IMAGE, but the caller blocks until the new process has exited.
+/// Returns the child PID on completion, or an error if it could not start.
+pub const SPAWN_IMAGE_WAIT: u32 = 48;

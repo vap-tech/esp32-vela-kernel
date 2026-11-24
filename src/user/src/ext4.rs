@@ -9,6 +9,7 @@ pub enum Error {
     Unsupported,
     NotFound,
     NotFile,
+    NotDirectory,
 }
 
 pub trait BlockRead {
@@ -21,6 +22,21 @@ struct Inode {
     kind: u16,
     size: u32,
     extents: [u8; 60],
+}
+
+struct DirEntry {
+    id: u32,
+    name_at: u64,
+    name_len: usize,
+    next: u32,
+}
+
+pub struct Directory(Inode);
+
+pub struct NameChunk {
+    pub next: u32,
+    pub len: usize,
+    pub end_of_name: bool,
 }
 
 pub struct Ext4<B> {
@@ -254,45 +270,69 @@ impl<B: BlockRead> Ext4<B> {
         }
     }
 
-    fn lookup(&mut self, dir: &Inode, name: &[u8]) -> Result<Inode, Error> {
+    fn check_directory(&self, dir: &Inode) -> Result<(), Error> {
         if dir.kind != 0x4000 {
-            return Err(Error::NotFound);
+            return Err(Error::NotDirectory);
         }
         // Bound the work of a single request, even on a malformed volume.
         if dir.size > 64 * 1024 || dir.size == 0 || !dir.size.is_multiple_of(self.block_size) {
             return Err(Error::Unsupported);
         }
-        for block in 0..dir.size / self.block_size {
-            let base = self.data_block(dir, block)?.ok_or(Error::Corrupt)?;
-            let mut offset = 0u32;
-            while offset < self.block_size {
-                let mut entry = [0; 8];
-                if self.block_size - offset < 8 {
-                    return Err(Error::Corrupt);
+        Ok(())
+    }
+
+    fn dir_entry(&mut self, dir: &Inode, offset: u32) -> Result<DirEntry, Error> {
+        let remaining = self.block_size - offset % self.block_size;
+        if remaining < 8 || !offset.is_multiple_of(4) {
+            return Err(Error::Corrupt);
+        }
+        let base = self
+            .data_block(dir, offset / self.block_size)?
+            .ok_or(Error::Corrupt)?;
+        let addr = base + u64::from(offset % self.block_size);
+        let mut header = [0; 8];
+        self.read_bytes(addr, &mut header)?;
+        let len = u32::from(le16(&header, 4));
+        let name_len = u32::from(header[6]);
+        let id = le32(&header, 0);
+        if len < 8 + name_len
+            || len % 4 != 0
+            || len > remaining
+            || (id != 0 && (name_len == 0 || id > self.inodes))
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(DirEntry {
+            id,
+            name_at: addr + 8,
+            name_len: name_len as usize,
+            next: offset + len,
+        })
+    }
+
+    fn lookup(&mut self, dir: &Inode, name: &[u8]) -> Result<Inode, Error> {
+        self.check_directory(dir)?;
+        let mut offset = 0;
+        let mut buf = [0; 255];
+        while offset < dir.size {
+            let entry = self.dir_entry(dir, offset)?;
+            if entry.id != 0 && entry.name_len == name.len() {
+                self.read_bytes(entry.name_at, &mut buf[..name.len()])?;
+                if &buf[..name.len()] == name {
+                    return self.inode(entry.id);
                 }
-                self.read_bytes(base + u64::from(offset), &mut entry)?;
-                let len = u32::from(le16(&entry, 4));
-                let name_len = u32::from(entry[6]);
-                if len < 8 + name_len || len % 4 != 0 || len > self.block_size - offset {
-                    return Err(Error::Corrupt);
-                }
-                let id = le32(&entry, 0);
-                if id != 0 && name_len as usize == name.len() {
-                    let mut buf = [0; 255];
-                    self.read_bytes(base + u64::from(offset + 8), &mut buf[..name.len()])?;
-                    if &buf[..name.len()] == name {
-                        return self.inode(id);
-                    }
-                }
-                offset += len;
             }
+            offset = entry.next;
         }
         Err(Error::NotFound)
     }
 
-    pub fn open(&mut self, path: &[u8]) -> Result<File, Error> {
+    fn resolve(&mut self, path: &[u8]) -> Result<Inode, Error> {
         let path = path.strip_prefix(b"/").ok_or(Error::NotFound)?;
         let mut inode = self.inode(2)?;
+        if path.is_empty() {
+            return Ok(inode);
+        }
         for name in path.split(|b| *b == b'/') {
             if name.is_empty()
                 || name.len() > 255
@@ -303,10 +343,76 @@ impl<B: BlockRead> Ext4<B> {
             }
             inode = self.lookup(&inode, name)?;
         }
+        Ok(inode)
+    }
+
+    pub fn open(&mut self, path: &[u8]) -> Result<File, Error> {
+        let inode = self.resolve(path)?;
         if inode.kind != 0x8000 {
             return Err(Error::NotFile);
         }
         Ok(File(inode))
+    }
+
+    pub fn open_dir(&mut self, path: &[u8]) -> Result<Directory, Error> {
+        let path = if path.len() > 1 {
+            path.strip_suffix(b"/").unwrap_or(path)
+        } else {
+            path
+        };
+        let inode = self.resolve(path)?;
+        self.check_directory(&inode)?;
+        Ok(Directory(inode))
+    }
+
+    /// Continue reading names from an opaque cursor. At most one name (or part
+    /// of it) is returned per call so even 255-byte names fit the IPC protocol.
+    pub fn read_dir(
+        &mut self,
+        dir: &Directory,
+        cursor: u32,
+        out: &mut [u8],
+    ) -> Result<Option<NameChunk>, Error> {
+        // High bits select the directory record, low byte selects a position
+        // within its name. A completed name advances to the next record.
+        let mut offset = cursor >> 8;
+        let consumed = (cursor & 255) as usize;
+        if offset > dir.0.size || (offset == dir.0.size && consumed != 0) || out.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        while offset < dir.0.size {
+            let entry = self.dir_entry(&dir.0, offset)?;
+            if entry.id == 0 || entry.name_len <= 2 {
+                let mut name = [0; 2];
+                if entry.id != 0 {
+                    self.read_bytes(entry.name_at, &mut name[..entry.name_len])?;
+                }
+                if entry.id == 0 || matches!(&name[..entry.name_len], b"." | b"..") {
+                    if consumed != 0 {
+                        return Err(Error::Corrupt);
+                    }
+                    offset = entry.next;
+                    continue;
+                }
+            }
+            if consumed >= entry.name_len {
+                return Err(Error::Corrupt);
+            }
+            let len = (entry.name_len - consumed).min(out.len());
+            self.read_bytes(entry.name_at + consumed as u64, &mut out[..len])?;
+            let end_of_name = consumed + len == entry.name_len;
+            let next = if end_of_name {
+                entry.next << 8
+            } else {
+                (offset << 8) | (consumed + len) as u32
+            };
+            return Ok(Some(NameChunk {
+                next,
+                len,
+                end_of_name,
+            }));
+        }
+        Ok(None)
     }
 
     pub fn read(&mut self, file: &File, offset: u32, out: &mut [u8]) -> Result<usize, Error> {
@@ -363,8 +469,11 @@ mod tests {
         }
         let _cleanup = Cleanup(root.clone());
         fs::create_dir_all(files.join("bin")).unwrap();
+        fs::create_dir(files.join("empty")).unwrap();
         let content: Vec<u8> = (0..14000).map(|i| (i % 251) as u8 + 1).collect();
         fs::write(files.join("bin/large"), &content).unwrap();
+        let long_name = "x".repeat(255);
+        fs::write(files.join("bin").join(&long_name), b"").unwrap();
         fs::File::create(files.join("sparse"))
             .unwrap()
             .set_len(8192)
@@ -407,6 +516,32 @@ mod tests {
             let sparse = image.open(b"/sparse").unwrap();
             assert_eq!(image.read(&sparse, 4064, &mut buffer), Ok(95));
             assert_eq!(buffer, [0; 95]);
+            let dir = image.open_dir(b"/bin/").unwrap();
+            let mut cursor = 0;
+            let mut names = Vec::new();
+            let mut name = Vec::new();
+            while let Some(chunk) = image.read_dir(&dir, cursor, &mut buffer).unwrap() {
+                assert!(chunk.next > cursor);
+                name.extend_from_slice(&buffer[..chunk.len]);
+                if chunk.end_of_name {
+                    names.push(core::mem::take(&mut name));
+                }
+                cursor = chunk.next;
+            }
+            names.sort();
+            assert_eq!(names, [b"large".to_vec(), long_name.as_bytes().to_vec()]);
+            assert!(image.open_dir(b"/").is_ok());
+            let empty = image.open_dir(b"/empty").unwrap();
+            assert!(image.read_dir(&empty, 0, &mut buffer).unwrap().is_none());
+            assert_eq!(
+                image.open_dir(b"/bin/large").err(),
+                Some(Error::NotDirectory)
+            );
+            assert_eq!(image.open_dir(b"/missing").err(), Some(Error::NotFound));
+            assert_eq!(
+                image.read_dir(&dir, 1, &mut buffer).err(),
+                Some(Error::Corrupt)
+            );
             // INCOMPAT_RECOVER: a read-only mount must not use stale metadata.
             bytes[1024 + 0x60] |= 4;
             assert_eq!(Ext4::mount(Image(bytes)).err(), Some(Error::Unsupported));

@@ -12,14 +12,14 @@ path = "src/lib.rs"
 bench = false
 
 [[bin]]
-name = "vela-procfs"
-path = "src/bin/procfs.rs"
+name = "vela-sysd"
+path = "src/bin/sysd/main.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "vela-shell"
-path = "src/bin/shell.rs"
+name = "vela-init"
+path = "src/bin/init.rs"
 test = false
 bench = false
 
@@ -48,6 +48,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "vela-shell"
+path = "tools/shell.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "vela-uptime"
 path = "tools/uptime.rs"
 test = false
@@ -56,5 +62,17 @@ bench = false
 [[bin]]
 name = "vela-cat"
 path = "tools/cat.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vela-ls"
+path = "tools/ls.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vela-sdexport"
+path = "tools/sdexport.rs"
 test = false
 bench = false

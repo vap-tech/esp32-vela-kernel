@@ -1,7 +1,7 @@
 use vela_kernel::{
-    capability::{self as cap, Authority},
+    capability::{self as cap, Authority, Capability, Object},
     errno::Errno,
-    id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
+    id::{Handle, ProcSlot, ThreadSlot, Tid},
     lifecycle,
     memory::MemoryClass,
     task::{Context, Region, State, Wait},
@@ -16,15 +16,39 @@ use crate::{
     usermem::{copy_from_user, copy_to_user, copy_to_user_within},
 };
 
+const _: () = {
+    assert!(syscall::CAP_READ == cap::READ as u32);
+    assert!(syscall::CAP_WRITE == cap::WRITE as u32);
+    assert!(syscall::CAP_EXECUTE == cap::EXECUTE as u32);
+    assert!(syscall::CAP_SEND == cap::SEND as u32);
+    assert!(syscall::CAP_RECEIVE == cap::RECEIVE as u32);
+    assert!(syscall::CAP_GRANT_RIGHT == cap::GRANT as u32);
+    assert!(syscall::CAP_WAIT == cap::WAIT as u32);
+    assert!(syscall::CAP_ACK == cap::ACK as u32);
+    assert!(syscall::CAP_CONTROL == cap::CONTROL as u32);
+    assert!(syscall::CAP_PASS_ON_SPAWN == cap::PASS_ON_SPAWN as u32);
+};
+
 impl Runtime {
-    pub(super) fn sys_spawn_image(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        lifecycle::require_authority(
-            &self.processes,
-            current,
-            Handle(args.a0),
-            Authority::ProcessSpawn,
-            cap::EXECUTE,
-        )?;
+    pub(super) fn sys_spawn_image(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        let spawn_cap = self
+            .processes
+            .slot(current)
+            .capabilities
+            .get(Handle(args.a0), 0)?;
+        if spawn_cap.object != Object::Authority(Authority::ProcessSpawn) {
+            return Err(Errno::Ebadf);
+        }
+        if spawn_cap.rights & cap::EXECUTE != cap::EXECUTE {
+            return Err(Errno::Eperm);
+        }
+        let allow_repass = (spawn_cap.rights & cap::CONTROL) != 0;
+
         let len = args.a2 as usize;
         let ptr = args.a1 as usize;
         if len == 0 || len > syscall::SPAWN_IMAGE_MAX {
@@ -35,16 +59,8 @@ impl Runtime {
         if arg_len > syscall::SPAWN_ARG_MAX {
             return Err(Errno::Emsgsize);
         }
-        let inherited = if args.a5 == 0 {
-            None
-        } else {
-            Some(lifecycle::endpoint_for_spawn(
-                &self.processes,
-                &self.ipc,
-                current,
-                Handle(args.a5),
-            )?)
-        };
+        let caps_ptr = args.a5 as usize;
+        let caps_bytes = core::mem::size_of::<syscall::SpawnCaps>();
         if self.scheduler.tasks.iter().enumerate().any(|(i, task)| {
             ThreadSlot(i) != self.scheduler.current
                 && task.process == current
@@ -54,6 +70,43 @@ impl Runtime {
         }
         self.check_private_spawn_input(current, ptr, len)?;
         self.check_private_spawn_input(current, arg_ptr, arg_len)?;
+        if caps_ptr != 0 {
+            self.check_private_spawn_input(current, caps_ptr, caps_bytes)?;
+        }
+
+        let mut inherited: [Option<Capability>; syscall::SPAWN_CAPS_MAX] =
+            [None; syscall::SPAWN_CAPS_MAX];
+        if caps_ptr != 0 {
+            let mut raw = [0u8; core::mem::size_of::<syscall::SpawnCaps>()];
+            copy_from_user(self.memory(), caps_ptr, &mut raw)?;
+            let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+            if count > syscall::SPAWN_CAPS_MAX {
+                return Err(Errno::Einval);
+            }
+            for (i, slot) in inherited.iter_mut().take(count).enumerate() {
+                let base = 4 + i * 8;
+                let handle =
+                    u32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]]);
+                let rights = u32::from_le_bytes([
+                    raw[base + 4],
+                    raw[base + 5],
+                    raw[base + 6],
+                    raw[base + 7],
+                ]);
+                if handle == 0 {
+                    continue;
+                }
+                let rights = u16::try_from(rights).map_err(|_| Errno::Eperm)?;
+                *slot = Some(lifecycle::capability_for_spawn(
+                    &self.processes,
+                    &self.ipc,
+                    current,
+                    allow_repass,
+                    Handle(handle),
+                    rights,
+                )?);
+            }
+        }
 
         // No concurrently running writer can access either source while the
         // lock is held. Snapshot both before allocating the child.
@@ -65,15 +118,17 @@ impl Runtime {
         }
         let (loaded, _, _) = self.load_elf_in(&snapshot[..len], MemoryClass::Psram, false)?;
         let result = (|| {
-            let handle = if let Some(capability) = inherited {
-                self.processes
-                    .slot_mut(loaded.slot)
-                    .capabilities
-                    .install(capability)?
-                    .raw()
-            } else {
-                0
-            };
+            let mut handles = [0u32; syscall::SPAWN_CAPS_MAX];
+            for (dst, cap_opt) in handles.iter_mut().zip(inherited) {
+                if let Some(capability) = cap_opt {
+                    *dst = self
+                        .processes
+                        .slot_mut(loaded.slot)
+                        .capabilities
+                        .install(capability)?
+                        .raw();
+                }
+            }
             let top = loaded.stack.base + loaded.stack.size;
             let sp = (top - arg_len) & !15;
             let child_arg = if arg_len == 0 { 0 } else { sp as u32 };
@@ -87,7 +142,14 @@ impl Runtime {
             self.start_loaded_at(
                 loaded,
                 sp,
-                [handle, child_arg, arg_len as u32, 0, 0, 0],
+                [
+                    handles[0],
+                    child_arg,
+                    arg_len as u32,
+                    handles[1],
+                    handles[2],
+                    handles[3],
+                ],
                 1,
                 1,
             )?;
@@ -96,6 +158,12 @@ impl Runtime {
         if result.is_err() {
             self.abort_loaded(loaded);
         } else {
+            if args.number == syscall::SPAWN_IMAGE_WAIT {
+                // The child cannot run until we leave the kernel lock, so the
+                // wait is registered before exit (including a fault) is possible.
+                self.scheduler.block(Wait::ProcessExit { pid: loaded.pid });
+                *switch = true;
+            }
             self.notify_remote_hart(false);
         }
         result
@@ -123,36 +191,6 @@ impl Runtime {
             return Err(Errno::Ebusy);
         }
         Ok(())
-    }
-
-    pub(super) fn sys_spawn_hello(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        lifecycle::require_authority(
-            &self.processes,
-            current,
-            Handle(args.a0),
-            Authority::ProcessSpawn,
-            cap::EXECUTE,
-        )?;
-        let (bytes, class): (&[u8], MemoryClass) = match args.a1 {
-            0 => (
-                include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf")),
-                MemoryClass::Sram,
-            ),
-            2 => (
-                include_bytes!(concat!(env!("OUT_DIR"), "/dma.elf")),
-                MemoryClass::Sram,
-            ),
-            1 => (
-                include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
-                MemoryClass::Sram,
-            ),
-            3 => (
-                include_bytes!(concat!(env!("OUT_DIR"), "/pic.elf")),
-                MemoryClass::Psram,
-            ),
-            _ => return Err(Errno::Einval),
-        };
-        self.spawn_elf_in(bytes, class, args.a1 == 2).map(Pid::raw)
     }
 
     pub(super) fn sys_yield(&mut self, switch: &mut bool) -> Result<u32, Errno> {

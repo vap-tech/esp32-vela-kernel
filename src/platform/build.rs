@@ -22,34 +22,6 @@ fn main() {
     assert!(status.success(), "convert display PNG assets");
     build_sentinel(&dir, &out);
     build_user_services(&dir, &out);
-    let linker = user_linker();
-    for (name, pie) in [("hello", false), ("pic", true), ("dma", true)] {
-        let source = format!("../user/apps/{name}/main.S");
-        let layout = if pie { "pic" } else { name };
-        let script = format!("../user/apps/{layout}/link.x");
-        println!("cargo:rerun-if-changed={source}");
-        println!("cargo:rerun-if-changed={script}");
-        let status = std::process::Command::new("clang")
-            .args([
-                "--target=riscv32-none-elf",
-                "-march=rv32imac",
-                "-mabi=ilp32",
-                "-nostdlib",
-                "-Wl,--strip-all",
-                "-Xlinker",
-                "-T",
-                "-Xlinker",
-                &script,
-                &source,
-            ])
-            .arg(&linker)
-            .args(pie.then_some("-Wl,-pie,-z,max-page-size=64"))
-            .arg("-o")
-            .arg(out.join(format!("{name}.elf")))
-            .status()
-            .expect("clang and ld.lld required for bundled user ELF");
-        assert!(status.success(), "building {name}.elf failed");
-    }
 }
 
 fn build_sentinel(dir: &std::path::Path, out: &std::path::Path) {
@@ -104,29 +76,43 @@ fn build_sentinel(dir: &std::path::Path, out: &std::path::Path) {
 }
 
 fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
+    println!("cargo:rerun-if-env-changed=VELA_BOARD_INIT_FILE");
+    let board_init_path = std::env::var_os("VELA_BOARD_INIT_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.join("../../boards/tab5/init.conf"));
+    println!("cargo:rerun-if-changed={}", board_init_path.display());
+    let board_init_text = std::fs::read_to_string(&board_init_path)
+        .unwrap_or_else(|e| panic!("read board init config {}: {e}", board_init_path.display()));
+
     for path in [
         "../user/Cargo.toml",
         "../user/link.x",
         "../user/src/lib.rs",
         "../user/src/sys.rs",
         "../user/src/arena.rs",
+        "../user/src/boot_cfg.rs",
         "../user/src/ina226.rs",
         "../user/src/i2c.rs",
         "../user/src/kbd.rs",
         "../user/src/fbcon.rs",
         "../user/src/file.rs",
+        "../user/src/mount.rs",
         "../user/src/ext4.rs",
         "../user/src/bin/ext4fs.rs",
         "../user/src/font.rs",
         "../user/src/term.rs",
         "../user/src/sdcard.rs",
-        "../user/src/bin/procfs.rs",
-        "../user/src/bin/shell.rs",
+        "../user/src/bin/sysd/main.rs",
+        "../user/src/bin/sysd/proc.rs",
+        "../user/src/bin/sysd/sys.rs",
+        "../user/src/bin/sysd/dev.rs",
+        "../user/src/bin/init.rs",
         "../user/src/bin/console.rs",
         "../user/src/bin/kbd.rs",
         "../user/src/bin/fbcon.rs",
         "../abi/Cargo.toml",
         "../abi/src/lib.rs",
+        "../abi/src/fs.rs",
         "../abi/src/syscall.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
@@ -141,15 +127,16 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
     let status = std::process::Command::new(std::env::var_os("CARGO").unwrap())
         .env_remove("RUSTFLAGS")
         .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .env("VELA_BOARD_INIT", &board_init_text)
         .args(["build", "--manifest-path"])
         .arg(&manifest)
         .args([
             "--bin",
-            "vela-procfs",
+            "vela-sysd",
             "--bin",
             "vela-ext4fs",
             "--bin",
-            "vela-shell",
+            "vela-init",
             "--bin",
             "vela-console",
             "--bin",
@@ -167,9 +154,9 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         .expect("run cargo for vela-user services");
     assert!(status.success(), "building vela-user ELF services failed");
     for (bin, artifact) in [
-        ("vela-procfs", "procfs.elf"),
+        ("vela-sysd", "sysd.elf"),
         ("vela-ext4fs", "ext4fs.elf"),
-        ("vela-shell", "shell.elf"),
+        ("vela-init", "init.elf"),
         ("vela-console", "console.elf"),
         ("vela-kbd", "kbd.elf"),
         ("vela-fbcon", "fbcon.elf"),
@@ -182,31 +169,4 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         )
         .unwrap_or_else(|e| panic!("copy {artifact}: {e}"));
     }
-}
-
-// Clang is required for the bundled user assembly; a separately installed LLD
-// is optional because the pinned Rust toolchain already supplies GNU-flavour LLD.
-fn user_linker() -> String {
-    if std::process::Command::new("ld.lld")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        return "-fuse-ld=lld".into();
-    }
-    let output = std::process::Command::new(std::env::var_os("RUSTC").unwrap())
-        .args(["--print", "sysroot"])
-        .output()
-        .expect("query Rust sysroot");
-    assert!(output.status.success(), "query Rust sysroot failed");
-    let root = String::from_utf8(output.stdout).expect("UTF-8 Rust sysroot");
-    let linker = std::path::Path::new(root.trim())
-        .join("lib/rustlib")
-        .join(std::env::var_os("HOST").unwrap())
-        .join("bin/gcc-ld/ld.lld");
-    assert!(
-        linker.is_file(),
-        "install ld.lld: Rust bundled linker not found"
-    );
-    format!("--ld-path={}", linker.display())
 }

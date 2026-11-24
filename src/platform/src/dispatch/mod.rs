@@ -40,8 +40,9 @@ impl Runtime {
         let result = match args.number {
             syscall::SD_EXPORT => self.sys_sd_export(current, args),
             syscall::SD_PARTITION => self.sys_sd_partition(current, args),
-            syscall::SPAWN_IMAGE => self.sys_spawn_image(current, args),
-            syscall::SPAWN_HELLO => self.sys_spawn_hello(current, args),
+            syscall::SPAWN_IMAGE | syscall::SPAWN_IMAGE_WAIT => {
+                self.sys_spawn_image(current, args, switch)
+            }
             syscall::WRITE => self.sys_write(args),
             syscall::YIELD => self.sys_yield(switch),
             syscall::EXIT => self.sys_exit(switch),

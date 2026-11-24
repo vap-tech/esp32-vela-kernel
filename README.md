@@ -3,7 +3,7 @@
 # Vela
 
 Bare-metal Rust microkernel, ESP32-P4 v1.3 / M5Stack Tab5.
-Dual-core HP0+HP1 SMP M-mode kernel; PMP-isolated U-mode procfs, shell and console tasks with full RV32F FPU + ESP32-P4 v1.3 PIE (`Xespv2p1`) context switching.
+Dual-core HP0+HP1 SMP M-mode kernel; PMP-isolated U-mode `sysd`, `init`, `console`, `fbcon`, `kbd` and `ext4fs` services with full RV32F FPU + ESP32-P4 v1.3 PIE (`Xespv2p1`) context switching.
 100 Hz priority round robin, bounded process/thread pools, no global heap or async runtime.
 LP Sentinel independently observes HP heartbeats, keeps a diagnostic journal
 and delivers one-shot timer events through the hardware mailbox.
@@ -27,71 +27,48 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 
 | Shell command | Result |
 | --- | --- |
-| `help` | List shell commands. |
-| `uptime`, `cat /proc/uptime` | Read elapsed time from userspace procfs. |
-| `cat /proc/loadavg` | Read sampled runnable demand. |
-| `cat /proc/interrupts` | Read interrupt and SMP counters (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`, `ipi_hp0`, `ipi_hp1`, `pmp_shootdowns`, `kbd_gpio50`). |
-| `cat /proc/cpuinfo` | Read live HP0+HP1/APB/LP clocks, `rv32imafc_xesppie` ISA, DVFS policy/switch counts, tickless sleep counters, per-hart `mcycle` utilization, IPI/PMP shootdown counters and SYSTIMER IRQ latency. |
-| `cat /proc/tasks` | List active threads with TID/PID, wait state, `base/effective` priority, `hart/aff` (`hp0`/`hp1` and affinity mask `1..3`), migrations, ticks, `user_cycles`, preemptions and stack size. |
-| `cat /proc/streams` | Read live DW-GDMA DSI scanout (`frames`, `fifo`, `underruns`, `dma_errors`) and GDMA-AHB CH1 transfer telemetry. |
-| `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
-| `cat /proc/i2c`, `i2cdetect [bus]`, `cat /dev/i2c-N` | List the board I²C buses (`0` system `GPIO31`/`GPIO32`, `1` Ext.Port1 `GPIO0`/`GPIO1`) or scan one with address-only probes (found addresses, `state ok/bus_fault`). Tab5 Keyboard answers at `0x6d` on bus 1. |
-| `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
-| `sd export [seconds]`, `sd export rw` | Export the whole card by USB-C. Read-only export times out (default 60 s). Writable export ends when the host ejects it. |
-| `cat /sd/<path>`, `run /sd/<path>.elf` | Read a file from the read-only ext4 system partition or start an RV32 static PIE ELF (up to 8 KiB). |
-| `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
-| `smp [status/pin 0/pin 1/any]` | Verify dual-hart HP0+HP1 SMP execution, `HP1 -> HP0 -> HP1` thread migration, synchronous IPI PMP shootdown, and concurrent `RV32F` FPU + `Xespv2p1` PIE (`q0..q7`, `QACC`, `UA_STATE`, `XACC`) context preservation (`fpu_pie=ok`), or query/set shell hart affinity. |
-| `freq [auto/40/180]` | Query or set the HP0 DVFS operating-point policy (`auto` idle governor, `pin_40mhz` XTAL or `pin_180mhz` CPLL; `40 MHz` is rejected with `-EBUSY` while display or DMA is active). |
-| `display diag` | Stream the full-screen diagnostic image from microSD into PSRAM, in keyboard-down landscape. |
-| `display boot` | Stream the Vela boot artwork from microSD into the PSRAM framebuffer. |
-| `display pixel` | Draw a white pixel at (360, 640) on black using trusted kernel scanout. |
-| `display test` | Identify the ST7121 via touch firmware, initialize the two-lane DSI link and enable vertical color bars and backlight. |
-| `display off` | Stop active DW-GDMA / MIPI-DSI scanout, disable backlight (`GPIO22`), release `InFlight` DMA and return the 2 MiB PSRAM framebuffer to the 32 MiB pool. |
-| `memtest` | Check aligned userspace allocation, bounds, capability lookup and release across both internal SRAM and external PSRAM. |
-| `run hello`, `run pic`, `run pic-psram` | Launch the bundled fixed-address ELF (SRAM) and static PIE (SRAM or external PSRAM), respectively. |
-| `run dma` | Copy and verify 2048 bytes of SRAM using GDMA-AHB. |
-| `sentinel` | Show the LP protocol version and boot epoch acknowledged by HP. |
-| `sentinel hello` | Send HELLO via the hardware mailbox and print the acknowledged sequence. |
-| `sentinel status` | Read LP heartbeat state, age, counters and received missed notices. |
-| `sentinel pause`, `sentinel resume` | Stop/restart HP heartbeats without stopping HP or resetting LP. |
-| `sentinel log` | Read the bounded LP diagnostic journal without consuming records. |
-| `sentinel mark` | Send an HP diagnostic MARK event with the current HP uptime tick as its value. |
-| `sentinel sleep <ms>` | Prepare a coordinated sleep window with LP (`SENTINEL_PREPARE_SLEEP`), enter tickless `wfi` at `40 MHz` XTAL until the LP `WAKE_EVENT` arrives, and restore the active operating point. |
-| `sentinel wake <ms>` | Arm an LP timer and block until its WAKE_EVENT. Range: 1–60000 ms. |
-| `sentinel prepare <ms>` | Agree a heartbeat pause with LP for 1–60000 ms while HP stays active. Use `sentinel cancel` or `sentinel wait` with the returned alarm. |
-| `sentinel arm <ms>`, `sentinel wait` | Arm without waiting for expiry; later consume the latched event. |
-| `sentinel cancel` | Cancel the current alarm before it fires; an already-fired event remains available to wait. |
+| `help` | List shell commands and virtual namespaces. |
+| `ls [path]` | List `/`, `/proc`, `/sys`, `/sys/sentinel`, `/dev`, or any `/sd/<dir>` via `/sd/bin/ls.elf`. |
+| `cat <path>` | Read any file in `/proc`, `/sys`, `/dev`, or `/sd` via `/sd/bin/cat.elf`. |
+| `echo <val> [> <path>]` | Print text, or write control values to writable `/sys/*` and `/dev/*` nodes. |
+| `uptime` | Run `/sd/bin/uptime.elf` (or `cat /proc/uptime`). |
+| `run <elf> [arg]` | Run an RV32 static PIE ELF from `/sd` (up to 8 KiB) and wait for exit. |
+| `sdexport [seconds \| rw]` | Run `/sd/bin/sdexport.elf` to export the microSD card over USB-C (read-only timeout or writable until host eject). |
+| `exit` | Exit the shell (`init` automatically respawns it). |
 
-The bars come from the DSI host pattern generator and require no framebuffer.
-The command reports completion after PHY lock and command FIFO drain. Inspect
-the glass to confirm scanout. Display errors 1 and 2 indicate expander and
-touch I²C failures, 3 a PHY startup timeout, 4 a packet FIFO timeout and 5
-loss of PHY lock. Values 256–511 encode an unsupported touch firmware byte
-as 256 plus the version.
+Everything in userspace shares one File IPC protocol (`OP_READ`, `OP_LIST`, `OP_WRITE`) mounted across `sysd` (`/proc`, `/sys`, `/dev`) and `ext4fs` (`/sd`):
+
+| Virtual path | Access | Description |
+| --- | --- | --- |
+| `/proc/uptime`, `/proc/loadavg` | R | Elapsed time and 1/5/15 min sampled runnable demand. |
+| `/proc/interrupts` | R | Interrupt and SMP counters (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`, `ipi_hp0`, `ipi_hp1`, `pmp_shootdowns`, `kbd_gpio50`). |
+| `/proc/cpuinfo` | R | Live HP0+HP1/APB/LP clocks, `rv32imafc_xesppie` ISA, DVFS policy/switch counts, tickless sleep counters, per-hart `mcycle` utilization, IPI/PMP shootdowns and SYSTIMER IRQ latency. |
+| `/proc/tasks` | R | Active threads with TID/PID, wait state, `base/effective` priority, `hart/aff`, migrations, ticks, `user_cycles`, preemptions and stack size. |
+| `/proc/streams`, `/proc/sdcard`, `/proc/i2c` | R | DW-GDMA/GDMA-AHB stream counters, microSD status/capacity/counters, and board I²C bus definitions. |
+| `/sys/power` | R | Live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
+| `/sys/freq` | R/W | Query or set HP0 DVFS operating-point policy (`echo auto\|40\|180 > /sys/freq`; `40` returns busy while display or DMA is active). |
+| `/sys/display` | R/W | Read display flags (`blanked`, `sd_export`) or control scanout/backlight (`echo off > /sys/display`, `echo 0..255 > /sys/display`). |
+| `/sys/sentinel/status`, `/sys/sentinel/log` | R | Read LP Sentinel heartbeat state/age/counters and bounded LP diagnostic journal. |
+| `/sys/sentinel/sleep` | W | Coordinated heartbeat-paused sleep window (`echo <1..60000> > /sys/sentinel/sleep`; requires display/DMA off). |
+| `/dev/i2c-0`, `/dev/i2c-1` | R | Address-only I²C bus scan (system bus `GPIO31`/`GPIO32`, Ext.Port1 `GPIO0`/`GPIO1`; Tab5 Keyboard answers at `0x6d` on bus 1). |
+| `/dev/kbdled` | R/W | Read or control Tab5 Keyboard RGB LEDs (`echo auto\|off\|bright N\|R G B [R G B] > /dev/kbdled`). |
+| `/dev/random`, `/dev/urandom`, `/dev/zero` | R | Hardware TRNG / ChaCha20 CSPRNG diagnostics and zero stream. |
 
 ## Quick Sentinel session
 
 Run these commands at the shell prompt:
 
 ```text
-sentinel
-sentinel status
-sentinel mark
-sentinel log
-sentinel wake 1000
-sentinel sleep 1500
-sentinel arm 10000
-sentinel cancel
-sentinel arm 10
-sentinel wait
+cat /sys/sentinel/status
+cat /sys/sentinel/log
+echo off > /sys/display
+echo 1500 > /sys/sentinel/sleep
 ```
 
-`wake` blocks until the actual LP event. `sleep` prepares a coordinated heartbeat-paused
+Writing milliseconds (`1..60000`) to `/sys/sentinel/sleep` prepares a coordinated heartbeat-paused
 sleep window with LP, enters tickless `wfi` (downshifting HP0 to `40 MHz` XTAL in `auto` mode)
 after re-checking pending console/mailbox/IRQ events under `MIE=0`, and restores `180 MHz`
-and periodic heartbeats upon wake. `arm` returns after the setup ACK;
-`wait` also accepts an event that has already arrived. Cancel before expiry;
-if it has already fired, collect it with `sentinel wait`. There is one alarm slot.
+and periodic heartbeats upon wake.
 Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 
 ## Current scope
@@ -99,18 +76,18 @@ Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 | Available | Current limit |
 | --- | --- |
 | Dual-core HP0+HP1 SMP, priority scheduling, thread affinity/migration, synchronous IPI PMP shootdown, capabilities, and per-thread `RV32F` FPU + `ESP32-P4 v1.3` PIE (`Xespv2p1`) extended context | Static 8-process / 8-thread pools; eager FPU+PIE save/restore on thread switch (`vela_ext_save`/`vela_ext_restore`). |
-| ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled images selected by index; no general filesystem loader or dynamic linker. |
+| ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled boot services in flash plus runtime `/sd/bin/*.elf` loading via `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` (up to 8 KiB, up to 4 passed capability handles); no dynamic linker. |
 | Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` and `L1-ICache1` are enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
-| Userspace `INA226` power driver (`I2C_TRANSFER`, `/proc/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
-| Userspace Tab5 Keyboard driver (`vela-kbd`, `I2C_TRANSFER` on Ext.Port1 bus 1) | Sleeps on the keyboard `INT` line (`GPIO50`, level interrupt, `IRQ_SLOT_KBD = 1`, CLIC line 22), drains the `0x6d` Character-mode FIFO when it fires, then writes `INT_STA = 0` so the keyboard releases the line, and feeds the shell input endpoint next to the USB console; named keys (`enter`, `del`, arrows...) become terminal bytes and the shell drops ANSI escape sequences. `kbdled [auto/off/bright N/R G B [R G B]]` drives the two RGB LEDs (registers `0x03`, `0x11`, `0x60`, `0x64`). No polling; `kbd_arm_low` / `kbd_arm_wait` in `/proc/interrupts` show how often the line was re-armed. After 5 minutes without a key the service dims the LEDs (brightness register `0x03` to 0) and restores them on the next key; while the screen is blanked (`STATS_DISPLAY`) the first key is swallowed and only wakes the display, via a no-op `ESC [ m` written to the console. |
-| Userspace framebuffer console (`vela-fbcon`, `CONSOLE_LOG`, `DISPLAY_MODE_CONSOLE`) | Owns a PSRAM framebuffer and mirrors everything written to the system console (shell echo, kernel log) on the Tab5 screen, 80x22 cells with a 16x32 Terminus font (SIL OFL). After 5 minutes without console output the backlight is switched off (`DISPLAY_MODE_BACKLIGHT`); any new output, such as a key echo, wakes it. The renderer understands ANSI SGR colours (16-colour palette, bold, reset); the shell prompt is green and errors are red. While blanked it polls the log every 100 ms instead of 20 ms. While the display is attached `sentinel sleep` and `freq 40` return `-EBUSY`. |
+| Userspace `INA226` power driver (`I2C_TRANSFER`, `/sys/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |
+| Userspace Tab5 Keyboard driver (`vela-kbd`, `I2C_TRANSFER` on Ext.Port1 bus 1) | Sleeps on the keyboard `INT` line (`GPIO50`, level interrupt, `IRQ_SLOT_KBD = 1`, CLIC line 22), drains the `0x6d` Character-mode FIFO when it fires, then writes `INT_STA = 0` so the keyboard releases the line, and feeds the shell input endpoint next to the USB console; named keys (`enter`, `del`, arrows...) become terminal bytes and the shell drops ANSI escape sequences. `echo <auto|off|bright N|R G B [R G B]> > /dev/kbdled` drives the two RGB LEDs (registers `0x03`, `0x11`, `0x60`, `0x64`). No polling; `kbd_arm_low` / `kbd_arm_wait` in `/proc/interrupts` show how often the line was re-armed. After 5 minutes without a key the service dims the LEDs (brightness register `0x03` to 0) and restores them on the next key; while the screen is blanked (`STATS_DISPLAY`) the first key is swallowed and only wakes the display, via a no-op `ESC [ m` written to the console. |
+| Userspace framebuffer console (`vela-fbcon`, `CONSOLE_LOG`, `DISPLAY_MODE_CONSOLE`) | Owns a PSRAM framebuffer and mirrors everything written to the system console (shell echo, kernel log) on the Tab5 screen, 80x22 cells with a 16x32 Terminus font (SIL OFL). After 5 minutes without console output the backlight is switched off (`DISPLAY_MODE_BACKLIGHT`); any new output, such as a key echo, wakes it. The renderer understands ANSI SGR colours (16-colour palette, bold, reset); the shell prompt is green and errors are red. While blanked it polls the log every 100 ms instead of 20 ms. While the display is attached `/sys/sentinel/sleep` and `echo 40 > /sys/freq` return `-EBUSY`. |
 | Per-bus I²C capabilities (`Authority::I2c(bus)`) and probe scan (`/dev/i2c-N`) | Address-only probes work on every address of both buses; data transfers are limited to `0x41` on the system bus and open on Ext.Port1 (no board devices). |
 | Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Legacy raw assets at LBA 2048 and partition-bounded read access for the U-mode ext4 service. |
 | Coordinated LP Sentinel sleep (`sentinel sleep`), DVFS (`40 MHz <-> 180 MHz`) and Tickless idle (`SYSTIMER`) | WFI + XTAL downshift with pre-sleep IRQ/generation re-check; full PMU HP power-domain power-down/reset resume is not used. |
-| Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
+| Userspace `sysd` (`/proc`, `/sys`, `/dev`), `ext4fs` (`/sd`), flash `init` (`boards/tab5/init.conf`), and `/sd/bin/shell.elf` | No kernel VFS or POSIX compatibility. |
 
-Boot services (`procfs`, `shell` and `console`) are built as standalone static PIE
+Boot services (`sysd`, `init`, `console`, `fbcon`, `kbd`, `ext4fs`) are built as standalone static PIE
 ELF binaries in `src/user` and loaded into private PMP-isolated SRAM allocations at
 startup. `docs/architecture.md` documents the workspace layout and kernel invariants;
 this README records the supported commands and hardware checkpoints.
@@ -478,39 +455,40 @@ Format **the intended partition** with:
 mkfs.ext4 -b 4096 -O ^metadata_csum,^metadata_csum_seed,^orphan_file /dev/SD_PARTITION
 ```
 
-Mount it on Linux, copy a text file and an RV32 static PIE ELF, then unmount it
-cleanly before inserting the card. The bundled `pic.elf` produced under
-`target/riscv32imafc-unknown-none-elf/release/build/*/out/` is a test executable.
+Build external utilities with `./scripts/build-tools.sh` and copy all ELF
+files from `target/sd/bin/` (`shell.elf`, `cat.elf`, `ls.elf`, `uptime.elf`,
+`sdexport.elf`) into the card's `bin/` directory, then unmount cleanly before
+inserting the card:
 
 ```console
+ls /sd/bin
 cat /sd/hello.txt
-run /sd/bin/pic.elf
+run /sd/bin/uptime.elf
 ```
 
-The reader supports 1–4 KiB blocks, regular files, extent trees and linear
+At boot, flash `init` reads the board policy compiled from `boards/tab5/init.conf`
+(checking `/sd/etc/init` first if present, falling back to `exec /sd/bin/shell.elf`).
+If `/sd/bin/shell.elf` is missing or unreadable, `init` prints an emergency alert
+explaining how to prepare the microSD card; otherwise it launches and supervises
+the shell, respawning it if it exits.
+
+The ext4 reader supports 1–4 KiB blocks, regular files, extent trees and linear
 directories up to 64 KiB. It rejects volumes needing journal recovery,
 unsupported feature flags, symlinks and indexed directories. Vela does not
 write ext4 or support card hot swapping. File IPC reads at a byte offset, with
 up to 95 bytes per reply. The kernel copies the ELF into a private snapshot
-before validating it. The shell may pass a bounded argument and an explicitly
-passable IPC endpoint. The child receives a local handle with send rights
-only, with no access to raw SD sectors.
+before validating it. `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` can pass a bounded
+argument and up to 4 explicit capability handles (each attenuated to its
+declared rights mask) so child utilities have zero ambient privileges.
 
-Build external utilities with `./scripts/build-tools.sh`. Copy the two ELF
-files from `target/sd/bin/` into the card's `bin/` directory, then eject:
-
-```console
-run /sd/bin/uptime.elf
-run /sd/bin/cat.elf /sd/hello.txt
-```
-
-`uptime.elf` uses kernel statistics. The first `cat.elf` takes one `/sd/`
-path and reads it from the ext4 service over IPC. The built-in shell
-commands remain available, and `run` starts a task without waiting for it.
+`uptime.elf` reads kernel statistics. `cat.elf` and `ls.elf` speak the unified
+File IPC protocol across `/proc`, `/sys`, `/dev` (`sysd`) and `/sd` (`ext4fs`).
+`shell.elf` provides the interactive console, dispatches `ls`/`cat`/`uptime`/`sdexport`/`run`,
+and supports `echo <val> > <path>` writes to `/sys/*` and `/dev/*`.
 
 ### USB-C SD export
 
-Run `sd export 60` for read-only access, or `sd export rw` to format the card
+Run `sdexport 60` for read-only access, or `sdexport rw` to format the card
 or update files from Linux. The whole card appears as a removable disk. Verify
 the model and capacity with `lsblk` before partitioning or formatting.
 
