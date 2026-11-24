@@ -188,6 +188,7 @@ unsafe fn provision_sd_from_flash() -> Result<(), u32> {
 
     let total_bytes = bundle_total_bytes()?;
     let total_sectors = (total_bytes + SECTOR_BYTES - 1) / SECTOR_BYTES;
+    unsafe { sdcard::check_legacy_write_range(SD_ASSET_LBA, total_sectors as u32)? };
     let mut words = [0u32; SECTOR_BYTES / 4];
     let mut sector_bytes = [0u8; SECTOR_BYTES];
 

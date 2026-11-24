@@ -37,6 +37,8 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
 | `cat /proc/i2c`, `i2cdetect [bus]`, `cat /dev/i2c-N` | List the board I²C buses (`0` system `GPIO31`/`GPIO32`, `1` Ext.Port1 `GPIO0`/`GPIO1`) or scan one with address-only probes (found addresses, `state ok/bus_fault`). Tab5 Keyboard answers at `0x6d` on bus 1. |
 | `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
+| `sd export [seconds]` | Export the entire microSD card read-only via USB-C Mass Storage (default 60 seconds). USB Serial/JTAG reconnects when the export ends. |
+| `cat /sd/<path>`, `run /sd/<path>.elf` | Read a file from the read-only ext4 system partition or start an RV32 static PIE ELF (up to 8 KiB). |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
 | `smp [status/pin 0/pin 1/any]` | Verify dual-hart HP0+HP1 SMP execution, `HP1 -> HP0 -> HP1` thread migration, synchronous IPI PMP shootdown, and concurrent `RV32F` FPU + `Xespv2p1` PIE (`q0..q7`, `QACC`, `UA_STATE`, `XACC`) context preservation (`fpu_pie=ok`), or query/set shell hart affinity. |
 | `freq [auto/40/180]` | Query or set the HP0 DVFS operating-point policy (`auto` idle governor, `pin_40mhz` XTAL or `pin_180mhz` CPLL; `40 MHz` is rejected with `-EBUSY` while display or DMA is active). |
@@ -104,7 +106,7 @@ Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 | Userspace Tab5 Keyboard driver (`vela-kbd`, `I2C_TRANSFER` on Ext.Port1 bus 1) | Sleeps on the keyboard `INT` line (`GPIO50`, level interrupt, `IRQ_SLOT_KBD = 1`, CLIC line 22), drains the `0x6d` Character-mode FIFO when it fires, then writes `INT_STA = 0` so the keyboard releases the line, and feeds the shell input endpoint next to the USB console; named keys (`enter`, `del`, arrows...) become terminal bytes and the shell drops ANSI escape sequences. `kbdled [auto/off/bright N/R G B [R G B]]` drives the two RGB LEDs (registers `0x03`, `0x11`, `0x60`, `0x64`). No polling; `kbd_arm_low` / `kbd_arm_wait` in `/proc/interrupts` show how often the line was re-armed. After 5 minutes without a key the service dims the LEDs (brightness register `0x03` to 0) and restores them on the next key; while the screen is blanked (`STATS_DISPLAY`) the first key is swallowed and only wakes the display, via a no-op `ESC [ m` written to the console. |
 | Userspace framebuffer console (`vela-fbcon`, `CONSOLE_LOG`, `DISPLAY_MODE_CONSOLE`) | Owns a PSRAM framebuffer and mirrors everything written to the system console (shell echo, kernel log) on the Tab5 screen, 80x22 cells with a 16x32 Terminus font (SIL OFL). After 5 minutes without console output the backlight is switched off (`DISPLAY_MODE_BACKLIGHT`); any new output, such as a key echo, wakes it. The renderer understands ANSI SGR colours (16-colour palette, bold, reset); the shell prompt is green and errors are red. While blanked it polls the log every 100 ms instead of 20 ms. While the display is attached `sentinel sleep` and `freq 40` return `-EBUSY`. |
 | Per-bus I²C capabilities (`Authority::I2c(bus)`) and probe scan (`/dev/i2c-N`) | Address-only probes work on every address of both buses; data transfers are limited to `0x41` on the system bus and open on Ext.Port1 (no board devices). |
-| Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Raw LBA block access (`SD_ASSET_LBA = 2048` for `VELAIMG1` RLE streams); no FAT/VFS layer. |
+| Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Legacy raw assets at LBA 2048 and partition-bounded read access for the U-mode ext4 service. |
 | Coordinated LP Sentinel sleep (`sentinel sleep`), DVFS (`40 MHz <-> 180 MHz`) and Tickless idle (`SYSTIMER`) | WFI + XTAL downshift with pre-sleep IRQ/generation re-check; full PMU HP power-domain power-down/reset resume is not used. |
 | Userspace shell and procfs | No kernel VFS or POSIX compatibility. |
 
@@ -460,3 +462,46 @@ Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
 15 a PSRAM command timeout, 16 a Flash read/range error, 17 an asset
 header mismatch, 18 an image CRC mismatch, and 19–22 microSD init/read/CRC16/write
 errors. Cached `L1-DCache` PSRAM mappings and Flash XIP remain separate work.
+
+
+### ext4 system partition
+
+Vela mounts one primary Linux partition (MBR type `0x83`) on demand in the
+`ext4fs` U-mode service. Prepare a dedicated partition on Linux. Keep it outside
+the legacy artwork and benchmark ranges if you need both (starting the partition
+at 1 GiB leaves room for both). Legacy writes are rejected if they overlap an
+MBR partition. GPT and partitionless ext4 are not mountable in this release.
+
+Format **the intended partition** with:
+
+```sh
+mkfs.ext4 -b 4096 -O ^metadata_csum,^metadata_csum_seed,^orphan_file /dev/SD_PARTITION
+```
+
+Mount it on Linux, copy a text file and an RV32 static PIE ELF, then unmount it
+cleanly before inserting the card. The bundled `pic.elf` produced under
+`target/riscv32imafc-unknown-none-elf/release/build/*/out/` is a test executable.
+
+```console
+cat /sd/hello.txt
+run /sd/bin/pic.elf
+```
+
+The reader supports 1–4 KiB blocks, regular files, extent trees and linear
+directories up to 64 KiB. It rejects volumes needing journal recovery,
+unsupported feature flags, symlinks and indexed directories. Vela does not
+write ext4 or support card hot swapping. File IPC reads at a byte offset, with
+up to 95 bytes per reply. The kernel copies the ELF into a private snapshot
+before validating it and grants the new process no storage capabilities.
+
+### USB-C SD export
+
+Run `sd export 60` from the Vela shell. Linux sees a write-protected removable
+disk with the card's complete sector range, including LBA 0. Use `lsblk` to
+identify it. Vela reserves SDMMC for the export and rejects local SD I/O until
+the timer expires. Unmount the disk before then if you mounted it on Linux.
+
+USB-C switches from Serial/JTAG to Full-Speed USB OTG during export. Reopen
+the console when it reconnects. The `ttyACM` number can change, so use the
+Tab5's symlink under `/dev/serial/by-id`. The current export does not support
+formatting or updating files from the host.

@@ -114,6 +114,8 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         "../user/src/i2c.rs",
         "../user/src/kbd.rs",
         "../user/src/fbcon.rs",
+        "../user/src/ext4.rs",
+        "../user/src/bin/ext4fs.rs",
         "../user/src/font.rs",
         "../user/src/term.rs",
         "../user/src/sdcard.rs",
@@ -154,6 +156,7 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
     assert!(status.success(), "building vela-user ELF services failed");
     for (bin, artifact) in [
         ("vela-procfs", "procfs.elf"),
+        ("vela-ext4fs", "ext4fs.elf"),
         ("vela-shell", "shell.elf"),
         ("vela-console", "console.elf"),
         ("vela-kbd", "kbd.elf"),

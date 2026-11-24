@@ -8,6 +8,7 @@
 extern crate std;
 
 pub mod arena;
+pub mod ext4;
 pub mod fbcon;
 pub mod font;
 pub mod i2c;

@@ -12,6 +12,7 @@ pub mod sdcard;
 pub mod sentinel;
 pub mod smp;
 pub mod timer;
+pub mod usb_storage;
 
 pub use vela_lp::hw::{lp_counter, mailbox};
 

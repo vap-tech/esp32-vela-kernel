@@ -12,6 +12,7 @@ const PROMPT: &[u8] = b"\x1b[1;32mvela:/$ \x1b[0m";
 
 #[derive(Clone, Copy)]
 struct Caps {
+    ext4: u32,
     request: u32,
     spawn: u32,
     display: u32,
@@ -54,6 +55,83 @@ fn read_file(path: &[u8], request_handle: u32) {
         offset = offset.saturating_add(payload.len() as u16);
     }
     sys::write(out.as_slice());
+}
+
+fn ext4_read(handle: u32, path: &[u8], offset: u32, response: &mut Buffer) -> Result<usize, ()> {
+    let mut request = Buffer::new();
+    request.push(0);
+    request.append(&offset.to_le_bytes());
+    request.append(path);
+    let count = sys::call6(
+        abi::IPC_CALL,
+        handle,
+        request.ptr() as u32,
+        request.len() as u32,
+        response.mut_ptr() as u32,
+        abi::IPC_BYTES as u32,
+        500,
+    )
+    .0 as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        sys::write(FAILED);
+        return Err(());
+    }
+    response.set_len(count);
+    if response.get(0) != 0 {
+        sys::write(&response.as_slice()[1..]);
+        return Err(());
+    }
+    Ok(count - 1)
+}
+
+fn cat_ext4(handle: u32, path: &[u8]) {
+    let mut response = Buffer::new();
+    let mut offset = 0;
+    while let Ok(count) = ext4_read(handle, path, offset, &mut response) {
+        if count == 0 {
+            break;
+        }
+        sys::write(&response.as_slice()[1..]);
+        offset += count as u32;
+    }
+}
+
+fn run_ext4(caps: Caps, path: &[u8]) {
+    let Ok(mut arena) = Arena::new_psram(abi::SPAWN_IMAGE_MAX) else {
+        sys::write(b"run: no space for ELF\n");
+        return;
+    };
+    let mut response = Buffer::new();
+    let mut len = 0;
+    while let Ok(count) = ext4_read(caps.ext4, path, len as u32, &mut response) {
+        if count == 0 {
+            let pid = sys::call(
+                abi::SPAWN_IMAGE,
+                caps.spawn,
+                arena.base() as u32,
+                len as u32,
+                0,
+            );
+            if (pid as i32) < 0 {
+                sys::write(b"run: ELF rejected or process slots exhausted\n");
+            }
+            break;
+        }
+        if len + count > abi::SPAWN_IMAGE_MAX {
+            sys::write(b"run: ELF exceeds 8 KiB\n");
+            break;
+        }
+        // SAFETY: arena is privately allocated and len + count fits.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                response.as_slice()[1..].as_ptr(),
+                (arena.base() + len) as *mut u8,
+                count,
+            );
+        }
+        len += count;
+    }
+    let _ = arena.release();
 }
 
 extern "C" fn yield_worker(iters: u32) -> ! {
@@ -743,6 +821,35 @@ fn parse_u32_range(bytes: &[u8], min: u32, max: u32) -> Option<u32> {
 }
 
 fn sdcard_command(text: &[u8], display_cap: u32) -> bool {
+    if text == b"sd export" || text.starts_with(b"sd export ") {
+        let seconds = if text == b"sd export" {
+            60
+        } else if let Some(seconds) = parse_u32_range(&text[10..], 1, 600) {
+            seconds
+        } else {
+            sys::write(b"usage: sd export [seconds 1..600]\n");
+            return true;
+        };
+        sys::write(b"USB-C switching to read-only SD export. Console returns when time expires.\n");
+        if sys::call(abi::SD_EXPORT, display_cap, abi::SD_EXPORT_START, 0, 0) != 0 {
+            sys::write(b"sd export: could not start USB OTG\n");
+            return true;
+        }
+        let start = sys::call(abi::TICKS, 0, 0, 0, 0);
+        while sys::call(abi::TICKS, 0, 0, 0, 0).wrapping_sub(start) < seconds * 100 {
+            match sys::call(abi::SD_EXPORT, display_cap, abi::SD_EXPORT_POLL, 0, 0) {
+                0 => sys::sleep_ticks(1),
+                1 => {
+                    sys::call(abi::YIELD, 0, 0, 0, 0);
+                }
+                _ => break,
+            }
+        }
+        let _ = sys::call(abi::SD_EXPORT, display_cap, abi::SD_EXPORT_STOP, 0, 0);
+        sys::write(b"sd export ended\n");
+        return true;
+    }
+
     if text == b"sdcard" {
         let rc = sys::call(
             abi::DISPLAY_TEST,
@@ -819,7 +926,7 @@ fn command(line: &Buffer, caps: Caps) {
         b"help" => {
             // Command names in bright cyan, arguments in the default colour.
             sys::write(
-                b"\x1b[96mhelp\x1b[0m | \x1b[96mcat\x1b[0m <path> | \x1b[96muptime\x1b[0m | \x1b[96mbench\x1b[0m | \x1b[96msmp\x1b[0m [status/pin 0/pin 1/any] | \x1b[96mfreq\x1b[0m [auto/40/180] | \x1b[96msdcard\x1b[0m [bench [mib] [cmd_kib]] | \x1b[96mi2cdetect\x1b[0m [bus] | \x1b[96mkbdled\x1b[0m [auto/off/bright N/R G B] | \x1b[96mrun\x1b[0m hello/pic/pic-psram/dma | \x1b[96mmemtest\x1b[0m\n",
+                b"\x1b[96mhelp\x1b[0m | \x1b[96mcat\x1b[0m <path> | \x1b[96muptime\x1b[0m | \x1b[96mbench\x1b[0m | \x1b[96msmp\x1b[0m [status/pin 0/pin 1/any] | \x1b[96mfreq\x1b[0m [auto/40/180] | \x1b[96msdcard\x1b[0m [bench [mib] [cmd_kib]] | sd export [seconds] | \x1b[96mi2cdetect\x1b[0m [bus] | \x1b[96mkbdled\x1b[0m [auto/off/bright N/R G B] | \x1b[96mrun\x1b[0m hello/pic/pic-psram/dma or /sd/<elf> | \x1b[96mmemtest\x1b[0m\n",
             );
             sys::write(
                 b"\x1b[96msentinel\x1b[0m [hello/status/pause/resume/log/mark] | \x1b[96msentinel\x1b[0m sleep/wake/arm/prepare <ms> | \x1b[96msentinel\x1b[0m wait/cancel | \x1b[96mdisplay\x1b[0m test/orbit/pixel/diag/boot/off\n",
@@ -1001,6 +1108,8 @@ fn command(line: &Buffer, caps: Caps) {
                 _ => sys::write(b"usage: i2cdetect [bus]  (buses: cat /proc/i2c)\n"),
             }
         }
+        _ if text.starts_with(b"cat /sd/") => cat_ext4(caps.ext4, &text[7..]),
+        _ if text.starts_with(b"run /sd/") => run_ext4(caps, &text[7..]),
         _ if text.len() > 4 && text.starts_with(b"cat ") => {
             read_file(&text[4..], caps.request);
         }
@@ -1009,7 +1118,7 @@ fn command(line: &Buffer, caps: Caps) {
 }
 
 fn main(
-    _reply_handle: u32,
+    ext4_handle: u32,
     request_handle: u32,
     input_handle: u32,
     spawn_cap: u32,
@@ -1017,6 +1126,7 @@ fn main(
     sentinel_cap: u32,
 ) -> ! {
     let caps = Caps {
+        ext4: ext4_handle,
         request: request_handle,
         spawn: spawn_cap,
         display: display_cap,

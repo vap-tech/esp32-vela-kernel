@@ -195,7 +195,12 @@ impl<C: Copy> Scheduler<C> {
         let index = self
             .tasks
             .iter()
-            .position(|t| t.state == State::Terminated)
+            .enumerate()
+            // A remotely terminated thread still owns its slot until its hart
+            // consumes the outgoing trap and selects another context.
+            .position(|(i, t)| {
+                t.state == State::Terminated && !self.hart_current.contains(&Some(ThreadSlot(i)))
+            })
             .ok_or(Errno::Enospc)?;
         let id = self.last_id.checked_next().ok_or(Errno::Eoverflow)?;
         let initial_hart = if affinity & 1 != 0 { 0 } else { 1 };

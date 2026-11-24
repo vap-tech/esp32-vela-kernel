@@ -1376,18 +1376,54 @@ pub unsafe fn ensure_initialized() -> Result<(bool, bool, u32, u32), u32> {
     }
 }
 
+// Only the current export session may read raw sectors while Linux owns the card.
+static mut EXPORTED: bool = false;
+
+/// Called exclusively with KERNEL_LOCK held.
+pub unsafe fn set_exported(exported: bool) {
+    unsafe { EXPORTED = exported };
+}
+
+pub unsafe fn exported() -> bool {
+    unsafe { EXPORTED }
+}
+
+pub unsafe fn read_export_sector(lba: u32, out: &mut [u8; SECTOR_BYTES]) -> Result<(), u32> {
+    unsafe {
+        if !EXPORTED {
+            return Err(ERR_SD_READ);
+        }
+        let ptr = read_sectors(lba, 1)?;
+        core::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), SECTOR_BYTES);
+        Ok(())
+    }
+}
+
 /// Read `count` consecutive 512-byte sectors starting at `lba` (`1..=64` sectors)
 /// directly into `DMA_BUF` using hardware IDMAC (`CMD17` for 1 sector, `CMD18` for multi-sector).
 ///
 /// # Safety
 /// Exclusive HP0 ownership of `SDHOST` and `DMA_BUF` with machine interrupts masked.
 pub unsafe fn read_sectors_dma(lba: u32, count: usize) -> Result<*const u8, u32> {
+    if unsafe { EXPORTED } {
+        return Err(ERR_SD_READ);
+    }
+    unsafe { read_sectors(lba, count) }
+}
+
+unsafe fn read_sectors(lba: u32, count: usize) -> Result<*const u8, u32> {
     if count == 0 || count > BENCH_CHUNK_SECTORS {
         return Err(ERR_SD_READ);
     }
     unsafe {
         if !STATE.ready {
             let _ = ensure_initialized()?;
+        }
+        if lba
+            .checked_add(count as u32)
+            .is_none_or(|end| end > STATE.sectors)
+        {
+            return Err(ERR_SD_READ);
         }
         let arg = if STATE.sdhc {
             lba
@@ -1429,6 +1465,9 @@ pub unsafe fn read_sectors_dma(lba: u32, count: usize) -> Result<*const u8, u32>
 /// # Safety
 /// Exclusive HP0 ownership of `SDHOST` and `DMA_BUF` with machine interrupts masked.
 pub unsafe fn write_sectors_dma(lba: u32, count: usize) -> Result<(), u32> {
+    if unsafe { EXPORTED } {
+        return Err(ERR_SD_WRITE);
+    }
     if count == 0 || count > BENCH_CHUNK_SECTORS {
         return Err(ERR_SD_WRITE);
     }
@@ -1573,6 +1612,87 @@ pub unsafe fn read_sector(lba: u32, out: &mut [u8; SECTOR_BYTES]) -> Result<(), 
         core::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), SECTOR_BYTES);
         Ok(())
     }
+}
+
+// Only primary MBR partitions are selected. A protective MBR blocks legacy
+// writes across the disk even though the GPT is not yet mountable.
+fn primary_partitions(mbr: &[u8; SECTOR_BYTES], sectors: u32) -> Result<[(u8, u32, u32); 4], u32> {
+    let mut result = [(0, 0, 0); 4];
+    if mbr[510..] != [0x55, 0xaa] {
+        return Ok(result);
+    }
+    for (slot, entry) in result.iter_mut().zip(mbr[446..510].chunks_exact(16)) {
+        let kind = entry[4];
+        if kind == 0 {
+            continue;
+        }
+        let start = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+        let count = u32::from_le_bytes(entry[12..16].try_into().unwrap());
+        if start == 0 || count == 0 || start.checked_add(count).is_none_or(|end| end > sectors) {
+            return Err(ERR_SD_READ);
+        }
+        *slot = (kind, start, count);
+    }
+    for (i, &(kind, start, count)) in result.iter().enumerate() {
+        if kind != 0
+            && result[..i]
+                .iter()
+                .any(|&(k, s, n)| k != 0 && start < s + n && s < start + count)
+        {
+            return Err(ERR_SD_READ);
+        }
+    }
+    Ok(result)
+}
+
+/// Read the single Linux primary partition from the card's MBR.
+/// # Safety
+/// Same serialized controller ownership as `read_sector`.
+pub unsafe fn system_partition() -> Result<(u32, u32), u32> {
+    let (_, _, _, sectors) = unsafe { ensure_initialized()? };
+    let mut mbr = [0; SECTOR_BYTES];
+    unsafe { read_sector(0, &mut mbr)? };
+    let partitions = primary_partitions(&mbr, sectors)?;
+    if partitions.iter().any(|&(kind, _, _)| kind == 0xee) {
+        return Err(ERR_SD_READ);
+    }
+    let mut linux = partitions.into_iter().filter(|&(kind, _, _)| kind == 0x83);
+    match (linux.next(), linux.next()) {
+        (Some((_, start, count)), None) => Ok((start, count)),
+        _ => Err(ERR_SD_READ),
+    }
+}
+
+/// Check the entire legacy write range before issuing any data writes.
+/// # Safety
+/// Same serialized controller ownership as `read_sector`.
+pub unsafe fn check_legacy_write_range(start: u32, count: u32) -> Result<(), u32> {
+    let (_, _, _, sectors) = unsafe { ensure_initialized()? };
+    let end = start.checked_add(count).ok_or(ERR_SD_WRITE)?;
+    if start == 0 || count == 0 || end > sectors {
+        return Err(ERR_SD_WRITE);
+    }
+    let mut buf = [0; SECTOR_BYTES];
+    unsafe { read_sector(0, &mut buf)? };
+    if buf[510..] == [0x55, 0xaa] {
+        let partitions = primary_partitions(&buf, sectors)?;
+        if partitions
+            .iter()
+            .any(|&(kind, s, n)| kind == 0xee || (kind != 0 && start < s + n && s < end))
+        {
+            return Err(ERR_SD_WRITE);
+        }
+        // A boot sector can also have 55aa without partition entries.
+        if partitions.iter().all(|&(kind, _, _)| kind == 0) {
+            return Err(ERR_SD_WRITE);
+        }
+    } else {
+        unsafe { read_sector(2, &mut buf)? };
+        if buf[0x38..0x3a] == [0x53, 0xef] {
+            return Err(ERR_SD_WRITE);
+        }
+    }
+    Ok(())
 }
 
 /// Write one 512-byte sector at `lba` using hardware 4-bit SDMMC IDMA (`CMD24`) or SPI fallback.
@@ -1842,10 +1962,7 @@ pub unsafe fn bench<F: FnMut()>(
     let total_sectors = mib.saturating_mul(2048);
     unsafe {
         let _ = ensure_initialized()?;
-        let end_lba = BENCH_LBA.checked_add(total_sectors).ok_or(ERR_SD_WRITE)?;
-        if end_lba > STATE.sectors {
-            return Err(ERR_SD_WRITE);
-        }
+        check_legacy_write_range(BENCH_LBA, total_sectors)?;
         let seed = rng::next_u32();
         let streaming = STATE.sdmmc_4bit;
 

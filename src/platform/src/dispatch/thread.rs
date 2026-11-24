@@ -4,7 +4,7 @@ use vela_kernel::{
     id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
     lifecycle,
     memory::MemoryClass,
-    task::{Context, Region, Wait},
+    task::{Context, Region, State, Wait},
 };
 
 use super::Args;
@@ -13,10 +13,47 @@ use crate::{
     dma::DMA_CH_GDMA_AHB_CH1,
     runtime::{IRQ_SLOT_CONSOLE_RX, IRQ_SLOT_KBD, Runtime},
     soc, syscall,
-    usermem::{copy_to_user, copy_to_user_within},
+    usermem::{copy_from_user, copy_to_user, copy_to_user_within},
 };
 
 impl Runtime {
+    pub(super) fn sys_spawn_image(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::ProcessSpawn,
+            cap::EXECUTE,
+        )?;
+        let len = args.a2 as usize;
+        let ptr = args.a1 as usize;
+        if len == 0 || len > syscall::SPAWN_IMAGE_MAX {
+            return Err(Errno::Emsgsize);
+        }
+        let end = ptr.checked_add(len).ok_or(Errno::Efault)?;
+        if self.scheduler.tasks.iter().enumerate().any(|(i, task)| {
+            ThreadSlot(i) != self.scheduler.current
+                && task.process == current
+                && task.state == State::Running
+        }) || self.processes.slots.iter().enumerate().any(|(i, process)| {
+            ProcSlot(i) != current
+                && process.memory.maps.iter().any(|map| {
+                    map.permissions & vela_kernel::process::WRITE != 0
+                        && map.region.size != 0
+                        && map.region.base < end
+                        && ptr < map.region.base.saturating_add(map.region.size)
+                })
+        }) {
+            return Err(Errno::Ebusy);
+        }
+        // No concurrently running writer can access the source while KERNEL_LOCK
+        // is held. Validation and relocation use this one kernel-owned snapshot.
+        let mut snapshot = [0; syscall::SPAWN_IMAGE_MAX];
+        copy_from_user(self.memory(), ptr, &mut snapshot[..len])?;
+        self.spawn_elf_in(&snapshot[..len], MemoryClass::Psram, false)
+            .map(Pid::raw)
+    }
+
     pub(super) fn sys_spawn_hello(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
         lifecycle::require_authority(
             &self.processes,
@@ -131,16 +168,10 @@ impl Runtime {
         Ok(tid.raw())
     }
 
-    pub(super) fn sys_process_exit(
-        &mut self,
-        current: ProcSlot,
-        switch: &mut bool,
-    ) -> Result<u32, Errno> {
-        let owner = self.processes.slot(current).id;
+    pub(super) fn sys_process_exit(&mut self, switch: &mut bool) -> Result<u32, Errno> {
+        let local = self.scheduler.active_hart;
+        let harts = &mut self.harts;
         let display = &mut self.display;
-        self.allocator.release_psram_owner_with(owner, |region| {
-            let _ = display.set_psram_region_mapped(region, false);
-        });
         let reaped = lifecycle::terminate_process(
             &mut self.processes,
             &mut self.ipc,
@@ -148,6 +179,12 @@ impl Runtime {
             &mut self.events,
             &mut self.allocator,
             &mut self.scheduler,
+            |processes, allocator, owner| {
+                Self::sync_remote_pmp(processes, harts, local);
+                allocator.release_psram_owner_with(owner, |region| {
+                    let _ = display.set_psram_region_mapped(region, false);
+                });
+            },
             copy_to_user_within,
         );
         self.finish_reaped_process(reaped);

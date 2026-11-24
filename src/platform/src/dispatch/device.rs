@@ -20,6 +20,74 @@ use crate::{
 };
 
 impl Runtime {
+    pub(crate) fn stop_sd_export(&mut self) {
+        // SAFETY: device ownership changes are serialized by KERNEL_LOCK.
+        unsafe { self.usb_storage.stop() };
+        self.sd_export_owner = None;
+    }
+
+    pub(super) fn sys_sd_export(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::Display,
+            cap::CONTROL,
+        )?;
+        let owner = self.processes.slot(current).id;
+        match args.a1 {
+            syscall::SD_EXPORT_START => {
+                // SAFETY: all USB device transfers use bounded, serialized polling.
+                unsafe { self.usb_storage.start()? };
+                self.sd_export_owner = Some(owner);
+            }
+            syscall::SD_EXPORT_POLL if self.sd_export_owner == Some(owner) => {
+                return match unsafe { self.usb_storage.poll() } {
+                    Ok(active) => Ok(u32::from(active)),
+                    Err(error) => {
+                        self.stop_sd_export();
+                        Err(error)
+                    }
+                };
+            }
+            syscall::SD_EXPORT_STOP if self.sd_export_owner == Some(owner) => self.stop_sd_export(),
+            _ => return Err(Errno::Einval),
+        }
+        Ok(0)
+    }
+
+    pub(super) fn sys_sd_partition(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::SdSystemPartition,
+            cap::READ,
+        )?;
+        if unsafe { soc::sdcard::exported() } {
+            return Err(Errno::Ebusy);
+        }
+        if args.a2 == 0 {
+            self.sd_partition = None;
+            let partition = unsafe { soc::sdcard::system_partition() }.map_err(|_| Errno::Eio)?;
+            self.sd_partition = Some(partition);
+            return Ok(partition.1);
+        }
+        let (start, count) = self.sd_partition.ok_or(Errno::Einval)?;
+        let mut sector = [0; 512];
+        if args.a1 >= count || !self.writable(args.a2 as usize, sector.len()) {
+            return Err(Errno::Einval);
+        }
+        // Serialized with legacy SD accesses by KERNEL_LOCK. DMA writes only
+        // to the driver's buffer. Copy to U-mode after completion.
+        unsafe { soc::sdcard::read_sector(start + args.a1, &mut sector) }.map_err(|_| {
+            self.sd_partition = None;
+            Errno::Eio
+        })?;
+        copy_to_user_within(self.memory(), args.a2 as usize, sector.len(), &sector)?;
+        Ok(0)
+    }
+
     pub(super) fn sys_write(&mut self, args: Args) -> Result<u32, Errno> {
         let length = args.a1 as usize;
         if length > 128 {

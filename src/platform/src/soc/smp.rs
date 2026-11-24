@@ -71,6 +71,9 @@ pub static KERNEL_LOCK: TicketLock = TicketLock::new();
 #[inline(always)]
 pub fn mark_hart_in_kernel(hart: usize) {
     if hart < HARTS {
+        // Order completed user accesses (including uncached PSRAM) before
+        // acknowledging that the other hart may release the mappings.
+        unsafe { core::arch::asm!("fence iorw, iorw", options(nostack)) };
         HART_IN_KERNEL_OR_IDLE[hart].store(true, Ordering::SeqCst);
     }
 }

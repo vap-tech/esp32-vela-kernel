@@ -39,6 +39,7 @@ impl Runtime {
                 &mut self.scheduler,
                 current,
                 region,
+                |_| {},
             );
             return Err(Errno::Eio);
         }
@@ -55,14 +56,16 @@ impl Runtime {
             base: args.a0 as usize,
             size: args.a1 as usize,
         };
+        let local = self.scheduler.active_hart;
+        let harts = &mut self.harts;
         let class = lifecycle::free_memory(
             &mut self.processes,
             &mut self.allocator,
             &mut self.scheduler,
             current,
             region,
+            |processes| Self::sync_remote_pmp(processes, harts, local),
         )?;
-        self.shootdown_stale_remote_pmp();
         if class == MemoryClass::Psram {
             let _ = self.display.set_psram_region_mapped(region, false);
         }

@@ -74,6 +74,9 @@ pub struct Runtime {
     pub dma: DmaTable,
     pub sentinel: SentinelClient,
     pub display: DisplayControl,
+    pub usb_storage: soc::usb_storage::UsbStorage,
+    pub sd_export_owner: Option<Pid>,
+    pub sd_partition: Option<(u32, u32)>,
     pub dma_interrupts: u64,
     pub sentinel_interrupts: u64,
     pub freq_mode: FreqMode,
@@ -126,42 +129,40 @@ impl Runtime {
         }
     }
 
-    /// Deadlock-free synchronous IPI PMP shootdown: if `remote` hart currently has
-    /// a stale `active_space` (its process's `AddressSpace` revision changed or was
-    /// reaped), invalidate `harts[remote].active_space`, send an IPI to `remote`,
-    /// and wait until `remote` has entered M-mode (`is_hart_in_kernel_or_idle(remote)`).
-    ///
-    /// Once `remote` is in M-mode (`vela_trap_entry`), it has stopped all U-mode memory
-    /// accesses and cannot resume U-mode until the caller releases `KERNEL_LOCK` and
-    /// `remote` reloads its hardware PMP CSRs via [`Self::ensure_active_space_on`].
     pub fn shootdown_stale_remote_pmp(&mut self) {
+        Self::sync_remote_pmp(&self.processes, &mut self.harts, self.scheduler.active_hart);
+    }
+
+    /// Called with KERNEL_LOCK held after changing permissions, before recycling
+    /// memory or handing it to a device. The peer acknowledges entry to M-mode
+    /// before taking the lock, then reloads PMP before returning to U-mode.
+    pub fn sync_remote_pmp(processes: &Processes, harts: &mut [HartState; HARTS], local: usize) {
         if !soc::smp::hp1_online() {
             return;
         }
-        let local = self.scheduler.active_hart.min(HARTS - 1);
         let remote = 1 - local;
-        let Some((proc_slot, active_rev)) = self.harts[remote].active_space else {
+        let Some((proc_slot, active_rev)) = harts[remote].active_space else {
             return;
         };
-        let proc = self.processes.slot(proc_slot);
-        let is_alive = proc.state == vela_kernel::process::Lifecycle::Alive;
-        if is_alive && proc.memory.revision == active_rev {
+        let proc = processes.slot(proc_slot);
+        if proc.state == vela_kernel::process::Lifecycle::Alive
+            && proc.memory.revision == active_rev
+        {
             return;
         }
-        self.harts[remote].active_space = None;
-        self.harts[remote].pmp_shootdowns = self.harts[remote].pmp_shootdowns.saturating_add(1);
-        if self.harts[remote].in_idle || soc::smp::is_hart_in_kernel_or_idle(remote) {
-            return;
-        }
-        soc::smp::send_ipi(remote);
-        let mut spins = 1_000_000u32;
-        while !soc::smp::is_hart_in_kernel_or_idle(remote) {
-            core::hint::spin_loop();
-            spins -= 1;
-            if spins == 0 {
-                break;
+        if !soc::smp::is_hart_in_kernel_or_idle(remote) {
+            soc::smp::send_ipi(remote);
+            let mut spins = 1_000_000u32;
+            while !soc::smp::is_hart_in_kernel_or_idle(remote) {
+                // Permissions have already changed in software. Keep the lock and
+                // stop the kernel if the peer cannot confirm quiescence.
+                assert!(spins > 0, "PMP shootdown timeout on hart {remote}");
+                spins -= 1;
+                core::hint::spin_loop();
             }
         }
+        harts[remote].active_space = None;
+        harts[remote].pmp_shootdowns = harts[remote].pmp_shootdowns.saturating_add(1);
     }
 
     /// Switch HP operating point (`40 MHz` XTAL <-> `180 MHz` CPLL) while
@@ -452,29 +453,25 @@ impl Runtime {
             }
         }
         self.sentinel.release_wake_on_exit(reaped.pid);
+        if self.sd_export_owner == Some(reaped.pid) {
+            self.stop_sd_export();
+        }
         self.dma.release_all_for_process(reaped.pid);
         self.pmp_images[reaped.slot.index()] = None;
-        self.shootdown_stale_remote_pmp();
+        let local = self.scheduler.active_hart;
+        if self.harts[local]
+            .active_space
+            .is_some_and(|(slot, _)| slot == reaped.slot)
+        {
+            self.harts[local].active_space = None;
+        }
         self.note_woken_receiver(reaped.first_woken);
     }
 
     pub fn terminate(&mut self) {
-        let process = self.scheduler.current().process;
-        let owner = self.processes.slot(process).id;
-        let is_last = !self.scheduler.tasks.iter().enumerate().any(|(i, t)| {
-            ThreadSlot(i) != self.scheduler.current
-                && t.process == process
-                && t.state != State::Terminated
-        });
-        if is_last {
-            // If another thread of this process was somehow active on the remote hart,
-            // shoot down its PMP before unmapping PSRAM/SRAM.
-            self.shootdown_stale_remote_pmp();
-            let display = &mut self.display;
-            self.allocator.release_psram_owner_with(owner, |region| {
-                let _ = display.set_psram_region_mapped(region, false);
-            });
-        }
+        let local = self.scheduler.active_hart;
+        let harts = &mut self.harts;
+        let display = &mut self.display;
         if let Some(reaped) = lifecycle::terminate_current_thread(
             &mut self.processes,
             &mut self.ipc,
@@ -482,6 +479,12 @@ impl Runtime {
             &mut self.events,
             &mut self.allocator,
             &mut self.scheduler,
+            |processes, allocator, owner| {
+                Self::sync_remote_pmp(processes, harts, local);
+                allocator.release_psram_owner_with(owner, |region| {
+                    let _ = display.set_psram_region_mapped(region, false);
+                });
+            },
             copy_to_user_within,
         ) {
             self.finish_reaped_process(reaped);

@@ -38,6 +38,9 @@ impl Runtime {
         let args = Args::from_frame(frame);
         let current = self.scheduler.current().process;
         let result = match args.number {
+            syscall::SD_EXPORT => self.sys_sd_export(current, args),
+            syscall::SD_PARTITION => self.sys_sd_partition(current, args),
+            syscall::SPAWN_IMAGE => self.sys_spawn_image(current, args),
             syscall::SPAWN_HELLO => self.sys_spawn_hello(current, args),
             syscall::WRITE => self.sys_write(args),
             syscall::YIELD => self.sys_yield(switch),
@@ -53,7 +56,7 @@ impl Runtime {
             syscall::MEM_ALLOC => self.sys_mem_alloc(current, args, frame),
             syscall::MEM_FREE => self.sys_mem_free(current, args),
             syscall::THREAD_CREATE => self.sys_thread_create(current, args),
-            syscall::PROCESS_EXIT => self.sys_process_exit(current, switch),
+            syscall::PROCESS_EXIT => self.sys_process_exit(switch),
             syscall::DISPLAY_TEST => self.sys_display_test(current, args),
             syscall::SENTINEL_CONTROL => self.sys_sentinel_control(current, args),
             syscall::SENTINEL_ARM_WAKE | syscall::SENTINEL_PREPARE_SLEEP => {

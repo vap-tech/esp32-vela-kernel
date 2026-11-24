@@ -770,12 +770,14 @@ pub fn alloc_memory_in(
 
 /// Free an owned memory region if no live thread stack or in-flight DMA resides inside it,
 /// revoking all capabilities/mappings and waking blocked receivers with `-EFAULT`.
+/// `before_release` synchronizes the hardware permissions before the allocator can reuse the region.
 pub fn free_memory<C: Context>(
     processes: &mut Processes,
     allocator: &mut RegionAllocator,
     scheduler: &mut Scheduler<C>,
     current: ProcSlot,
     region: Region,
+    before_release: impl FnOnce(&Processes),
 ) -> Result<MemoryClass, Errno> {
     let owner = processes.slot(current).id;
     if !allocator.owns(owner, region)
@@ -797,6 +799,7 @@ pub fn free_memory<C: Context>(
         return Err(Errno::Ebusy);
     }
     invalidate_object(processes, scheduler, Object::Memory { owner, region }, None);
+    before_release(processes);
     allocator.free(owner, region)
 }
 
@@ -908,7 +911,8 @@ pub fn spawn_user_thread<C: Copy>(
 /// Terminate `scheduler.current`. If it was the last live thread of its process,
 /// reap all process-owned endpoints, event bindings, shared-memory grants,
 /// capabilities, and physical allocations, returning `Some(ReapedProcess)` for
-/// platform cleanup.
+/// platform cleanup. `before_release` runs after revocation and before allocator
+/// reuse, so the platform can synchronize PMP and unmap physical backing.
 pub fn terminate_current_thread<C: Context>(
     processes: &mut Processes,
     ipc: &mut Ipc,
@@ -916,6 +920,7 @@ pub fn terminate_current_thread<C: Context>(
     events: &mut EventTable,
     allocator: &mut RegionAllocator,
     scheduler: &mut Scheduler<C>,
+    before_release: impl FnOnce(&Processes, &mut RegionAllocator, Pid),
     mut deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
 ) -> Option<ReapedProcess> {
     let process = scheduler.current().process;
@@ -975,6 +980,7 @@ pub fn terminate_current_thread<C: Context>(
         }
     }
     processes.slot_mut(process).capabilities.clear();
+    before_release(processes, allocator, owner);
     allocator.release_owner(owner);
     processes.slot_mut(process).state = Lifecycle::Free;
     processes.slot_mut(process).memory = AddressSpace::EMPTY;
@@ -1005,6 +1011,7 @@ pub fn terminate_process<C: Context>(
     events: &mut EventTable,
     allocator: &mut RegionAllocator,
     scheduler: &mut Scheduler<C>,
+    before_release: impl FnOnce(&Processes, &mut RegionAllocator, Pid),
     deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
 ) -> ReapedProcess {
     let current = scheduler.current().process;
@@ -1021,9 +1028,17 @@ pub fn terminate_process<C: Context>(
             task.deadline = None;
         }
     }
-    let mut reaped =
-        terminate_current_thread(processes, ipc, calls, events, allocator, scheduler, deliver)
-            .expect("process has no remaining live threads");
+    let mut reaped = terminate_current_thread(
+        processes,
+        ipc,
+        calls,
+        events,
+        allocator,
+        scheduler,
+        before_release,
+        deliver,
+    )
+    .expect("process has no remaining live threads");
     for wait in sibling_waits {
         if let Wait::Event {
             object: event_object,
@@ -1493,7 +1508,8 @@ mod tests {
                 &mut h.allocator,
                 &mut h.scheduler,
                 p0,
-                stack
+                stack,
+                |_| {},
             ),
             Err(Errno::Ebusy)
         );
@@ -1508,6 +1524,7 @@ mod tests {
                 &mut h.events,
                 &mut h.allocator,
                 &mut h.scheduler,
+                |_, _, _| {},
                 deliver_checked,
             )
             .is_none()
@@ -1522,6 +1539,7 @@ mod tests {
                 &mut h.scheduler,
                 p0,
                 stack,
+                |_| {},
             ),
             Ok(MemoryClass::Sram)
         );
@@ -1596,6 +1614,7 @@ mod tests {
                 &mut h.scheduler,
                 owner,
                 psram_r2,
+                |_| {},
             ),
             Err(Errno::Ebusy)
         );
@@ -1611,6 +1630,7 @@ mod tests {
                 &mut h.scheduler,
                 owner,
                 psram_r2,
+                |_| {},
             ),
             Ok(MemoryClass::Psram)
         );
@@ -1625,6 +1645,16 @@ mod tests {
             &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
+            |processes, allocator, pid| {
+                assert_eq!(processes.slot(owner).state, Lifecycle::Dying);
+                assert!(
+                    !processes
+                        .slot(peer)
+                        .memory
+                        .permits(psram_r1.base, 4096, process::READ)
+                );
+                assert!(allocator.owns(pid, psram_r1));
+            },
             deliver_checked,
         )
         .unwrap();
@@ -1751,6 +1781,7 @@ mod tests {
             &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
+            |_, _, _| {},
             deliver_checked,
         )
         .unwrap();
@@ -1926,6 +1957,15 @@ mod tests {
         h.calls
             .bind_reply(&mut h.scheduler, msg.reply_token, ThreadSlot(1));
 
+        // Another sibling is still assigned to HP1 when HP0 exits the process.
+        let remote_tid = h
+            .scheduler
+            .create_thread(p0, TestCtx::default(), stack, CODE.base, 1, 2)
+            .unwrap();
+        let remote = h.scheduler.find_by_id(remote_tid).unwrap();
+        h.scheduler.activate_initial_on(1, remote);
+        h.scheduler.enter_hart(0);
+
         // Thread 0 invokes PROCESS_EXIT -> kills sibling slot 3, deactivates tok_w, and reaps p0.
         h.scheduler.current = ThreadSlot(0);
         let reaped = terminate_process(
@@ -1935,12 +1975,33 @@ mod tests {
             &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
+            |_, _, _| {},
             deliver_checked,
         );
         assert_eq!(reaped.slot, p0);
         assert_eq!(h.scheduler.task(ThreadSlot(3)).state, State::Terminated);
         assert_eq!(h.calls.lookup_for_reply(tok_w), Err(Errno::Epipe));
         assert_eq!(h.processes.slot(p0).state, Lifecycle::Free);
+        assert_eq!(h.scheduler.task(remote).state, State::Terminated);
+        assert_eq!(h.scheduler.hart_current[1], Some(remote));
+
+        // The old trap still refers to this slot. A new thread must use another one.
+        for _ in 0..TASKS - 3 {
+            let Ok(tid) = h
+                .scheduler
+                .create_thread(p1, TestCtx::default(), stack, CODE.base, 1, 2)
+            else {
+                break;
+            };
+            assert_ne!(h.scheduler.find_by_id(tid), Some(remote));
+        }
+        h.scheduler.enter_hart(1);
+        h.scheduler.select_for(1, false);
+        let tid = h
+            .scheduler
+            .create_thread(p1, TestCtx::default(), stack, CODE.base, 1, 2)
+            .unwrap();
+        assert_eq!(h.scheduler.find_by_id(tid), Some(remote));
     }
 
     #[test]
@@ -2127,6 +2188,7 @@ mod tests {
             &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
+            |_, _, _| {},
             deliver_checked,
         )
         .unwrap();
@@ -2149,6 +2211,7 @@ mod tests {
             &mut h.events,
             &mut h.allocator,
             &mut h.scheduler,
+            |_, _, _| {},
             deliver_checked,
         )
         .unwrap();

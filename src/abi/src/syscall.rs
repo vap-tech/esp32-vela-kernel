@@ -119,3 +119,12 @@ pub const IRQ_SLOT_KBD: u32 = 1; // Tab5 Keyboard INT (GPIO50, active-low level)
 
 pub const DMA_CHANNEL_GDMA_AHB_CH1: u32 = 0; // GDMA-AHB channel 1 memory-to-memory copy
 pub const DMA_CHANNEL_DW_GDMA_SCANOUT: u32 = 1; // DW-GDMA channel 0 MIPI-DSI video scanout
+
+pub const SD_PARTITION: u32 = 45; // a0=read capability, a1=relative LBA, a2=512-byte dst; dst=0 queries sector count
+pub const SPAWN_IMAGE: u32 = 46; // a0=ProcessSpawn capability, a1=ELF bytes, a2=size -> PID
+pub const SPAWN_IMAGE_MAX: usize = 8192;
+
+pub const SD_EXPORT: u32 = 47; // a0=Display control, a1=SD_EXPORT_* operation
+pub const SD_EXPORT_START: u32 = 0;
+pub const SD_EXPORT_POLL: u32 = 1;
+pub const SD_EXPORT_STOP: u32 = 2;

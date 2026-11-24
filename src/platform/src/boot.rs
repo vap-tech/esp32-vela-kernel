@@ -7,7 +7,7 @@ use vela_kernel::{
     id::ThreadSlot,
     ipc::Ipc,
     lifecycle::{bind_event, create_endpoint, grant},
-    memory::RegionAllocator,
+    memory::{MemoryClass, RegionAllocator},
     process::{PROCESSES, Processes},
     sched::Scheduler,
     stats::{CycleAccounting, FreqMode},
@@ -22,6 +22,7 @@ use crate::{
     soc,
 };
 
+const EXT4FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ext4fs.elf"));
 const PROCFS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/procfs.elf"));
 const SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
@@ -117,6 +118,9 @@ extern "C" fn rust_main() -> ! {
             dma,
             sentinel: SentinelClient::new(),
             display: DisplayControl::new(),
+            usb_storage: soc::usb_storage::UsbStorage::new(),
+            sd_export_owner: None,
+            sd_partition: None,
             dma_interrupts: 0,
             sentinel_interrupts: 0,
             freq_mode: FreqMode::Auto,
@@ -128,11 +132,14 @@ extern "C" fn rust_main() -> ! {
         })
     };
 
-    // Load isolated standalone user ELF services into private SRAM allocations.
+    // Keep room in SRAM for service stacks and DMA by placing the shell image in PSRAM.
     let (procfs, _, _) = runtime.load_elf(PROCFS_ELF, false).expect("procfs ELF");
-    let (shell, _, _) = runtime.load_elf(SHELL_ELF, false).expect("shell ELF");
+    let (shell, _, _) = runtime
+        .load_elf_in(SHELL_ELF, MemoryClass::Psram, false)
+        .expect("shell ELF");
     let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
     let (kbd_proc, _, _) = runtime.load_elf(KBD_ELF, false).expect("kbd ELF");
+    let (ext4fs, _, _) = runtime.load_elf(EXT4FS_ELF, false).expect("ext4fs ELF");
     let (fbcon_proc, _, _) = runtime.load_elf(FBCON_ELF, false).expect("fbcon ELF");
 
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
@@ -155,6 +162,25 @@ extern "C" fn rust_main() -> ! {
         cap::SEND,
     )
     .unwrap();
+    let fs_request =
+        create_endpoint(&mut runtime.ipc, &mut runtime.processes, ext4fs.slot).unwrap();
+    let shell_fs = grant(
+        &mut runtime.processes,
+        ext4fs.slot,
+        fs_request,
+        shell.slot,
+        cap::SEND,
+    )
+    .unwrap();
+    let storage = runtime
+        .processes
+        .slot_mut(ext4fs.slot)
+        .capabilities
+        .install(Capability {
+            object: Object::Authority(Authority::SdSystemPartition),
+            rights: cap::READ,
+        })
+        .unwrap();
     let console_input = grant(
         &mut runtime.processes,
         shell.slot,
@@ -271,7 +297,7 @@ extern "C" fn rust_main() -> ! {
         .start_loaded(
             shell,
             [
-                reply.raw(),
+                shell_fs.raw(),
                 shell_request.raw(),
                 input.raw(),
                 spawn_cap.raw(),
@@ -308,6 +334,10 @@ extern "C" fn rust_main() -> ! {
         .unwrap();
 
     // SAFETY: isolated physical regions, no users executing yet.
+    runtime
+        .start_loaded(ext4fs, [fs_request.raw(), storage.raw(), 0, 0, 0, 0], 1, 1)
+        .unwrap();
+
     let (revision, initial_pmp, _) = runtime.pmp_images[procfs.slot.index()].unwrap();
     assert!(unsafe { initial_pmp.activate_initial() }, "PMP readback");
     runtime.pmp_images[procfs.slot.index()] = Some((revision, initial_pmp, 1));

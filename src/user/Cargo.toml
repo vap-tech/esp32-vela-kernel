@@ -40,3 +40,9 @@ name = "vela-fbcon"
 path = "src/bin/fbcon.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-ext4fs"
+path = "src/bin/ext4fs.rs"
+test = false
+bench = false

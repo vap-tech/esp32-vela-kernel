@@ -1,5 +1,9 @@
 use core::fmt::Write;
-use vela_kernel::{id::Ticks, sched::HARTS, task::Context};
+use vela_kernel::{
+    id::Ticks,
+    sched::HARTS,
+    task::{Context, State},
+};
 
 use crate::{arch, dma::DMA_CH_GDMA_AHB_CH1, runtime::RUNTIME, soc};
 
@@ -74,6 +78,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     } else {
         None
     };
+    let remotely_terminated =
+        outgoing_thread.is_some_and(|slot| runtime.scheduler.task(slot).state == State::Terminated);
     let mut switch = false;
     if interrupt && cause == 17 && hart == 0 {
         // SAFETY: sole timer owner under masked IRQs and KERNEL_LOCK. Only bounded O(TASKS)
@@ -137,6 +143,9 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         } else {
             switch = from_idle;
         }
+    } else if !interrupt && remotely_terminated {
+        // PROCESS_EXIT on the peer won the race with this syscall or fault.
+        // The process has been reaped, so discard the trap from its old context.
     } else if !interrupt && cause == 8 && !from_idle {
         frame.mepc = frame.mepc.wrapping_add(4);
         let result = runtime.dispatch(frame, &mut switch);
@@ -159,6 +168,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         soc::smp::KERNEL_LOCK.unlock();
         fatal(frame);
     }
+    let switch = switch || remotely_terminated;
     // Preserve active trap bookkeeping, canonicalize target privilege and MPIL.
     let cause = frame.mcause & !((3 << 28) | (255 << 16));
     if !from_idle && !switch {
@@ -178,7 +188,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         soc::smp::KERNEL_LOCK.unlock();
         return frame;
     }
-    if !from_idle {
+    if !from_idle && !remotely_terminated {
         if let Some(out_slot) = outgoing_thread {
             unsafe {
                 arch::save_extended_context(
