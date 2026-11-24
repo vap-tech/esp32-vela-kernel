@@ -149,26 +149,22 @@ NAPOT-compatible owned internal SRAM (`MEM_CLASS_SRAM = 0`, 4 KiB pages) or exte
 and memory grants cannot forward authority. IPC call/reply (`IPC_CALL`, `IPC_REPLY`, `IPC_REPLY_RECV`) uses single-use reply
 tokens, bounded priority donation, direct client-to-server handoff when a receiver is already waiting, and optional deadlines.
 
-Userspace Arena explicitly suballocates aligned blocks inside one MEM_ALLOC
+Userspace `Arena` explicitly suballocates aligned blocks inside one `MEM_ALLOC`
 region; metadata stays on the service stack, with checked arithmetic and explicit
 whole-region release. Raw pointers expire at release; sharing requires userspace
-synchronization. No global allocator or individual free. `memtest` exercises
-alignment, writable allocations, exhaustion and release in U-mode across both SRAM and PSRAM.
-Tab5 v1.3 smoke: memtest, help, uptime and cat /proc/loadavg passed.
+synchronization. No global allocator or individual free.
 Dual-core HP0+HP1 SMP with synchronous IPI PMP shootdowns and full FPU+PIE context switching is active; no POSIX or kernel VFS.
 
 ## ELF and DMA
 
 The ELF loader checks RV32 bounds, segment permissions and entry before
-starting the process with a private stack and empty capability table. Exit and
-fault release its SRAM and unmap any owned PSRAM MMU pages. Each PIE receives one aligned backing allocation (in SRAM for `run pic` or in the managed PSRAM pool for `run pic-psram`) and
+starting the process with a private stack and explicitly granted capability table. Exit and
+fault release its SRAM and unmap any owned PSRAM MMU pages. Each static PIE receives one aligned backing allocation (in SRAM or in the managed PSRAM pool) and
 separate PMP mappings for its segments. The supported relocation is symbol-free
-R_RISCV_RELATIVE with an aligned RW destination and an in-image addend.
-The spawn ABI selects a bundled executable by index.
+`R_RISCV_RELATIVE` with an aligned RW destination and an in-image addend.
+Runtime binaries are loaded from `/sd/bin/*.elf` via `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` with up to 4 attenuated capability handles.
 
-On Tab5 v1.3, `run dma` launches an isolated driver granted a process-local
-`Object::DmaChannel` capability (`DMA_CHANNEL_GDMA_AHB_CH1 = 0`) that checks a
-2048-byte SRAM copy byte by byte. `DmaTable` unifies `GDMA-AHB CH1` (memory copy)
+`DmaTable` unifies `GDMA-AHB CH1` (memory copy)
 and `DW-GDMA CH0` (MIPI-DSI scanout), validating controller-specific `MemoryClass`
 compatibility (`GdmaAhb` -> `Sram`, `DwGdmaAxi` -> `Sram | Psram`), 64-byte
 cache-line alignment, and per-channel `InFlight` region holds in `RegionAllocator`.
@@ -194,12 +190,14 @@ No heartbeat means unarmed until the first accepted heartbeat. A missed deadline
 increments the transition count once and publishes HEARTBEAT_MISSED. A new
 heartbeat restores healthy state without erasing counters. No automatic reset.
 
-Commands: sentinel and sentinel hello retain READY/ACK diagnostics;
-sentinel status requests a fresh LP snapshot; sentinel pause/resume disable or
-enable only the HP heartbeat sender, for timeout/recovery checks. Status notices
-counts asynchronous missed notifications actually received by HP. A blocked
-status/HELLO request times out after one second; its transport slot stays
-reserved until the matching response, so a late reply cannot complete a new call.
+Userspace interfaces: `cat /sys/sentinel/status` requests a fresh LP snapshot,
+`cat /sys/sentinel/log` reads the LP diagnostic journal, and
+`echo <ms> > /sys/sentinel/sleep` enters a coordinated heartbeat-paused sleep window
+(the underlying kernel syscalls also retain HELLO, pause/resume, mark, and wake-alarm
+operations). Status `notices` counts asynchronous missed notifications actually
+received by HP. A blocked status/HELLO request times out after one second; its
+transport slot stays reserved until the matching response, so a late reply cannot
+complete a new call.
 
 If an automatic heartbeat receives no reply for one second, `sentinel` reports
 a heartbeat timeout. HP retries the original sequence once per second. LP
@@ -291,7 +289,7 @@ ticket, and STATUS reports `prepared` with the age of the last real heartbeat.
 `SENTINEL_PREPARE_SLEEP` rejects sleep preparation with `-EBUSY` while any DMA
 channel (`GDMA-AHB CH1` or `DW-GDMA CH0` scanout) or the MIPI-DSI display
 pipeline is active, or when an unconsumed IRQ/Event notification is pending in
-`EventTable`; run `display off` first to stop scanout and release the
+`EventTable`; run `echo off > /sys/display` first to stop scanout and release the
 framebuffer. Cancellation before the deadline disarms the timer. At or after the deadline
 expiry wins, and WAIT consumes one WAKE_EVENT. Either outcome opens a fresh
 heartbeat timeout window and immediately schedules a fresh HP heartbeat so LP
@@ -307,8 +305,8 @@ timeouts (`SentinelClient::next_deadline`) and the 5-second load average window
 (`1..=400` ticks = 10 ms .. 4.0 s) and reprograms `SYSTIMER` comparator 0 in
 26-bit period mode when neither display scanout nor DMA is active.
 
-In `auto` DVFS mode (`CLOCK_CONTROL`, `freq [auto/40/180]`), HP0 downshifts to
-`40 MHz` XTAL (`CPU/MEM/SYS/APB = 40 MHz`) during tickless and `sentinel sleep <ms>`
+In `auto` DVFS mode (`CLOCK_CONTROL`, `echo auto|40|180 > /sys/freq`), HP0 downshifts to
+`40 MHz` XTAL (`CPU/MEM/SYS/APB = 40 MHz`) during tickless and `/sys/sentinel/sleep`
 windows when `!display.is_active() && !dma.any_active()`, and restores the active
 `180 MHz` CPLL (`CPU/MEM/SYS = 180 MHz`, `APB = 90 MHz`) operating point upon wakeup.
 `CycleAccounting` integrates exact `mcycle` capacity across every frequency switch
@@ -383,56 +381,35 @@ source and 16-item source bursts removed those artifacts. Pixel and Orbit
 share the same zero source.
 
 
-### Full-screen graphics from microSD in PSRAM
+### Display, PSRAM and microSD (SDMMC 4-bit IDMAC)
 
-`display diag` and `display boot` use the PNG masters in
-`vela_boot_and_display_assets`. During the build, `tools/display_assets.py`
-rotates each 1280×720 PNG counterclockwise into the 720×1280 scanout layout,
-placing the keyboard connector along the bottom edge,
-quantizes it to RGB565 and encodes little-endian (u16 count, u16 pixel)
-runs. The converter checks its output by an exact round trip. The 271920-byte
-`VELAIMG1` bundle (64-byte header + 87948-byte `DIAGNOSTIC` + 183908-byte `BOOT`
-RLE streams, 532 sectors) is stored on the Tab5 microSD card starting at `LBA 2048`
-(`1 MiB` offset). If a blank or unprovisioned microSD card is inserted, the
-microSD driver automatically stages the 532 sectors once from the Flash staging
-area (`0x100000`) onto the microSD card at `LBA 2048` and verifies both streams
-back from the card before rendering.
+`vela_boot_and_display_assets` and `tools/display_assets.py` are retained in the
+repository for future boot/background wallpapers: during the build, each 1280×720
+PNG is rotated counterclockwise into the 720×1280 scanout layout (keyboard connector
+at the bottom), quantized to RGB565, RLE-encoded, verified by exact round-trip, and
+packed into the 271920-byte `VELAIMG1` bundle at Flash `0x100000`.
 
 The microSD driver (`src/platform/src/soc/sdcard.rs`) enables internal PMU
 `LDO_VO4` (`ext_ldo[4]`, `0x501151d8`/`0x501151dc`) at 3.3 V to power the
-`VDDPST_5` (`GPIO39..48`) domain, configures `GPIO43` (`CLK`), `GPIO44` (`CMD`/MOSI),
-`GPIO42` (`D3`/CS#) as push-pull outputs and `GPIO39..41` (`D0..D2`) as pulled-up
-inputs, and runs SD v2 / SDHC identification (`CMD0`, `CMD8`, `CMD59(1)` hardware
-CRC7 enable, `CMD55`+`ACMD41`, `CMD58` OCR, `CMD9` CSD capacity parsing). All
-512-byte sector reads (`CMD17`) and writes (`CMD24` + `CMD13` status check) verify
-16-bit `CRC16-CCITT` (`0x1021`) in software and on the card.
+`VDDPST_5` (`GPIO39..48`) domain and drives the hardware 4-bit SDMMC host controller
+(`SDHOST` at `0x50083000`, DesignWare DWC-MSHC) on Slot 0 (`GPIO39..44`) with an
+8-descriptor chained IDMAC ring (32 KiB / 64 sectors per `CMD18`/`CMD25` multi-block
+transfer at up to 40 MHz High-Speed), with automatic fallback to SPI mode (`CMD59`
+CRC7 + software `CRC16-CCITT`).
 
-The trusted display driver powers LDO2 at 1.8 V and the shared MSPI PHY, reads AP
-mode registers and verifies the selected chip's 32 MiB density. The link
-initializes at SPLL/12 = 40 MHz and uses SPLL/6 = 80 MHz for HEX x16 DDR.
+The trusted display driver powers LDO2 at 1.8 V and the shared MSPI PHY, verifies the
+32 MiB AP HEX PSRAM density, and switches the link to 80 MHz HEX x16 DDR (`SPLL/6`).
 All 32 MiB (`0x88000000..0x8a000000`, `pages 0..512`) are managed as a unified
-64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM` and `run pic-psram`).
-When `display diag` or `display boot` starts, the display driver dynamically
-allocates a 2 MiB region from `RegionAllocator` after locking CPLL 180 MHz in stage 2,
-identity-maps its 32 MMU pages, streams 4 KiB (8-sector) RLE chunks from the microSD
-card into the 1843200-byte framebuffer via the uncached `0x88xx_xxxx` alias across
-stages 3..43 **before** ST7121 panel initialization (`0x11` / `0x29`), and then starts
-MIPI-DSI video and `DW-GDMA CH0` (`InFlight`) reading the `0x48xx_xxxx` bus alias with
-one descriptor per frame and a four-frame ring. Running `display off` (or switching back
-to `display test`, `display pixel` or `display orbit`) stops scanout, turns off backlight
-on `display off`, releases the `InFlight` DMA hold and unmaps/frees the 2 MiB region
-so the full 32 MiB of PSRAM are available when full-screen PSRAM scanout is not active.
+64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM`).
+At boot, `vela-fbcon` allocates a 2 MiB framebuffer from `RegionAllocator`, initializes
+the ST7121 panel and MIPI-DSI video pipeline (`DW-GDMA CH0`, 4-frame descriptor ring
+reading the `0x48xx_xxxx` bus alias), and renders the 80×22 ANSI console. Writing
+`echo off > /sys/display` stops scanout, disables backlight, releases the `InFlight`
+DMA hold, and returns the 2 MiB region to the 32 MiB pool.
 
-The raster is expanded and read back in batches of 32 rows, yielding between
-batches. The framebuffer is written only after the previous scanout stops.
-Both full-screen images and their orientation were confirmed on Tab5 with an
-8 GB SDHC card (`ocr=0xc0ff8000`, `15646720` sectors / `7640 MiB`). Startup checks
-passed 40 frames without recurring underrun, followed by `/proc/sdcard`, `/proc/streams`,
-`/proc/power` and healthy Sentinel with missed=0.
-
-Current SRAM payload is 148080 bytes (including bundled service and test ELFs),
-SPM `.entry` (bootstrap + trap entry/exit) is 1372 bytes, and kernel BSS is 19216 bytes (including per-thread 384-byte 16-byte-aligned `ExtendedContext` frames and the 4 KiB aligned microSD stream chunk buffer).
-The artwork is selected through the shell; startup still enters the USB shell.
+Current SRAM payload is ~201 KiB (including bundled `sysd`, `init`, `console`, `kbd`,
+`fbcon`, and `ext4fs` ELFs), SPM `.entry` (bootstrap + trap entry/exit) is 1372 bytes,
+and kernel BSS is ~25 KiB (including per-thread 384-byte `ExtendedContext` frames).
 
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
 13 an invalid image stream/range, 14 a framebuffer readback mismatch,
