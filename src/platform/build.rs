@@ -43,7 +43,7 @@ fn main() {
                 &source,
             ])
             .arg(&linker)
-            .args(pie.then_some("-Wl,-pie"))
+            .args(pie.then_some("-Wl,-pie,-z,max-page-size=64"))
             .arg("-o")
             .arg(out.join(format!("{name}.elf")))
             .status()

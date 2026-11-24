@@ -76,6 +76,8 @@ pub struct Runtime {
     pub display: DisplayControl,
     pub usb_storage: soc::usb_storage::UsbStorage,
     pub sd_export_owner: Option<Pid>,
+    pub sd_export_interrupted: bool,
+    pub sd_epoch: u32,
     pub sd_partition: Option<(u32, u32)>,
     pub dma_interrupts: u64,
     pub sentinel_interrupts: u64,
@@ -454,7 +456,7 @@ impl Runtime {
         }
         self.sentinel.release_wake_on_exit(reaped.pid);
         if self.sd_export_owner == Some(reaped.pid) {
-            self.stop_sd_export();
+            self.stop_sd_export(false);
         }
         self.dma.release_all_for_process(reaped.pid);
         self.pmp_images[reaped.slot.index()] = None;

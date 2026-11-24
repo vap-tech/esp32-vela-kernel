@@ -822,27 +822,43 @@ fn parse_u32_range(bytes: &[u8], min: u32, max: u32) -> Option<u32> {
 
 fn sdcard_command(text: &[u8], display_cap: u32) -> bool {
     if text == b"sd export" || text.starts_with(b"sd export ") {
-        let seconds = if text == b"sd export" {
+        let writable = text == b"sd export rw";
+        let seconds = if writable || text == b"sd export" {
             60
         } else if let Some(seconds) = parse_u32_range(&text[10..], 1, 600) {
             seconds
         } else {
-            sys::write(b"usage: sd export [seconds 1..600]\n");
+            sys::write(b"usage: sd export [seconds 1..600] | sd export rw\n");
             return true;
         };
-        sys::write(b"USB-C switching to read-only SD export. Console returns when time expires.\n");
-        if sys::call(abi::SD_EXPORT, display_cap, abi::SD_EXPORT_START, 0, 0) != 0 {
+        let operation = if writable {
+            sys::write(b"USB-C switching to writable SD export. Unmount and eject on Linux.\n");
+            abi::SD_EXPORT_START_RW
+        } else {
+            sys::write(
+                b"USB-C switching to read-only SD export. Console returns when time expires.\n",
+            );
+            abi::SD_EXPORT_START
+        };
+        if sys::call(abi::SD_EXPORT, display_cap, operation, 0, 0) != 0 {
             sys::write(b"sd export: could not start USB OTG\n");
             return true;
         }
         let start = sys::call(abi::TICKS, 0, 0, 0, 0);
-        while sys::call(abi::TICKS, 0, 0, 0, 0).wrapping_sub(start) < seconds * 100 {
+        while writable || sys::call(abi::TICKS, 0, 0, 0, 0).wrapping_sub(start) < seconds * 100 {
             match sys::call(abi::SD_EXPORT, display_cap, abi::SD_EXPORT_POLL, 0, 0) {
                 0 => sys::sleep_ticks(1),
                 1 => {
                     sys::call(abi::YIELD, 0, 0, 0, 0);
                 }
-                _ => break,
+                abi::SD_EXPORT_EJECTED => {
+                    sys::write(b"SD ejected by host; back under Vela control\n");
+                    return true;
+                }
+                _ => {
+                    sys::write(b"sd export: USB transport error\n");
+                    return true;
+                }
             }
         }
         let _ = sys::call(abi::SD_EXPORT, display_cap, abi::SD_EXPORT_STOP, 0, 0);
@@ -926,7 +942,7 @@ fn command(line: &Buffer, caps: Caps) {
         b"help" => {
             // Command names in bright cyan, arguments in the default colour.
             sys::write(
-                b"\x1b[96mhelp\x1b[0m | \x1b[96mcat\x1b[0m <path> | \x1b[96muptime\x1b[0m | \x1b[96mbench\x1b[0m | \x1b[96msmp\x1b[0m [status/pin 0/pin 1/any] | \x1b[96mfreq\x1b[0m [auto/40/180] | \x1b[96msdcard\x1b[0m [bench [mib] [cmd_kib]] | sd export [seconds] | \x1b[96mi2cdetect\x1b[0m [bus] | \x1b[96mkbdled\x1b[0m [auto/off/bright N/R G B] | \x1b[96mrun\x1b[0m hello/pic/pic-psram/dma or /sd/<elf> | \x1b[96mmemtest\x1b[0m\n",
+                b"\x1b[96mhelp\x1b[0m | \x1b[96mcat\x1b[0m <path> | \x1b[96muptime\x1b[0m | \x1b[96mbench\x1b[0m | \x1b[96msmp\x1b[0m [status/pin 0/pin 1/any] | \x1b[96mfreq\x1b[0m [auto/40/180] | \x1b[96msdcard\x1b[0m [bench [mib] [cmd_kib]] | sd export [seconds/rw] | \x1b[96mi2cdetect\x1b[0m [bus] | \x1b[96mkbdled\x1b[0m [auto/off/bright N/R G B] | \x1b[96mrun\x1b[0m hello/pic/pic-psram/dma or /sd/<elf> | \x1b[96mmemtest\x1b[0m\n",
             );
             sys::write(
                 b"\x1b[96msentinel\x1b[0m [hello/status/pause/resume/log/mark] | \x1b[96msentinel\x1b[0m sleep/wake/arm/prepare <ms> | \x1b[96msentinel\x1b[0m wait/cancel | \x1b[96mdisplay\x1b[0m test/orbit/pixel/diag/boot/off\n",

@@ -20,10 +20,17 @@ use crate::{
 };
 
 impl Runtime {
-    pub(crate) fn stop_sd_export(&mut self) {
+    pub(crate) fn stop_sd_export(&mut self, host_ejected: bool) {
+        self.sd_export_interrupted = !host_ejected && self.usb_storage.writable();
         // SAFETY: device ownership changes are serialized by KERNEL_LOCK.
-        unsafe { self.usb_storage.stop() };
+        unsafe {
+            self.usb_storage.stop();
+            // An interrupted writer may still have dirty state on the host.
+            soc::sdcard::set_exported(self.sd_export_interrupted);
+        };
         self.sd_export_owner = None;
+        self.sd_partition = None;
+        self.sd_epoch = (self.sd_epoch % i32::MAX as u32) + 1;
     }
 
     pub(super) fn sys_sd_export(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
@@ -36,21 +43,36 @@ impl Runtime {
         )?;
         let owner = self.processes.slot(current).id;
         match args.a1 {
-            syscall::SD_EXPORT_START => {
+            syscall::SD_EXPORT_START | syscall::SD_EXPORT_START_RW => {
+                if self.sd_export_interrupted && args.a1 == syscall::SD_EXPORT_START {
+                    return Err(Errno::Ebusy);
+                }
                 // SAFETY: all USB device transfers use bounded, serialized polling.
-                unsafe { self.usb_storage.start()? };
+                unsafe {
+                    self.usb_storage
+                        .start(args.a1 == syscall::SD_EXPORT_START_RW)?
+                };
                 self.sd_export_owner = Some(owner);
             }
             syscall::SD_EXPORT_POLL if self.sd_export_owner == Some(owner) => {
                 return match unsafe { self.usb_storage.poll() } {
-                    Ok(active) => Ok(u32::from(active)),
+                    Ok(syscall::SD_EXPORT_EJECTED) => {
+                        self.stop_sd_export(true);
+                        Ok(syscall::SD_EXPORT_EJECTED)
+                    }
+                    Ok(active) => Ok(active),
                     Err(error) => {
-                        self.stop_sd_export();
+                        self.stop_sd_export(false);
                         Err(error)
                     }
                 };
             }
-            syscall::SD_EXPORT_STOP if self.sd_export_owner == Some(owner) => self.stop_sd_export(),
+            syscall::SD_EXPORT_STOP if self.sd_export_owner == Some(owner) => {
+                if self.usb_storage.writable() {
+                    return Err(Errno::Ebusy);
+                }
+                self.stop_sd_export(false);
+            }
             _ => return Err(Errno::Einval),
         }
         Ok(0)
@@ -66,6 +88,9 @@ impl Runtime {
         )?;
         if unsafe { soc::sdcard::exported() } {
             return Err(Errno::Ebusy);
+        }
+        if args.a2 == 0 && args.a3 == syscall::SD_PARTITION_EPOCH {
+            return Ok(self.sd_epoch);
         }
         if args.a2 == 0 {
             self.sd_partition = None;

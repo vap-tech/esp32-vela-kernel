@@ -1390,12 +1390,39 @@ pub unsafe fn exported() -> bool {
 
 pub unsafe fn read_export_sector(lba: u32, out: &mut [u8; SECTOR_BYTES]) -> Result<(), u32> {
     unsafe {
-        if !EXPORTED {
+        if !EXPORTED || !STATE.ready {
             return Err(ERR_SD_READ);
         }
         let ptr = read_sectors(lba, 1)?;
         core::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), SECTOR_BYTES);
         Ok(())
+    }
+}
+
+/// Write one complete sector on the card owned by USB. Both SD transports
+/// wait for the card to finish programming before returning success.
+pub unsafe fn write_export_sector(lba: u32, data: &[u8; SECTOR_BYTES]) -> Result<(), u32> {
+    unsafe {
+        if !EXPORTED || !STATE.ready || lba >= STATE.sectors {
+            return Err(ERR_SD_WRITE);
+        }
+        core::ptr::copy_nonoverlapping(data.as_ptr(), dma_buf_direct_ptr(), SECTOR_BYTES);
+        fence();
+        write_sectors(lba, 1)
+    }
+}
+
+/// The driver has no dirty write cache. Confirm that the current card is ready.
+pub unsafe fn sync_export() -> bool {
+    unsafe {
+        EXPORTED
+            && STATE.ready
+            && if STATE.sdmmc_4bit {
+                sdmmc_wait_not_busy(4_000_000)
+            } else {
+                // SPI writes already include the card's busy response before deselect.
+                true
+            }
     }
 }
 
@@ -1468,12 +1495,22 @@ pub unsafe fn write_sectors_dma(lba: u32, count: usize) -> Result<(), u32> {
     if unsafe { EXPORTED } {
         return Err(ERR_SD_WRITE);
     }
+    unsafe { write_sectors(lba, count) }
+}
+
+unsafe fn write_sectors(lba: u32, count: usize) -> Result<(), u32> {
     if count == 0 || count > BENCH_CHUNK_SECTORS {
         return Err(ERR_SD_WRITE);
     }
     unsafe {
         if !STATE.ready {
             let _ = ensure_initialized()?;
+        }
+        if lba
+            .checked_add(count as u32)
+            .is_none_or(|end| end > STATE.sectors)
+        {
+            return Err(ERR_SD_WRITE);
         }
         let arg = if STATE.sdhc {
             lba

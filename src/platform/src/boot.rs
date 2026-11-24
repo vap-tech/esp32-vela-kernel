@@ -120,6 +120,8 @@ extern "C" fn rust_main() -> ! {
             display: DisplayControl::new(),
             usb_storage: soc::usb_storage::UsbStorage::new(),
             sd_export_owner: None,
+            sd_export_interrupted: false,
+            sd_epoch: 1,
             sd_partition: None,
             dma_interrupts: 0,
             sentinel_interrupts: 0,

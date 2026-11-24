@@ -128,3 +128,6 @@ pub const SD_EXPORT: u32 = 47; // a0=Display control, a1=SD_EXPORT_* operation
 pub const SD_EXPORT_START: u32 = 0;
 pub const SD_EXPORT_POLL: u32 = 1;
 pub const SD_EXPORT_STOP: u32 = 2;
+pub const SD_EXPORT_START_RW: u32 = 3;
+pub const SD_EXPORT_EJECTED: u32 = 2;
+pub const SD_PARTITION_EPOCH: u32 = 1; // SD_PARTITION a3 selects media epoch query (a2 must be 0)

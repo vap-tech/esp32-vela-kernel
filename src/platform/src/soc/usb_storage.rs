@@ -1,4 +1,4 @@
-//! Tab5 USB-C Full-Speed OTG and read-only SCSI Bulk-Only Transport.
+//! Tab5 USB-C Full-Speed OTG and SCSI Bulk-Only Transport.
 //! Register fields: ESP-IDF esp32p4 hw_ver1 and esp_hal_usb/usb_wrap_ll.h.
 use core::mem::MaybeUninit;
 
@@ -7,16 +7,15 @@ use usb_device::{
     bus::UsbBusAllocator,
     device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbRev, UsbVidPid},
 };
-use usbd_storage::{
-    subclass::scsi::{Scsi, ScsiCommand},
-    transport::bbb::BulkOnly,
-};
 use vela_kernel::errno::Errno;
 
 use crate::{
     pac::{read, write},
     soc::{clock, sdcard, timer},
 };
+
+mod bot;
+use bot::{Media, Msc};
 
 const DWC: usize = 0x5004_0000;
 const USB_WRAP: usize = 0x5008_0000;
@@ -57,21 +56,18 @@ unsafe impl UsbPeripheral for FsOtg {
 }
 
 type Bus = UsbBus<FsOtg>;
-type Msc = Scsi<BulkOnly<'static, Bus, [u8; SECTOR]>>;
 static mut ALLOCATOR: MaybeUninit<UsbBusAllocator<Bus>> = MaybeUninit::uninit();
 static mut ENDPOINT_MEMORY: [u32; 32] = [0; 32];
 
 struct Session {
     device: UsbDevice<'static, Bus>,
-    msc: Msc,
+    msc: Msc<'static, Bus>,
     attach_at: u64,
+    detach_at: Option<u64>,
+    last_progress: u64,
     attached: bool,
     previous_phy: u32,
-    sectors: u32,
-    offset: usize,
-    data: [u8; SECTOR],
-    cached_lba: Option<u32>,
-    sense: (u8, u8),
+    writable: bool,
 }
 
 pub struct UsbStorage {
@@ -87,15 +83,18 @@ impl UsbStorage {
         Self { session: None }
     }
 
-    /// Start a read-only session. An absent card is reported as no media.
+    /// Start an export. Writable sessions require a card and return on host eject.
     /// SAFETY: KERNEL_LOCK held, MIE masked, exclusive ownership of OTG11.
-    pub unsafe fn start(&mut self) -> Result<(), Errno> {
+    pub unsafe fn start(&mut self, writable: bool) -> Result<(), Errno> {
         if self.session.is_some() {
             return Err(Errno::Ebusy);
         }
         let sectors = unsafe { sdcard::ensure_initialized() }
             .map(|(_, _, _, sectors)| sectors)
             .unwrap_or(0);
+        if writable && sectors == 0 {
+            return Err(Errno::Eio);
+        }
         unsafe {
             let attach_at = timer::uptime_ticks().ok_or(Errno::Eio)?.saturating_add(25);
             update(SYS_CLOCK, 0, 1 << 15);
@@ -116,11 +115,15 @@ impl UsbStorage {
             let allocator = (&raw mut ALLOCATOR).cast::<UsbBusAllocator<Bus>>();
             allocator.write(UsbBus::new(FsOtg, memory));
             let allocator = &*allocator;
-            let msc = Msc::new(allocator, 64, 0, [0; SECTOR]).map_err(|_| Errno::Eio)?;
+            let msc = Msc::new(allocator, sectors, writable);
             let device = UsbDeviceBuilder::new(allocator, UsbVidPid(0x303a, 0x4001))
                 .strings(&[StringDescriptors::default()
                     .manufacturer("Space Flow")
-                    .product("Vela SD (read only)")])
+                    .product(if writable {
+                        "Vela SD"
+                    } else {
+                        "Vela SD (read only)"
+                    })])
                 .map_err(|_| Errno::Eio)?
                 .usb_rev(UsbRev::Usb200)
                 .max_packet_size_0(64)
@@ -137,13 +140,11 @@ impl UsbStorage {
                 device,
                 msc,
                 attach_at,
+                detach_at: None,
+                last_progress: 0,
                 attached: false,
                 previous_phy,
-                sectors,
-                offset: 0,
-                data: [0; SECTOR],
-                cached_lba: None,
-                sense: (0, 0),
+                writable,
             });
         }
         Ok(())
@@ -163,14 +164,22 @@ impl UsbStorage {
         }
     }
 
+    pub fn writable(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.writable)
+    }
+
     /// Service a bounded number of transport steps per syscall.
+    /// Return 0 for idle, 1 for activity, and 2 after the host accepted the eject CSW.
     /// SAFETY: KERNEL_LOCK held with MIE masked.
-    pub unsafe fn poll(&mut self) -> Result<bool, Errno> {
+    pub unsafe fn poll(&mut self) -> Result<u32, Errno> {
         let session = self.session.as_mut().ok_or(Errno::Einval)?;
+        let now = unsafe { timer::uptime_ticks() }.ok_or(Errno::Eio)?;
         unsafe {
             if !session.attached {
-                if timer::uptime_ticks().ok_or(Errno::Eio)? < session.attach_at {
-                    return Ok(false);
+                if now < session.attach_at {
+                    return Ok(0);
                 }
                 update(DCTL, DISCONNECT, 0);
                 session.attached = true;
@@ -178,134 +187,47 @@ impl UsbStorage {
             update(USB_WRAP, PULL_OVERRIDE, PULL_UP_DP);
         }
         let mut activity = false;
+        let mut media = SdMedia { accessed: false };
         for _ in 0..8 {
             activity |= session.device.poll(&mut [&mut session.msc]);
+            if session.msc.ejected() || session.detach_at.is_some() {
+                // Give the host time to finish its SCSI status handling.
+                let detach_at = *session.detach_at.get_or_insert(now.saturating_add(25));
+                return Ok(if now >= detach_at { 2 } else { 0 });
+            }
             if session.device.state() != UsbDeviceState::Configured {
-                session.offset = 0;
-                session.cached_lba = None;
                 break;
             }
-            if session.poll_scsi() {
-                activity = true;
+            activity |= session.msc.step(&mut media);
+            if media.accessed {
                 break; // At most one SD transfer per syscall.
             }
         }
-        Ok(activity || session.offset != 0)
+        if activity {
+            session.last_progress = now;
+        }
+        Ok(u32::from(
+            activity || (session.msc.transferring() && now <= session.last_progress),
+        ))
     }
 }
 
-impl Session {
-    fn poll_scsi(&mut self) -> bool {
-        let Self {
-            msc,
-            sectors,
-            offset,
-            data,
-            cached_lba,
-            sense,
-            ..
-        } = self;
-        let mut accessed_sd = false;
-        let _ = msc.poll_command(|mut cmd| {
-            let mut response = [0; 36];
-            let count = match cmd.kind {
-                ScsiCommand::Inquiry {
-                    evpd: false,
-                    alloc_len,
-                    ..
-                } => {
-                    response[..5].copy_from_slice(&[0, 0x80, 4, 2, 31]);
-                    response[8..16].copy_from_slice(b"VELA    ");
-                    response[16..32].copy_from_slice(b"Tab5 microSD    ");
-                    response[32..36].copy_from_slice(b"0001");
-                    36.min(usize::from(alloc_len))
-                }
-                ScsiCommand::Inquiry {
-                    evpd: true,
-                    alloc_len,
-                    page_code: 0,
-                } => 4.min(usize::from(alloc_len)),
-                ScsiCommand::RequestSense {
-                    desc: false,
-                    alloc_len,
-                } => {
-                    response[0] = 0x70;
-                    response[2] = sense.0;
-                    response[7] = 10;
-                    response[12] = sense.1;
-                    *sense = (0, 0);
-                    18.min(usize::from(alloc_len))
-                }
-                ScsiCommand::ModeSense6 { alloc_len, .. } => {
-                    response[0] = 3;
-                    response[2] = 0x80; // write protected
-                    4.min(usize::from(alloc_len))
-                }
-                ScsiCommand::ModeSense10 { alloc_len, .. } => {
-                    response[1] = 6;
-                    response[3] = 0x80;
-                    8.min(usize::from(alloc_len))
-                }
-                ScsiCommand::TestUnitReady if *sectors != 0 => 0,
-                ScsiCommand::ReadCapacity10 if *sectors != 0 => {
-                    response[..4].copy_from_slice(&(*sectors - 1).to_be_bytes());
-                    response[4..8].copy_from_slice(&(SECTOR as u32).to_be_bytes());
-                    8
-                }
-                ScsiCommand::Read { lba, len }
-                    if lba
-                        .checked_add(u32::from(len))
-                        .is_some_and(|end| end <= *sectors) =>
-                {
-                    let bytes = usize::from(len) * SECTOR;
-                    if *offset < bytes {
-                        let sector = lba + (*offset / SECTOR) as u32;
-                        if *cached_lba != Some(sector) {
-                            accessed_sd = true;
-                            if unsafe { sdcard::read_export_sector(sector, data) }.is_err() {
-                                *sense = (3, 0x11);
-                                cmd.fail(*offset as u32);
-                                *offset = 0;
-                                *cached_lba = None;
-                                return Ok(());
-                            }
-                            *cached_lba = Some(sector);
-                        }
-                        *offset += cmd.write_data(&data[*offset % SECTOR..])?;
-                    }
-                    if *offset == bytes {
-                        cmd.pass(bytes as u32);
-                        *offset = 0;
-                    }
-                    return Ok(());
-                }
-                ScsiCommand::Write { .. } => {
-                    *sense = (7, 0x27); // DATA PROTECT / WRITE PROTECTED
-                    cmd.fail(*offset as u32);
-                    *offset = 0;
-                    return Ok(());
-                }
-                _ => {
-                    *sense = if *sectors == 0 {
-                        (2, 0x3a)
-                    } else if matches!(cmd.kind, ScsiCommand::Read { .. }) {
-                        (5, 0x21)
-                    } else {
-                        (5, 0x20)
-                    };
-                    cmd.fail(0);
-                    *offset = 0;
-                    return Ok(());
-                }
-            };
-            if count == 0 {
-                cmd.pass(0);
-            } else {
-                let sent = cmd.write_data(&response[..count])?;
-                cmd.pass(sent as u32);
-            }
-            Ok(())
-        });
-        accessed_sd
+struct SdMedia {
+    accessed: bool,
+}
+impl Media for SdMedia {
+    fn read(&mut self, lba: u32, data: &mut [u8; SECTOR]) -> bool {
+        self.accessed = true;
+        unsafe { sdcard::read_export_sector(lba, data).is_ok() }
+    }
+
+    fn write(&mut self, lba: u32, data: &[u8; SECTOR]) -> bool {
+        self.accessed = true;
+        unsafe { sdcard::write_export_sector(lba, data).is_ok() }
+    }
+
+    fn sync(&mut self) -> bool {
+        self.accessed = true;
+        unsafe { sdcard::sync_export() }
     }
 }

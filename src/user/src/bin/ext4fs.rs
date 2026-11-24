@@ -38,6 +38,7 @@ impl BlockRead for Partition {
 
 fn main(endpoint: u32, storage: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     let mut mount = None;
+    let mut mounted_epoch = 0;
     let mut opened: Option<(Buffer, File)> = None;
     let mut request = Buffer::new();
     let mut response = Buffer::new();
@@ -61,6 +62,15 @@ fn main(endpoint: u32, storage: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> 
                 return Err(b"invalid request" as &[u8]);
             };
             let offset = u32::from_le_bytes([*a, *b, *c, *d]);
+            let epoch = sys::call(abi::SD_PARTITION, storage, 0, 0, abi::SD_PARTITION_EPOCH);
+            if (epoch as i32) <= 0 {
+                return Err(b"SD system partition unavailable");
+            }
+            if epoch != mounted_epoch {
+                mount = None;
+                opened = None;
+                mounted_epoch = epoch;
+            }
             if mount.is_none() {
                 let sectors = sys::call(abi::SD_PARTITION, storage, 0, 0, 0);
                 if (sectors as i32) <= 0 {

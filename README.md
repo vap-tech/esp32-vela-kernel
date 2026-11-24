@@ -37,7 +37,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `cat /proc/power` | Read live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
 | `cat /proc/i2c`, `i2cdetect [bus]`, `cat /dev/i2c-N` | List the board I²C buses (`0` system `GPIO31`/`GPIO32`, `1` Ext.Port1 `GPIO0`/`GPIO1`) or scan one with address-only probes (found addresses, `state ok/bus_fault`). Tab5 Keyboard answers at `0x6d` on bus 1. |
 | `cat /proc/sdcard`, `sdcard` | Probe Tab5 microSD Slot 0 (`GPIO39..44`, `LDO_VO4` 3.3 V), provision/verify `VELAIMG1` display assets at `LBA 2048` and read card capacity/transfer counters. |
-| `sd export [seconds]` | Export the entire microSD card read-only via USB-C Mass Storage (default 60 seconds). USB Serial/JTAG reconnects when the export ends. |
+| `sd export [seconds]`, `sd export rw` | Export the whole card by USB-C. Read-only export times out (default 60 s). Writable export ends when the host ejects it. |
 | `cat /sd/<path>`, `run /sd/<path>.elf` | Read a file from the read-only ext4 system partition or start an RV32 static PIE ELF (up to 8 KiB). |
 | `bench` | Measure U-mode syscall, thread context switch and cross-process IPC `CALL`/`REPLY` round-trip in `mcycle` cycles plus IRQ latency. |
 | `smp [status/pin 0/pin 1/any]` | Verify dual-hart HP0+HP1 SMP execution, `HP1 -> HP0 -> HP1` thread migration, synchronous IPI PMP shootdown, and concurrent `RV32F` FPU + `Xespv2p1` PIE (`q0..q7`, `QACC`, `UA_STATE`, `XACC`) context preservation (`fpu_pie=ok`), or query/set shell hart affinity. |
@@ -496,12 +496,17 @@ before validating it and grants the new process no storage capabilities.
 
 ### USB-C SD export
 
-Run `sd export 60` from the Vela shell. Linux sees a write-protected removable
-disk with the card's complete sector range, including LBA 0. Use `lsblk` to
-identify it. Vela reserves SDMMC for the export and rejects local SD I/O until
-the timer expires. Unmount the disk before then if you mounted it on Linux.
+Run `sd export 60` for read-only access, or `sd export rw` to format the card
+or update files from Linux. The whole card appears as a removable disk. Verify
+the model and capacity with `lsblk` before partitioning or formatting.
+
+For writable export, unmount every partition on Linux and use the desktop's
+Eject action or `sudo eject -s /dev/sdX` on the **whole Tab5 disk**. Vela
+acknowledges eject after card writes have completed, switches back to its
+USB console, and reopens the ext4 partition on the next file request.
+Writable export has no timeout. After an unexpected USB disconnect, reconnect
+and eject the disk before trying to access it from Vela.
 
 USB-C switches from Serial/JTAG to Full-Speed USB OTG during export. Reopen
 the console when it reconnects. The `ttyACM` number can change, so use the
-Tab5's symlink under `/dev/serial/by-id`. The current export does not support
-formatting or updating files from the host.
+Tab5's symlink under `/dev/serial/by-id`.
