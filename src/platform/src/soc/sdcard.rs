@@ -1509,7 +1509,7 @@ unsafe fn read_sectors(
     }
     unsafe {
         if !STATE.ready {
-            let _ = ensure_initialized()?;
+            let _ = ensure_initialized_with(service)?;
         }
         if lba
             .checked_add(count as u32)
@@ -1713,8 +1713,23 @@ unsafe fn write_sector_spi(lba: u32, data: &[u8; SECTOR_BYTES]) -> Result<(), u3
 /// # Safety
 /// Exclusive HP0 ownership of `SDHOST` / `GPIO39..44` with machine interrupts masked.
 pub unsafe fn read_sector(lba: u32, out: &mut [u8; SECTOR_BYTES]) -> Result<(), u32> {
+    unsafe { read_sector_with(lba, out, &mut || {}) }
+}
+
+/// Read one sector, allowing a callback to run during controller waits.
+///
+/// # Safety
+/// Same ownership as `read_sector`. The callback must not access the SD driver.
+pub unsafe fn read_sector_with(
+    lba: u32,
+    out: &mut [u8; SECTOR_BYTES],
+    service: &mut impl FnMut(),
+) -> Result<(), u32> {
     unsafe {
-        let ptr = read_sectors_dma(lba, 1)?;
+        if EXPORTED {
+            return Err(ERR_SD_READ);
+        }
+        let ptr = read_sectors(lba, 1, service)?;
         core::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), SECTOR_BYTES);
         Ok(())
     }
@@ -1753,11 +1768,14 @@ fn primary_partitions(mbr: &[u8; SECTOR_BYTES], sectors: u32) -> Result<[(u8, u3
 
 /// Read the single Linux primary partition from the card's MBR.
 /// # Safety
-/// Same serialized controller ownership as `read_sector`.
-pub unsafe fn system_partition() -> Result<(u32, u32), u32> {
-    let (_, _, _, sectors) = unsafe { ensure_initialized()? };
+/// Same serialized controller ownership and callback restrictions as `read_sector_with`.
+pub unsafe fn system_partition(service: &mut impl FnMut()) -> Result<(u32, u32), u32> {
+    if unsafe { EXPORTED } {
+        return Err(ERR_SD_READ);
+    }
+    let (_, _, _, sectors) = unsafe { ensure_initialized_with(service)? };
     let mut mbr = [0; SECTOR_BYTES];
-    unsafe { read_sector(0, &mut mbr)? };
+    unsafe { read_sector_with(0, &mut mbr, service)? };
     let partitions = primary_partitions(&mbr, sectors)?;
     if partitions.iter().any(|&(kind, _, _)| kind == 0xee) {
         return Err(ERR_SD_READ);

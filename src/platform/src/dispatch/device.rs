@@ -132,7 +132,10 @@ impl Runtime {
         }
         if args.a2 == 0 {
             self.sd_partition = None;
-            let partition = unsafe { soc::sdcard::system_partition() }.map_err(|_| Errno::Eio)?;
+            // Cold SD initialization can outlast the scanout descriptor ring
+            // while KERNEL_LOCK masks timer interrupts.
+            let partition = unsafe { soc::sdcard::system_partition(&mut || self.display.tick()) }
+                .map_err(|_| Errno::Eio)?;
             self.sd_partition = Some(partition);
             return Ok(partition.1);
         }
@@ -143,7 +146,10 @@ impl Runtime {
         }
         // Serialized with legacy SD accesses by KERNEL_LOCK. DMA writes only
         // to the driver's buffer. Copy to U-mode after completion.
-        unsafe { soc::sdcard::read_sector(start + args.a1, &mut sector) }.map_err(|_| {
+        unsafe {
+            soc::sdcard::read_sector_with(start + args.a1, &mut sector, &mut || self.display.tick())
+        }
+        .map_err(|_| {
             self.sd_partition = None;
             Errno::Eio
         })?;
