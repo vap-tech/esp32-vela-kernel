@@ -199,7 +199,7 @@ pub fn resolve_dma_channel(
 }
 
 /// Grant a one-level delegated capability from `owner` to `peer`.
-/// `GRANT` and `CONTROL` are never delegable.
+/// `GRANT`, `CONTROL` and `PASS_ON_SPAWN` are never delegable.
 pub fn grant(
     processes: &mut Processes,
     owner: ProcSlot,
@@ -208,12 +208,33 @@ pub fn grant(
     rights: u16,
 ) -> Result<Handle, Errno> {
     let source = processes.slot(owner).capabilities.get(handle, cap::GRANT)?;
-    if rights == 0 || rights & !source.rights != 0 || rights & (cap::CONTROL | cap::GRANT) != 0 {
+    if rights == 0
+        || rights & !source.rights != 0
+        || rights & (cap::CONTROL | cap::GRANT | cap::PASS_ON_SPAWN) != 0
+    {
         return Err(Errno::Eperm);
     }
     processes.slot_mut(peer).capabilities.install(Capability {
         object: source.object,
         rights,
+    })
+}
+
+/// Resolve an explicitly passable endpoint into the capability a child receives.
+pub fn endpoint_for_spawn(
+    processes: &Processes,
+    ipc: &Ipc,
+    parent: ProcSlot,
+    handle: Handle,
+) -> Result<Capability, Errno> {
+    let source = processes
+        .slot(parent)
+        .capabilities
+        .get(handle, cap::SEND | cap::PASS_ON_SPAWN)?;
+    ipc.resolve(source.object)?;
+    Ok(Capability {
+        object: source.object,
+        rights: cap::SEND,
     })
 }
 
@@ -1186,6 +1207,55 @@ mod tests {
         for _ in 1..ipc::MAX_ENDPOINTS {
             create_endpoint(&mut h.ipc, &mut h.processes, p0).unwrap();
         }
+    }
+
+    #[test]
+    fn spawn_can_pass_only_an_explicit_live_send_endpoint() {
+        let mut h = harness();
+        let owner = ProcSlot(0);
+        let parent = ProcSlot(1);
+        let child = ProcSlot(2);
+        let endpoint = create_endpoint(&mut h.ipc, &mut h.processes, owner).unwrap();
+        let delegated = grant(&mut h.processes, owner, endpoint, parent, cap::SEND).unwrap();
+        assert_eq!(
+            endpoint_for_spawn(&h.processes, &h.ipc, parent, delegated).err(),
+            Some(Errno::Eperm)
+        );
+        let object = h
+            .processes
+            .slot(owner)
+            .capabilities
+            .get(endpoint, cap::CONTROL)
+            .unwrap()
+            .object;
+        let passable = h
+            .processes
+            .slot_mut(parent)
+            .capabilities
+            .install(Capability {
+                object,
+                rights: cap::SEND | cap::PASS_ON_SPAWN,
+            })
+            .unwrap();
+        let cap = endpoint_for_spawn(&h.processes, &h.ipc, parent, passable).unwrap();
+        assert_eq!(cap.object, object);
+        assert_eq!(cap.rights, cap::SEND);
+        let inherited = h
+            .processes
+            .slot_mut(child)
+            .capabilities
+            .install(cap)
+            .unwrap();
+        assert_eq!(
+            endpoint_for_spawn(&h.processes, &h.ipc, child, inherited).err(),
+            Some(Errno::Eperm)
+        );
+        let index = h.ipc.resolve(object).unwrap();
+        h.ipc.close(index);
+        assert_eq!(
+            endpoint_for_spawn(&h.processes, &h.ipc, parent, passable).err(),
+            Some(Errno::Epipe)
+        );
     }
 
     #[test]

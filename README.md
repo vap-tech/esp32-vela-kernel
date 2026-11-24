@@ -492,7 +492,21 @@ directories up to 64 KiB. It rejects volumes needing journal recovery,
 unsupported feature flags, symlinks and indexed directories. Vela does not
 write ext4 or support card hot swapping. File IPC reads at a byte offset, with
 up to 95 bytes per reply. The kernel copies the ELF into a private snapshot
-before validating it and grants the new process no storage capabilities.
+before validating it. The shell may pass a bounded argument and an explicitly
+passable IPC endpoint. The child receives a local handle with send rights
+only, with no access to raw SD sectors.
+
+Build external utilities with `./scripts/build-tools.sh`. Copy the two ELF
+files from `target/sd/bin/` into the card's `bin/` directory, then eject:
+
+```console
+run /sd/bin/uptime.elf
+run /sd/bin/cat.elf /sd/hello.txt
+```
+
+`uptime.elf` uses kernel statistics. The first `cat.elf` takes one `/sd/`
+path and reads it from the ext4 service over IPC. The built-in shell
+commands remain available, and `run` starts a task without waiting for it.
 
 ### USB-C SD export
 

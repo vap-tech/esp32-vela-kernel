@@ -46,3 +46,15 @@ name = "vela-ext4fs"
 path = "src/bin/ext4fs.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-uptime"
+path = "tools/uptime.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vela-cat"
+path = "tools/cat.rs"
+test = false
+bench = false

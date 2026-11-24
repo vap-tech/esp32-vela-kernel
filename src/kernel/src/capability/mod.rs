@@ -14,6 +14,9 @@ pub const GRANT: u16 = 32;
 pub const WAIT: u16 = 64;
 pub const ACK: u16 = 128;
 pub const CONTROL: u16 = 256;
+/// Boot policy may allow a send endpoint to be installed in a new child.
+/// The child receives SEND alone and cannot pass it to another process.
+pub const PASS_ON_SPAWN: u16 = 512;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
     ProcessSpawn,

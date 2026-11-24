@@ -167,14 +167,22 @@ extern "C" fn rust_main() -> ! {
     .unwrap();
     let fs_request =
         create_endpoint(&mut runtime.ipc, &mut runtime.processes, ext4fs.slot).unwrap();
-    let shell_fs = grant(
-        &mut runtime.processes,
-        ext4fs.slot,
-        fs_request,
-        shell.slot,
-        cap::SEND,
-    )
-    .unwrap();
+    let fs_object = runtime
+        .processes
+        .slot(ext4fs.slot)
+        .capabilities
+        .get(fs_request, cap::CONTROL)
+        .unwrap()
+        .object;
+    let shell_fs = runtime
+        .processes
+        .slot_mut(shell.slot)
+        .capabilities
+        .install(Capability {
+            object: fs_object,
+            rights: cap::SEND | cap::PASS_ON_SPAWN,
+        })
+        .unwrap();
     let storage = runtime
         .processes
         .slot_mut(ext4fs.slot)

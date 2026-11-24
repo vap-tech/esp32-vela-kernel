@@ -2,7 +2,14 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, arena::Arena, sys, term::EscapeFilter, word_le};
+use vela_user::{
+    Buffer, TextBuf,
+    arena::Arena,
+    file::{cat_ext4, ext4_read},
+    sys,
+    term::EscapeFilter,
+    word_le,
+};
 
 vela_user::entry!(main);
 
@@ -57,46 +64,20 @@ fn read_file(path: &[u8], request_handle: u32) {
     sys::write(out.as_slice());
 }
 
-fn ext4_read(handle: u32, path: &[u8], offset: u32, response: &mut Buffer) -> Result<usize, ()> {
-    let mut request = Buffer::new();
-    request.push(0);
-    request.append(&offset.to_le_bytes());
-    request.append(path);
-    let count = sys::call6(
-        abi::IPC_CALL,
-        handle,
-        request.ptr() as u32,
-        request.len() as u32,
-        response.mut_ptr() as u32,
-        abi::IPC_BYTES as u32,
-        500,
-    )
-    .0 as usize;
-    if !(1..=abi::IPC_BYTES).contains(&count) {
-        sys::write(FAILED);
-        return Err(());
+fn run_ext4(caps: Caps, command: &[u8]) {
+    let mut words = command.splitn(2, |b| *b == b' ');
+    let path = words.next().unwrap_or_default();
+    let argument = words.next().unwrap_or_default().trim_ascii();
+    if argument.len() > abi::SPAWN_ARG_MAX {
+        sys::write(b"run: argument too long\n");
+        return;
     }
-    response.set_len(count);
-    if response.get(0) != 0 {
-        sys::write(&response.as_slice()[1..]);
-        return Err(());
-    }
-    Ok(count - 1)
-}
-
-fn cat_ext4(handle: u32, path: &[u8]) {
-    let mut response = Buffer::new();
-    let mut offset = 0;
-    while let Ok(count) = ext4_read(handle, path, offset, &mut response) {
-        if count == 0 {
-            break;
-        }
-        sys::write(&response.as_slice()[1..]);
-        offset += count as u32;
-    }
-}
-
-fn run_ext4(caps: Caps, path: &[u8]) {
+    // The first cat variant is the only utility that gets a file endpoint.
+    let file_handle = if path == b"/bin/cat.elf" {
+        caps.ext4
+    } else {
+        0
+    };
     let Ok(mut arena) = Arena::new_psram(abi::SPAWN_IMAGE_MAX) else {
         sys::write(b"run: no space for ELF\n");
         return;
@@ -105,12 +86,14 @@ fn run_ext4(caps: Caps, path: &[u8]) {
     let mut len = 0;
     while let Ok(count) = ext4_read(caps.ext4, path, len as u32, &mut response) {
         if count == 0 {
-            let pid = sys::call(
+            let (pid, _) = sys::call6(
                 abi::SPAWN_IMAGE,
                 caps.spawn,
                 arena.base() as u32,
                 len as u32,
-                0,
+                argument.as_ptr() as u32,
+                argument.len() as u32,
+                file_handle,
             );
             if (pid as i32) < 0 {
                 sys::write(b"run: ELF rejected or process slots exhausted\n");

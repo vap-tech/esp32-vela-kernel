@@ -657,9 +657,31 @@ impl Runtime {
         priority: u8,
         priority_ceiling: u8,
     ) -> Result<Tid, Errno> {
+        self.start_loaded_at(
+            loaded,
+            loaded.stack.base + loaded.stack.size,
+            args,
+            priority,
+            priority_ceiling,
+        )
+    }
+
+    pub fn start_loaded_at(
+        &mut self,
+        loaded: LoadedElf,
+        stack_pointer: usize,
+        args: [u32; 6],
+        priority: u8,
+        priority_ceiling: u8,
+    ) -> Result<Tid, Errno> {
+        if !stack_pointer.is_multiple_of(16)
+            || !loaded.stack.contains(stack_pointer, 0)
+            || stack_pointer == loaded.stack.base
+        {
+            return Err(Errno::Einval);
+        }
         self.processes.slot_mut(loaded.slot).priority_ceiling = priority_ceiling;
-        let frame =
-            arch::TrapFrame::user_args(loaded.entry, loaded.stack.base + loaded.stack.size, args);
+        let frame = arch::TrapFrame::user_args(loaded.entry, stack_pointer, args);
         let tid = self.scheduler.create_thread(
             loaded.slot,
             frame,

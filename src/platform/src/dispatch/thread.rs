@@ -30,12 +30,88 @@ impl Runtime {
         if len == 0 || len > syscall::SPAWN_IMAGE_MAX {
             return Err(Errno::Emsgsize);
         }
-        let end = ptr.checked_add(len).ok_or(Errno::Efault)?;
+        let arg_ptr = args.a3 as usize;
+        let arg_len = args.a4 as usize;
+        if arg_len > syscall::SPAWN_ARG_MAX {
+            return Err(Errno::Emsgsize);
+        }
+        let inherited = if args.a5 == 0 {
+            None
+        } else {
+            Some(lifecycle::endpoint_for_spawn(
+                &self.processes,
+                &self.ipc,
+                current,
+                Handle(args.a5),
+            )?)
+        };
         if self.scheduler.tasks.iter().enumerate().any(|(i, task)| {
             ThreadSlot(i) != self.scheduler.current
                 && task.process == current
                 && task.state == State::Running
-        }) || self.processes.slots.iter().enumerate().any(|(i, process)| {
+        }) {
+            return Err(Errno::Ebusy);
+        }
+        self.check_private_spawn_input(current, ptr, len)?;
+        self.check_private_spawn_input(current, arg_ptr, arg_len)?;
+
+        // No concurrently running writer can access either source while the
+        // lock is held. Snapshot both before allocating the child.
+        let mut snapshot = [0; syscall::SPAWN_IMAGE_MAX];
+        copy_from_user(self.memory(), ptr, &mut snapshot[..len])?;
+        let mut argument = [0; syscall::SPAWN_ARG_MAX];
+        if arg_len != 0 {
+            copy_from_user(self.memory(), arg_ptr, &mut argument[..arg_len])?;
+        }
+        let (loaded, _, _) = self.load_elf_in(&snapshot[..len], MemoryClass::Psram, false)?;
+        let result = (|| {
+            let handle = if let Some(capability) = inherited {
+                self.processes
+                    .slot_mut(loaded.slot)
+                    .capabilities
+                    .install(capability)?
+                    .raw()
+            } else {
+                0
+            };
+            let top = loaded.stack.base + loaded.stack.size;
+            let sp = (top - arg_len) & !15;
+            let child_arg = if arg_len == 0 { 0 } else { sp as u32 };
+            if arg_len != 0 {
+                // SAFETY: the child hasn't started. Reserve the argument above
+                // its initial SP so user stack growth cannot overwrite it.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(argument.as_ptr(), sp as *mut u8, arg_len)
+                };
+            }
+            self.start_loaded_at(
+                loaded,
+                sp,
+                [handle, child_arg, arg_len as u32, 0, 0, 0],
+                1,
+                1,
+            )?;
+            Ok(loaded.pid.raw())
+        })();
+        if result.is_err() {
+            self.abort_loaded(loaded);
+        } else {
+            self.notify_remote_hart(false);
+        }
+        result
+    }
+
+    fn check_private_spawn_input(
+        &self,
+        current: ProcSlot,
+        ptr: usize,
+        len: usize,
+    ) -> Result<(), Errno> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = ptr.checked_add(len).ok_or(Errno::Efault)?;
+        if self.processes.slots.iter().enumerate().any(|(i, process)| {
             ProcSlot(i) != current
                 && process.memory.maps.iter().any(|map| {
                     map.permissions & vela_kernel::process::WRITE != 0
@@ -46,12 +122,7 @@ impl Runtime {
         }) {
             return Err(Errno::Ebusy);
         }
-        // No concurrently running writer can access the source while KERNEL_LOCK
-        // is held. Validation and relocation use this one kernel-owned snapshot.
-        let mut snapshot = [0; syscall::SPAWN_IMAGE_MAX];
-        copy_from_user(self.memory(), ptr, &mut snapshot[..len])?;
-        self.spawn_elf_in(&snapshot[..len], MemoryClass::Psram, false)
-            .map(Pid::raw)
+        Ok(())
     }
 
     pub(super) fn sys_spawn_hello(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {

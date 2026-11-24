@@ -114,6 +114,7 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         "../user/src/i2c.rs",
         "../user/src/kbd.rs",
         "../user/src/fbcon.rs",
+        "../user/src/file.rs",
         "../user/src/ext4.rs",
         "../user/src/bin/ext4fs.rs",
         "../user/src/font.rs",
@@ -143,7 +144,18 @@ fn build_user_services(dir: &std::path::Path, out: &std::path::Path) {
         .args(["build", "--manifest-path"])
         .arg(&manifest)
         .args([
-            "--bins",
+            "--bin",
+            "vela-procfs",
+            "--bin",
+            "vela-ext4fs",
+            "--bin",
+            "vela-shell",
+            "--bin",
+            "vela-console",
+            "--bin",
+            "vela-kbd",
+            "--bin",
+            "vela-fbcon",
             "--release",
             "--locked",
             "--target",
