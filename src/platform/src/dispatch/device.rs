@@ -117,12 +117,13 @@ impl Runtime {
     }
 
     pub(super) fn sys_sd_partition(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
+        let is_write = args.a2 != 0 && args.a3 == syscall::SD_PARTITION_WRITE;
         lifecycle::require_authority(
             &self.processes,
             current,
             Handle(args.a0),
             Authority::SdSystemPartition,
-            cap::READ,
+            if is_write { cap::WRITE } else { cap::READ },
         )?;
         if unsafe { soc::sdcard::exported() } {
             return Err(Errno::Ebusy);
@@ -131,6 +132,9 @@ impl Runtime {
             return Ok(self.sd_epoch);
         }
         if args.a2 == 0 {
+            if args.a3 != 0 {
+                return Err(Errno::Einval);
+            }
             self.sd_partition = None;
             // Cold SD initialization can outlast the scanout descriptor ring
             // while KERNEL_LOCK masks timer interrupts.
@@ -141,7 +145,23 @@ impl Runtime {
         }
         let (start, count) = self.sd_partition.ok_or(Errno::Einval)?;
         let mut sector = [0; 512];
-        if args.a1 >= count || !self.writable(args.a2 as usize, sector.len()) {
+        if args.a1 >= count {
+            return Err(Errno::Einval);
+        }
+        if is_write {
+            copy_from_user(self.memory(), args.a2 as usize, &mut sector)?;
+            unsafe {
+                soc::sdcard::write_sector_with(start + args.a1, &sector, &mut || {
+                    self.display.tick()
+                })
+            }
+            .map_err(|_| {
+                self.sd_partition = None;
+                Errno::Eio
+            })?;
+            return Ok(0);
+        }
+        if args.a3 != 0 || !self.writable(args.a2 as usize, sector.len()) {
             return Err(Errno::Einval);
         }
         // Serialized with legacy SD accesses by KERNEL_LOCK. DMA writes only

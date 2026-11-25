@@ -9,12 +9,13 @@ pub const ENTRIES: &[&[u8]] = &[
     b"interrupts",
     b"cpuinfo",
     b"tasks",
+    b"mounts",
     b"streams",
     b"sdcard",
     b"i2c",
 ];
 
-pub fn read(rel: &[u8], out: &mut TextBuf<1024>) -> u8 {
+pub fn read(rel: &[u8], out: &mut TextBuf<2048>) -> u8 {
     match rel {
         b"uptime" => render_summary(false, out),
         b"loadavg" => render_summary(true, out),
@@ -58,7 +59,7 @@ fn ticks_16m_to_ns(ticks_16m: u32) -> (u32, u32) {
 }
 
 #[inline(never)]
-fn render_summary(loadavg: bool, out: &mut TextBuf<1024>) -> u8 {
+fn render_summary(loadavg: bool, out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_BYTES];
     if sys::call(
         abi::STATS,
@@ -96,7 +97,7 @@ fn render_summary(loadavg: bool, out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_interrupts(out: &mut TextBuf<1024>) -> u8 {
+fn render_interrupts(out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_IRQ_FULL_BYTES];
     if sys::call(
         abi::STATS,
@@ -131,7 +132,7 @@ fn render_interrupts(out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_cpuinfo(out: &mut TextBuf<1024>) -> u8 {
+fn render_cpuinfo(out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_CPU_SMP_BYTES];
     if sys::call(
         abi::STATS,
@@ -234,7 +235,7 @@ fn render_cpuinfo(out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_tasks(out: &mut TextBuf<1024>) -> u8 {
+fn render_tasks(out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_TASKS_BYTES];
     if sys::call(
         abi::STATS,
@@ -249,7 +250,7 @@ fn render_tasks(out: &mut TextBuf<1024>) -> u8 {
     }
     out.append(b"tid pid state prio hart/aff mig ticks user_cycles preempt stack\n");
     let stride = abi::STATS_TASK_WORDS * 4;
-    for slot in 0..snap.len() / stride {
+    for slot in 0..abi::STATS_TASKS_SLOTS {
         let base = slot * stride;
         let tid = word_le(&snap, base);
         if tid == 0 {
@@ -308,7 +309,7 @@ fn render_tasks(out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_streams(out: &mut TextBuf<1024>) -> u8 {
+fn render_streams(out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_STREAMS_BYTES];
     if sys::call(
         abi::STATS,
@@ -363,7 +364,7 @@ fn render_streams(out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_sdcard(out: &mut TextBuf<1024>) -> u8 {
+fn render_sdcard(out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_SDCARD_EXT_BYTES];
     if sys::call(
         abi::STATS,

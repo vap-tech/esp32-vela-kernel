@@ -23,7 +23,7 @@ impl DevCaps {
     }
 }
 
-pub fn read(rel: &[u8], caps: DevCaps, out: &mut TextBuf<1024>) -> u8 {
+pub fn read(rel: &[u8], caps: DevCaps, out: &mut TextBuf<2048>) -> u8 {
     match rel {
         b"random" => render_random(b"/dev/random", out),
         b"urandom" => render_random(b"/dev/urandom", out),
@@ -56,7 +56,7 @@ pub fn read(rel: &[u8], caps: DevCaps, out: &mut TextBuf<1024>) -> u8 {
     }
 }
 
-pub fn write(rel: &[u8], data: &[u8], caps: DevCaps, out: &mut TextBuf<1024>) -> u8 {
+pub fn write(rel: &[u8], data: &[u8], caps: DevCaps, out: &mut TextBuf<2048>) -> u8 {
     match rel {
         b"kbdled" => kbd_led_op(Some(data), caps.i2c_ext1, out),
         b"i2c-0" | b"i2c-1" | b"random" | b"urandom" | b"zero" => {
@@ -71,7 +71,7 @@ pub fn write(rel: &[u8], data: &[u8], caps: DevCaps, out: &mut TextBuf<1024>) ->
 }
 
 #[inline(never)]
-fn render_random(path: &[u8], out: &mut TextBuf<1024>) -> u8 {
+fn render_random(path: &[u8], out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_RANDOM_BYTES];
     if sys::call(
         abi::STATS,
@@ -107,7 +107,7 @@ fn render_random(path: &[u8], out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn kbd_led_op(args: Option<&[u8]>, ext1: u32, out: &mut TextBuf<1024>) -> u8 {
+fn kbd_led_op(args: Option<&[u8]>, ext1: u32, out: &mut TextBuf<2048>) -> u8 {
     let mut bus = kbd::SysBus(ext1);
     if let Some(args) = args {
         let trimmed = args.trim_ascii();

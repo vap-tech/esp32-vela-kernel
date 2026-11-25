@@ -1,7 +1,7 @@
 use vela_kernel::{
     capability::{self as cap, Authority, Capability, Object},
     errno::Errno,
-    id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
+    id::{Handle, ProcSlot, ThreadSlot, Tid},
     lifecycle,
     memory::MemoryClass,
     task::{Context, Region, State, Wait},
@@ -108,32 +108,23 @@ impl Runtime {
             }
         }
 
+        // Verify the image slice is wholly mapped readable in the caller's address
+        // space. Because KERNEL_LOCK is held with MIE=0, no sibling thread is running,
+        // and `check_private_spawn_input` rejected any foreign writable alias, the
+        // image cannot mutate while `load_elf_in` parses and copies it into a newly
+        // allocated child PSRAM region.
+        if !self.readable(ptr, len) {
+            return Err(Errno::Efault);
+        }
         let mut argument = [0; syscall::SPAWN_ARG_MAX];
         if arg_len != 0 {
             copy_from_user(self.memory(), arg_ptr, &mut argument[..arg_len])?;
         }
-        if !self.readable(ptr, len) {
-            return Err(Errno::Efault);
-        }
-        self.ensure_psram_pool()?;
-        let scratch = self
-            .allocator
-            .allocate_in(MemoryClass::Psram, Pid::KERNEL, len)?;
-        let mapped = self.display.set_psram_region_mapped(scratch, true);
-        let image = if mapped {
-            // SAFETY: scratch is freshly mapped, exclusively kernel-owned, and
-            // disjoint from the checked source. Initialize it before borrowing.
-            unsafe {
-                core::ptr::copy_nonoverlapping(ptr as *const u8, scratch.base as *mut u8, len);
-                let bytes = core::slice::from_raw_parts(scratch.base as *const u8, len);
-                self.load_elf_in(bytes, MemoryClass::Psram, false)
-            }
-        } else {
-            Err(Errno::Eio)
-        };
-        self.display.set_psram_region_mapped(scratch, false);
-        self.allocator.free(Pid::KERNEL, scratch)?;
-        let (loaded, _, _) = image?;
+        // SAFETY: `ptr..ptr+len` is a single contiguous readable mapping in SRAM or
+        // mapped PSRAM with no concurrent writer; `load_elf_in` allocates disjoint
+        // memory for the child and does not retain the slice.
+        let image_bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        let (loaded, _, _) = self.load_elf_in(image_bytes, MemoryClass::Psram, false)?;
         let result = (|| {
             let mut handles = [0u32; syscall::SPAWN_CAPS_MAX];
             for (dst, cap_opt) in handles.iter_mut().zip(inherited) {
@@ -144,6 +135,11 @@ impl Runtime {
                         .capabilities
                         .install(capability)?
                         .raw();
+                    if capability.rights & cap::SEND != 0
+                        && let Ok(ep) = self.ipc.resolve(capability.object)
+                    {
+                        self.ipc.mark_sender_attached(ep);
+                    }
                 }
             }
             let top = loaded.stack.base + loaded.stack.size;
@@ -496,10 +492,6 @@ impl Runtime {
                 copy_to_user(self.memory(), ptr, &flags.to_le_bytes())
             }
             syscall::STATS_TASKS => {
-                const _: () = assert!(
-                    vela_kernel::sched::TASKS * syscall::STATS_TASK_WORDS * 4
-                        == syscall::STATS_TASKS_BYTES
-                );
                 if len != 8 * syscall::STATS_TASK_WORDS * 4 && len != syscall::STATS_TASKS_BYTES {
                     return Err(Errno::Einval);
                 }

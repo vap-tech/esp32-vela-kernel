@@ -6,12 +6,12 @@ cargo_dir="$PWD/target/user-tools"
 linker="$PWD/src/user/link.x"
 export CARGO_ENCODED_RUSTFLAGS=$'-Crelocation-model=pie\x1f-Cstrip=symbols\x1f-Clink-arg=-pie\x1f-Clink-arg=-zmax-page-size=64\x1f-Clink-arg=-T'"$linker"
 cargo build --locked --release -p vela-user --target "$target" --target-dir "$cargo_dir" \
-    --bin vela-uptime --bin vela-cat --bin vela-ls --bin vela-sdexport --bin vela-shell
+    --bin vela-uptime --bin vela-cat --bin vela-ls --bin vela-sdexport --bin vela-shell --bin vela-ramdev --bin vela-wc
 mkdir -p target/sd/bin
-for name in uptime cat ls sdexport shell; do
+for name in uptime cat ls sdexport shell ramdev wc; do
     image="$cargo_dir/$target/release/vela-$name"
-    if (( $(stat -c %s "$image") > 65536 )); then
-        echo "Tool $name exceeds the 64 KiB SPAWN_IMAGE limit" >&2
+    if (( $(stat -c %s "$image") > 1048576 )); then
+        echo "Tool $name exceeds the 1 MiB SPAWN_IMAGE limit" >&2
         exit 1
     fi
     install -m 0644 "$image" "target/sd/bin/$name.elf"

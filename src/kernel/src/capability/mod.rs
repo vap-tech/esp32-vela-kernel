@@ -17,6 +17,8 @@ pub const CONTROL: u16 = 256;
 /// Boot policy may allow a send endpoint to be installed in a new child.
 /// The child receives SEND alone and cannot pass it to another process.
 pub const PASS_ON_SPAWN: u16 = 512;
+/// Unforgeable administrative privilege on a service endpoint (e.g. `sysd` mount/unmount).
+pub const ADMIN: u16 = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
     ProcessSpawn,
@@ -38,7 +40,7 @@ pub enum Object {
     DmaChannel { index: usize, generation: u32 },
     Authority(Authority),
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capability {
     pub object: Object,
     pub rights: u16,

@@ -142,8 +142,12 @@ extern "C" fn rust_main() -> ! {
         .expect("init ELF");
     let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
     let (kbd_proc, _, _) = runtime.load_elf(KBD_ELF, false).expect("kbd ELF");
-    let (ext4fs, _, _) = runtime.load_elf(EXT4FS_ELF, false).expect("ext4fs ELF");
-    let (fbcon_proc, _, _) = runtime.load_elf(FBCON_ELF, false).expect("fbcon ELF");
+    let (ext4fs, _, _) = runtime
+        .load_elf_in(EXT4FS_ELF, MemoryClass::Psram, false)
+        .expect("ext4fs ELF");
+    let (fbcon_proc, _, _) = runtime
+        .load_elf_in(FBCON_ELF, MemoryClass::Psram, false)
+        .expect("fbcon ELF");
 
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let vfs_request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, sysd.slot).unwrap();
@@ -160,7 +164,7 @@ extern "C" fn rust_main() -> ! {
         .capabilities
         .install(Capability {
             object: vfs_object,
-            rights: cap::SEND | cap::PASS_ON_SPAWN,
+            rights: cap::SEND | cap::ADMIN | cap::PASS_ON_SPAWN,
         })
         .unwrap();
 
@@ -201,7 +205,7 @@ extern "C" fn rust_main() -> ! {
         .capabilities
         .install(Capability {
             object: Object::Authority(Authority::SdSystemPartition),
-            rights: cap::READ,
+            rights: cap::READ | cap::WRITE,
         })
         .unwrap();
 

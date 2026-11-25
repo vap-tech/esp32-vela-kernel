@@ -5,14 +5,16 @@ use vela_abi::syscall as abi;
 use vela_user::{
     Buffer, TextBuf,
     file::{DIR_HEADER, fs_read_dir},
-    sys,
+    io, sys,
 };
 
 vela_user::entry!(main);
 
-fn main(fs: u32, arg: u32, len: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
+fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
+    io::init(stdin, stdout);
     if fs == 0 || len as usize > abi::SPAWN_ARG_MAX || (len != 0 && arg == 0) {
-        sys::write(b"usage: ls [</directory>]\n");
+        io::ewrite(b"usage: ls [</directory>]\n");
+        io::close_stdout();
         sys::process_exit();
     }
     let path = if len == 0 {
@@ -24,8 +26,9 @@ fn main(fs: u32, arg: u32, len: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     if path.starts_with(b"/") {
         list(fs, path);
     } else {
-        sys::write(b"usage: ls [</directory>]\n");
+        io::ewrite(b"usage: ls [</directory>]\n");
     }
+    io::close_stdout();
     sys::process_exit();
 }
 
@@ -51,7 +54,9 @@ fn list(fs: u32, path: &[u8]) {
         if end_of_name {
             line.push(b'\n');
         }
-        sys::write(line.as_slice());
+        if io::write(line.as_slice()).is_err() {
+            break;
+        }
         cursor = next;
     }
 }

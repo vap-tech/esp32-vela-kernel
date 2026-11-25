@@ -8,7 +8,11 @@
 //! (ESP32-C3/C5/C6) can point `exec` directly at a flash/ROM image.
 
 use vela_abi::syscall::{self as abi, SpawnCap, SpawnCaps};
-use vela_user::{Buffer, arena::Arena, boot_cfg, file::fs_read_raw, sys};
+use vela_user::{
+    Buffer, boot_cfg,
+    file::{fs_load_arena, fs_read_raw},
+    sys,
+};
 
 vela_user::entry!(main);
 
@@ -30,52 +34,22 @@ fn load_and_run(caps: Caps, path: &[u8], arg: &[u8]) -> Result<(), ()> {
     if arg.len() > abi::SPAWN_ARG_MAX {
         return Err(());
     }
-    let Ok(mut arena) =
-        Arena::new_psram(abi::SPAWN_IMAGE_MAX).or_else(|_| Arena::new(abi::SPAWN_IMAGE_MAX))
+    let mut response = Buffer::new();
+    let Ok((mut arena, len)) = fs_load_arena(caps.vfs, path, abi::SPAWN_IMAGE_MAX, &mut response)
     else {
         return Err(());
     };
-    let mut response = Buffer::new();
-    let mut len = 0usize;
-    let mut loaded = false;
-    loop {
-        match fs_read_raw(caps.vfs, path, len as u32, &mut response) {
-            Ok(0) => {
-                loaded = len > 0;
-                break;
-            }
-            Ok(count) => {
-                if len + count > abi::SPAWN_IMAGE_MAX {
-                    break;
-                }
-                // SAFETY: arena is privately allocated and len + count fits.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        response.as_slice()[1..].as_ptr(),
-                        (arena.base() + len) as *mut u8,
-                        count,
-                    );
-                }
-                len += count;
-            }
-            Err(_) => break,
-        }
-    }
-    if !loaded {
-        let _ = arena.release();
-        return Err(());
-    }
 
     let spawn_caps = SpawnCaps {
         count: 4,
         caps: [
             SpawnCap {
                 handle: caps.vfs,
-                rights: abi::CAP_SEND | abi::CAP_PASS_ON_SPAWN,
+                rights: abi::CAP_SEND | abi::CAP_ADMIN | abi::CAP_PASS_ON_SPAWN,
             },
             SpawnCap {
                 handle: caps.input,
-                rights: abi::CAP_RECEIVE,
+                rights: abi::CAP_RECEIVE | abi::CAP_PASS_ON_SPAWN,
             },
             SpawnCap {
                 handle: caps.spawn,
@@ -144,7 +118,7 @@ fn main(vfs: u32, input: u32, spawn: u32, display: u32, _a4: u32, _a5: u32) -> !
                 sys::write(b" -- prepare media with /bin utilities (shell.elf, ls.elf, cat.elf)\n");
                 alerted = true;
             }
-            sys::sleep_ticks(200);
+            sys::sleep_ticks(150);
         }
     }
 }

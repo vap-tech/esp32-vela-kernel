@@ -7,7 +7,7 @@
 //! host-tested without SoC or raw user pointer dependencies.
 
 use crate::{
-    call::CallTable,
+    call::{BulkWindow, CallExtra, CallTable},
     capability::{self as cap, Authority, Capability, Object},
     dma::DmaTable,
     errno::Errno,
@@ -49,10 +49,21 @@ pub fn create_endpoint(
     processes: &mut Processes,
     owner: ProcSlot,
 ) -> Result<Handle, Errno> {
-    let object = ipc.create(owner)?;
+    create_endpoint_with_flags(ipc, processes, owner, false)
+}
+
+/// Create an IPC endpoint (optionally a stream/pipe endpoint with automatic EOF
+/// once all delegated `SEND` handles are closed) and install its root capability.
+pub fn create_endpoint_with_flags(
+    ipc: &mut Ipc,
+    processes: &mut Processes,
+    owner: ProcSlot,
+    stream: bool,
+) -> Result<Handle, Errno> {
+    let object = ipc.create_with_flags(owner, stream)?;
     match processes.slot_mut(owner).capabilities.install(Capability {
         object,
-        rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL,
+        rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL | cap::PASS_ON_SPAWN,
     }) {
         Ok(handle) => Ok(handle),
         Err(e) => {
@@ -61,6 +72,33 @@ pub fn create_endpoint(
             Err(e)
         }
     }
+}
+
+/// If `ep` is a stream endpoint that previously had at least one delegated sender
+/// and no non-owner process still holds `SEND` on it, mark EOF and wake receivers.
+fn maybe_mark_stream_eof<C: Context>(
+    processes: &Processes,
+    ipc: &mut Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    ep: usize,
+    deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
+) -> Option<Tid> {
+    if !ipc.has_writer(ep) {
+        return None;
+    }
+    let owner = ipc.owner(ep)?;
+    let obj = ipc.object(ep);
+    let has_sender = processes.slots.iter().enumerate().any(|(slot_idx, proc)| {
+        proc.state == Lifecycle::Alive
+            && ProcSlot(slot_idx) != owner
+            && proc.capabilities.find(obj, cap::SEND).is_some()
+    });
+    if has_sender {
+        return None;
+    }
+    ipc.mark_eof(ep);
+    complete_receivers(processes, ipc, calls, scheduler, ep, false, deliver)
 }
 
 /// Bind hardware IRQ/event slot `index` to `owner` and install its root capability,
@@ -210,7 +248,7 @@ pub fn grant(
     let source = processes.slot(owner).capabilities.get(handle, cap::GRANT)?;
     if rights == 0
         || rights & !source.rights != 0
-        || rights & (cap::CONTROL | cap::GRANT | cap::PASS_ON_SPAWN) != 0
+        || rights & (cap::CONTROL | cap::GRANT | cap::PASS_ON_SPAWN | cap::ADMIN) != 0
     {
         return Err(Errno::Eperm);
     }
@@ -474,7 +512,26 @@ pub fn find_rpc_server<C: Copy>(
     client: ThreadSlot,
     handle: Handle,
 ) -> Result<(usize, ThreadSlot), Errno> {
-    let ep = resolve_endpoint(processes, ipc, current, handle, cap::SEND)?;
+    let (ep, server, _) =
+        find_rpc_server_with_rights(processes, ipc, scheduler, current, client, handle)?;
+    Ok((ep, server))
+}
+
+/// Like [`find_rpc_server`], also returning the full right bitmask on the
+/// caller's endpoint capability (e.g. `cap::ADMIN` for privileged services).
+pub fn find_rpc_server_with_rights<C: Copy>(
+    processes: &Processes,
+    ipc: &Ipc,
+    scheduler: &Scheduler<C>,
+    current: ProcSlot,
+    client: ThreadSlot,
+    handle: Handle,
+) -> Result<(usize, ThreadSlot, u16), Errno> {
+    let capability = processes
+        .slot(current)
+        .capabilities
+        .get(handle, cap::SEND)?;
+    let ep = ipc.resolve(capability.object)?;
     let server_process = ipc.owner(ep).ok_or(Errno::Epipe)?;
     // No self-process RPC: avoid an unbounded dependency on caller-owned locks.
     if server_process == current {
@@ -499,7 +556,57 @@ pub fn find_rpc_server<C: Copy>(
             break;
         }
     }
-    Ok((ep, server))
+    Ok((ep, server, capability.rights))
+}
+
+/// Validate a capability that a caller wants to attach to an `IPC_CALL_CAP`.
+/// Enforces one-level delegation (`GRANT` required, never delegates `CONTROL`,
+/// `GRANT`, `PASS_ON_SPAWN`, or `ADMIN`) and rejects memory objects (which use
+/// `IPC_CALL_BULK` or `MEM_GRANT`).
+pub fn prepare_ipc_cap(
+    processes: &Processes,
+    ipc: &Ipc,
+    owner: ProcSlot,
+    handle: Handle,
+    rights: u16,
+) -> Result<Capability, Errno> {
+    let source = processes.slot(owner).capabilities.get(handle, cap::GRANT)?;
+    if rights == 0
+        || rights & !source.rights != 0
+        || rights & (cap::CONTROL | cap::GRANT | cap::PASS_ON_SPAWN | cap::ADMIN) != 0
+    {
+        return Err(Errno::Eperm);
+    }
+    match source.object {
+        Object::Memory { .. } => return Err(Errno::Einval),
+        Object::Endpoint { .. } => {
+            ipc.resolve(source.object)?;
+        }
+        Object::Event { .. } | Object::DmaChannel { .. } | Object::Authority(_) => {}
+    }
+    Ok(Capability {
+        object: source.object,
+        rights,
+    })
+}
+
+/// Install the capability attached to an active RPC into the server's table,
+/// re-verifying liveness for endpoints before allocating a handle slot.
+pub fn accept_ipc_cap(
+    processes: &mut Processes,
+    ipc: &Ipc,
+    calls: &mut CallTable,
+    server_proc: ProcSlot,
+    server_thread: ThreadSlot,
+    token: u32,
+) -> Result<(Handle, u16), Errno> {
+    let (caller_rights, cap_opt) = calls.take_attached_cap(token, server_thread)?;
+    let cap = cap_opt.ok_or(Errno::Enoent)?;
+    if matches!(cap.object, Object::Endpoint { .. }) {
+        ipc.resolve(cap.object)?;
+    }
+    let handle = processes.slot_mut(server_proc).capabilities.install(cap)?;
+    Ok((handle, caller_rights))
 }
 
 /// Fast-path synchronous RPC handoff when `ep`'s queue is empty and a server
@@ -521,6 +628,97 @@ pub fn try_direct_ipc_call<C: Context>(
     reply_pointer: usize,
     reply_capacity: usize,
     deadline: Option<Ticks>,
+    copy_direct: impl FnMut(
+        &AddressSpace,
+        usize,
+        &AddressSpace,
+        usize,
+        usize,
+        usize,
+    ) -> Result<(), Errno>,
+) -> Option<Tid> {
+    try_direct_ipc_call_bulk(
+        processes,
+        ipc,
+        calls,
+        scheduler,
+        current,
+        ep,
+        generation,
+        token,
+        req_pointer,
+        req_length,
+        reply_pointer,
+        reply_capacity,
+        deadline,
+        None,
+        copy_direct,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_direct_ipc_call_bulk<C: Context>(
+    processes: &Processes,
+    ipc: &Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    ep: usize,
+    generation: u32,
+    token: u32,
+    req_pointer: usize,
+    req_length: usize,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    bulk: Option<BulkWindow>,
+    copy_direct: impl FnMut(
+        &AddressSpace,
+        usize,
+        &AddressSpace,
+        usize,
+        usize,
+        usize,
+    ) -> Result<(), Errno>,
+) -> Option<Tid> {
+    try_direct_ipc_call_extra(
+        processes,
+        ipc,
+        calls,
+        scheduler,
+        current,
+        ep,
+        generation,
+        token,
+        req_pointer,
+        req_length,
+        reply_pointer,
+        reply_capacity,
+        deadline,
+        CallExtra {
+            bulk,
+            ..CallExtra::EMPTY
+        },
+        copy_direct,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_direct_ipc_call_extra<C: Context>(
+    processes: &Processes,
+    ipc: &Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    ep: usize,
+    generation: u32,
+    token: u32,
+    req_pointer: usize,
+    req_length: usize,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    extra: CallExtra,
     mut copy_direct: impl FnMut(
         &AddressSpace,
         usize,
@@ -568,7 +766,7 @@ pub fn try_direct_ipc_call<C: Context>(
     )
     .ok()?;
     let client = scheduler.current;
-    calls.activate(client, generation, ep);
+    calls.activate_extra(client, generation, ep, extra);
     scheduler.block_opt(
         Wait::Reply {
             token,
@@ -603,10 +801,79 @@ pub fn commit_ipc_call<C: Context>(
     deadline: Option<Ticks>,
     deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
 ) -> Result<Option<Tid>, Errno> {
+    commit_ipc_call_bulk(
+        processes,
+        ipc,
+        calls,
+        scheduler,
+        ep,
+        server,
+        generation,
+        message,
+        reply_pointer,
+        reply_capacity,
+        deadline,
+        None,
+        deliver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn commit_ipc_call_bulk<C: Context>(
+    processes: &Processes,
+    ipc: &mut Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    ep: usize,
+    server: ThreadSlot,
+    generation: u32,
+    message: Message,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    bulk: Option<BulkWindow>,
+    deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
+) -> Result<Option<Tid>, Errno> {
+    commit_ipc_call_extra(
+        processes,
+        ipc,
+        calls,
+        scheduler,
+        ep,
+        server,
+        generation,
+        message,
+        reply_pointer,
+        reply_capacity,
+        deadline,
+        CallExtra {
+            bulk,
+            ..CallExtra::EMPTY
+        },
+        deliver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn commit_ipc_call_extra<C: Context>(
+    processes: &Processes,
+    ipc: &mut Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    ep: usize,
+    server: ThreadSlot,
+    generation: u32,
+    message: Message,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    extra: CallExtra,
+    deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
+) -> Result<Option<Tid>, Errno> {
     let client = scheduler.current;
     let token = message.reply_token;
     ipc.send(ep, message)?;
-    calls.activate(client, generation, ep);
+    calls.activate_extra(client, generation, ep, extra);
     scheduler.block_opt(
         Wait::Reply {
             token,
@@ -739,7 +1006,11 @@ pub fn close_endpoint<C: Context>(
             .capabilities
             .close(handle)
             .unwrap();
-        complete_receivers(processes, ipc, calls, scheduler, ep, false, deliver)
+        if capability.rights & cap::SEND != 0 && ipc.has_writer(ep) {
+            maybe_mark_stream_eof(processes, ipc, calls, scheduler, ep, deliver)
+        } else {
+            complete_receivers(processes, ipc, calls, scheduler, ep, false, deliver)
+        }
     };
     Ok(woken)
 }
@@ -1012,6 +1283,7 @@ pub fn terminate_current_thread<C: Context>(
     {
         unbound_events[index] = true;
     }
+    let mut stream_senders = [false; ipc::MAX_ENDPOINTS];
     for capability in processes
         .slot(process)
         .capabilities
@@ -1019,12 +1291,22 @@ pub fn terminate_current_thread<C: Context>(
         .into_iter()
         .flatten()
     {
-        if let Object::Memory {
-            owner: mem_owner, ..
-        } = capability.object
-            && mem_owner == owner
-        {
-            invalidate_object(processes, scheduler, capability.object, Some(process));
+        match capability.object {
+            Object::Memory {
+                owner: mem_owner, ..
+            } if mem_owner == owner => {
+                invalidate_object(processes, scheduler, capability.object, Some(process));
+            }
+            Object::Endpoint { .. }
+                if capability.rights & cap::SEND != 0 && capability.rights & cap::CONTROL == 0 =>
+            {
+                if let Ok(ep) = ipc.resolve(capability.object)
+                    && ipc.has_writer(ep)
+                {
+                    stream_senders[ep] = true;
+                }
+            }
+            _ => {}
         }
     }
     processes.slot_mut(process).capabilities.clear();
@@ -1037,6 +1319,11 @@ pub fn terminate_current_thread<C: Context>(
         if is_closed {
             let woken =
                 complete_receivers(processes, ipc, calls, scheduler, ep, true, &mut deliver);
+            if first_woken.is_none() {
+                first_woken = woken;
+            }
+        } else if stream_senders[ep] {
+            let woken = maybe_mark_stream_eof(processes, ipc, calls, scheduler, ep, &mut deliver);
             if first_woken.is_none() {
                 first_woken = woken;
             }
@@ -2472,5 +2759,189 @@ mod tests {
             set_thread_affinity(&mut h.scheduler, p1, Tid(1), 1),
             Err(Errno::Eperm)
         );
+    }
+
+    #[test]
+    fn ipc_cap_transfer_enforces_grant_liveness_and_admin_rights() {
+        let mut h = harness();
+        let p_sysd = ProcSlot(0);
+        let p_drv = ProcSlot(1);
+
+        let sysd_ep = create_endpoint(&mut h.ipc, &mut h.processes, p_sysd).unwrap();
+        let sysd_obj = h
+            .processes
+            .slot(p_sysd)
+            .capabilities
+            .get(sysd_ep, cap::CONTROL)
+            .unwrap()
+            .object;
+        let drv_vfs_admin = h
+            .processes
+            .slot_mut(p_drv)
+            .capabilities
+            .install(Capability {
+                object: sysd_obj,
+                rights: cap::SEND | cap::ADMIN,
+            })
+            .unwrap();
+        let drv_ep = create_endpoint(&mut h.ipc, &mut h.processes, p_drv).unwrap();
+
+        // Prepare attached SEND capability for drv_ep; CONTROL/GRANT/ADMIN are rejected.
+        assert_eq!(
+            prepare_ipc_cap(
+                &h.processes,
+                &h.ipc,
+                p_drv,
+                drv_ep,
+                cap::SEND | cap::CONTROL
+            ),
+            Err(Errno::Eperm)
+        );
+        let attached = prepare_ipc_cap(&h.processes, &h.ipc, p_drv, drv_ep, cap::SEND).unwrap();
+
+        let (ep_idx, srv, caller_rights) = find_rpc_server_with_rights(
+            &h.processes,
+            &h.ipc,
+            &h.scheduler,
+            p_drv,
+            ThreadSlot(1),
+            drv_vfs_admin,
+        )
+        .unwrap();
+        assert_eq!(srv, ThreadSlot(0));
+        assert_eq!(caller_rights, cap::SEND | cap::ADMIN);
+
+        let (gen1, tok) = h.calls.next_token(ThreadSlot(1)).unwrap();
+        h.calls.activate_extra(
+            ThreadSlot(1),
+            gen1,
+            ep_idx,
+            CallExtra {
+                bulk: None,
+                caller_rights,
+                attached_cap: Some(attached),
+            },
+        );
+        h.calls.bind_reply(&mut h.scheduler, tok, ThreadSlot(0));
+
+        let (installed, rights) = accept_ipc_cap(
+            &mut h.processes,
+            &h.ipc,
+            &mut h.calls,
+            p_sysd,
+            ThreadSlot(0),
+            tok,
+        )
+        .unwrap();
+        assert_eq!(rights, cap::SEND | cap::ADMIN);
+        assert!(resolve_endpoint(&h.processes, &h.ipc, p_sysd, installed, cap::SEND).is_ok());
+
+        // Second accept returns Enoent (single-use).
+        assert_eq!(
+            accept_ipc_cap(
+                &mut h.processes,
+                &h.ipc,
+                &mut h.calls,
+                p_sysd,
+                ThreadSlot(0),
+                tok,
+            ),
+            Err(Errno::Enoent)
+        );
+
+        // If attached endpoint is closed before server accepts, accept_ipc_cap rejects with Epipe.
+        let drv_ep2 = create_endpoint(&mut h.ipc, &mut h.processes, p_drv).unwrap();
+        let attached2 = prepare_ipc_cap(&h.processes, &h.ipc, p_drv, drv_ep2, cap::SEND).unwrap();
+        let (gen2, tok2) = h.calls.next_token(ThreadSlot(1)).unwrap();
+        h.calls.activate_extra(
+            ThreadSlot(1),
+            gen2,
+            ep_idx,
+            CallExtra {
+                bulk: None,
+                caller_rights: cap::SEND,
+                attached_cap: Some(attached2),
+            },
+        );
+        h.calls.bind_reply(&mut h.scheduler, tok2, ThreadSlot(0));
+        close_endpoint(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.scheduler,
+            p_drv,
+            drv_ep2,
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            accept_ipc_cap(
+                &mut h.processes,
+                &h.ipc,
+                &mut h.calls,
+                p_sysd,
+                ThreadSlot(0),
+                tok2,
+            ),
+            Err(Errno::Epipe)
+        );
+    }
+
+    #[test]
+    fn stream_endpoint_wakes_receiver_with_eof_when_producer_exits() {
+        let mut h = harness();
+        let shell = ProcSlot(0);
+        let producer = ProcSlot(1);
+        let consumer = ProcSlot(2);
+        let prod_t = ThreadSlot(1);
+        let cons_t = ThreadSlot(2);
+
+        // Shell creates a stream endpoint and delegates SEND to producer and RECEIVE to consumer.
+        let pipe = create_endpoint_with_flags(&mut h.ipc, &mut h.processes, shell, true).unwrap();
+        let prod_cap =
+            capability_for_spawn(&h.processes, &h.ipc, shell, false, pipe, cap::SEND).unwrap();
+        let cons_cap =
+            capability_for_spawn(&h.processes, &h.ipc, shell, false, pipe, cap::RECEIVE).unwrap();
+        let _prod_out = h
+            .processes
+            .slot_mut(producer)
+            .capabilities
+            .install(prod_cap)
+            .unwrap();
+        let cons_in = h
+            .processes
+            .slot_mut(consumer)
+            .capabilities
+            .install(cons_cap)
+            .unwrap();
+        let ep = h.ipc.resolve(prod_cap.object).unwrap();
+        h.ipc.mark_sender_attached(ep);
+
+        // Consumer blocks waiting to receive from the empty stream.
+        h.scheduler.current = cons_t;
+        h.scheduler.block(Wait::Receive {
+            endpoint: ep,
+            handle: cons_in,
+            pointer: 0x4ff1_2000,
+            capacity: ipc::MESSAGE_BYTES,
+        });
+        assert_eq!(h.scheduler.task(cons_t).state, State::Blocked);
+
+        // Producer exits (or faults) without explicitly sending an EOF frame.
+        h.scheduler.current = prod_t;
+        let reaped = terminate_current_thread(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.allocator,
+            &mut h.scheduler,
+            |_, _, _| {},
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(reaped.first_woken, Some(h.scheduler.task(cons_t).id));
+        assert_eq!(h.scheduler.task(cons_t).state, State::Ready);
+        assert_eq!(h.scheduler.task(cons_t).context.a0, 0);
     }
 }

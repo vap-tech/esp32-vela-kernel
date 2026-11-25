@@ -18,9 +18,10 @@ pub const STATS_IRQ_SMP_BYTES: usize = 56; // 7-source SMP IRQ table (+ ipi_hp0,
 pub const STATS_IRQ_FULL_BYTES: usize = 80; // 10-source table (+ kbd_gpio50, kbd_arm_low, kbd_arm_wait)
 pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
 pub const STATS_STREAMS_BYTES: usize = 36;
-pub const STATS_TASKS: u32 = 4; // per slot: 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
+pub const STATS_TASKS: u32 = 4; // 16 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
+pub const STATS_TASKS_SLOTS: usize = 16;
 pub const STATS_TASK_WORDS: usize = 9;
-pub const STATS_TASKS_BYTES: usize = 16 * STATS_TASK_WORDS * 4;
+pub const STATS_TASKS_BYTES: usize = STATS_TASKS_SLOTS * STATS_TASK_WORDS * 4;
 pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors (+ clk_khz, bench_write_kib_s, bench_read_kib_s)
 pub const STATS_SDCARD_BYTES: usize = 32;
 pub const STATS_SDCARD_EXT_BYTES: usize = 44;
@@ -32,13 +33,16 @@ pub const DISPLAY_FLAG_SD_EXPORT: u32 = 2;
 pub const DISPLAY_FLAG_SD_EXPORT_RW: u32 = 4;
 pub const STATS_DISPLAY_BYTES: usize = 4;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
+pub const EBADF: u32 = (-9i32) as u32;
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EBUSY: u32 = (-16i32) as u32;
 pub const EINVAL: u32 = (-22i32) as u32;
+pub const EPIPE: u32 = (-32i32) as u32;
 pub const ENOSYS: u32 = (-38i32) as u32;
 pub const ETIMEDOUT: u32 = (-110i32) as u32;
 
-pub const ENDPOINT_CREATE: u32 = 6;
+pub const ENDPOINT_CREATE: u32 = 6; // a0=flags (0=standard, ENDPOINT_STREAM=1 for pipe/stream EOF)
+pub const ENDPOINT_STREAM: u32 = 1; // automatic 0-byte EOF when last delegated SEND handle closes
 pub const SEND: u32 = 7; // a0=endpoint handle (SEND), a1=buffer, a2=len; full => EAGAIN
 pub const RECV: u32 = 8; // a0=endpoint handle (RECEIVE), a1=buffer, a2=capacity, a3=flags (0 / NONBLOCK)
 pub const ENDPOINT_CLOSE: u32 = 9; // a0=endpoint handle
@@ -72,6 +76,8 @@ pub const CAP_WAIT: u32 = 64;
 pub const CAP_ACK: u32 = 128;
 pub const CAP_CONTROL: u32 = 256;
 pub const CAP_PASS_ON_SPAWN: u32 = 512;
+/// Unforgeable administrative privilege on a service endpoint (e.g. `sysd` mount/unmount).
+pub const CAP_ADMIN: u32 = 1024;
 
 pub const IPC_CALL: u32 = 20; // a0=endpoint handle (SEND), a1=req, a2=len, a3=reply buf, a4=cap, a5=timeout ticks
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
@@ -141,7 +147,7 @@ pub const SD_PARTITION: u32 = 45; // a0=read capability, a1=relative LBA, a2=512
 /// Child entry receives `(cap0, arg_ptr, arg_len, cap1, cap2, cap3)`.
 pub const SPAWN_IMAGE: u32 = 46;
 pub const SPAWN_ARG_MAX: usize = 80;
-pub const SPAWN_IMAGE_MAX: usize = 64 * 1024;
+pub const SPAWN_IMAGE_MAX: usize = 1024 * 1024;
 pub const SPAWN_CAPS_MAX: usize = 4;
 
 #[repr(C)]
@@ -179,7 +185,65 @@ pub const SD_EXPORT_STOP: u32 = 2;
 pub const SD_EXPORT_START_RW: u32 = 3;
 pub const SD_EXPORT_EJECTED: u32 = 2;
 pub const SD_PARTITION_EPOCH: u32 = 1; // SD_PARTITION a3 selects media epoch query (a2 must be 0)
+pub const SD_PARTITION_WRITE: u32 = 2; // SD_PARTITION a3 selects 512-byte sector write from a2 (requires CAP_WRITE)
 
 /// Like SPAWN_IMAGE, but the caller blocks until the new process has exited.
 /// Returns the child PID on completion, or an error if it could not start.
 pub const SPAWN_IMAGE_WAIT: u32 = 48;
+
+/// Synchronous RPC with an attached bulk memory window (`a0=endpoint handle (SEND)`,
+/// `a1=pointer to IpcBulkCall` -> `a0=reply length`).
+/// While the caller blocks in `Wait::Reply`, the server (or a transitive forwardee)
+/// may read/write the caller's bulk window via `IPC_BULK_IO` using its reply token.
+pub const IPC_CALL_BULK: u32 = 49;
+/// Transfer bytes between the server's buffer and the client's bulk window bound to
+/// `reply_token`: `a0=reply_token`, `a1=client_offset`, `a2=local_ptr`, `a3=len`,
+/// `a4=direction (IPC_BULK_DIR_*)` -> `a0=bytes transferred`.
+/// When `a2==0 && a3==0`, returns `a0=bulk_len`, `a1=bulk_flags` without copying.
+pub const IPC_BULK_IO: u32 = 50;
+
+pub const IPC_BULK_READ: u32 = 1; // Server may read from the client's bulk buffer.
+pub const IPC_BULK_WRITE: u32 = 2; // Server may write into the client's bulk buffer.
+pub const IPC_BULK_FORWARD: u32 = 4; // Forward the bulk window bound to `forward_token`.
+pub const IPC_BULK_DIR_READ: u32 = 0; // Copy client bulk -> server local buffer.
+pub const IPC_BULK_DIR_WRITE: u32 = 1; // Copy server local buffer -> client bulk.
+pub const IPC_BULK_MAX: usize = 4 * 1024 * 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcBulkCall {
+    pub req_ptr: u32,
+    pub req_len: u32,
+    pub reply_ptr: u32,
+    pub reply_cap: u32,
+    pub timeout: u32,
+    pub bulk_ptr: u32,
+    pub bulk_len: u32,
+    pub bulk_flags: u32,
+    pub forward_token: u32,
+}
+
+/// Synchronous RPC with one attached capability (`a0=endpoint handle (SEND)`,
+/// `a1=pointer to IpcCapCall` -> `a0=reply length`).
+/// No capability slot is allocated in the server unless the server explicitly calls
+/// `IPC_ACCEPT_CAP` with the call's reply token.
+pub const IPC_CALL_CAP: u32 = 51;
+/// Accept a capability attached to an in-flight RPC call or query caller endpoint rights:
+/// - `a0=reply_token`, `a1=0`: installs the attached capability into the server's table ->
+///   `a0=new handle` (or `-ENOENT` if none attached), `a1=caller endpoint rights`.
+/// - `a0=reply_token`, `a1=IPC_ACCEPT_CAP_QUERY`: does not install a capability ->
+///   `a0=caller endpoint rights`, `a1=1 if a capability is attached else 0`.
+pub const IPC_ACCEPT_CAP: u32 = 52;
+pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcCapCall {
+    pub req_ptr: u32,
+    pub req_len: u32,
+    pub reply_ptr: u32,
+    pub reply_cap: u32,
+    pub timeout: u32,
+    pub cap_handle: u32,
+    pub cap_rights: u32,
+}

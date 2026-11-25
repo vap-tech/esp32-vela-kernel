@@ -519,42 +519,32 @@ impl Runtime {
         let owner = self.processes.slot(process).id;
         let result = (|| {
             let mut space = AddressSpace::EMPTY;
-            let bias = if image.pic {
-                let end = image
-                    .segments()
-                    .iter()
-                    .map(|s| s.region.base + s.region.size)
-                    .max()
-                    .ok_or(Errno::Enoexec)?;
+            let (bias, backing_end) = if image.pic {
+                let mut end = 0usize;
+                for s in image.segments() {
+                    let (tiles, count) =
+                        vela_kernel::elf::tile_pie_segment(s.region.base, s.region.size)
+                            .map_err(|_| Errno::Enoexec)?;
+                    let last = tiles[count - 1];
+                    let seg_end = last.base.checked_add(last.size).ok_or(Errno::Enoexec)?;
+                    if seg_end > end {
+                        end = seg_end;
+                    }
+                }
+                if end == 0 {
+                    return Err(Errno::Enoexec);
+                }
                 let backing = self.allocator.allocate_in(code_class, owner, end)?;
                 if code_class == MemoryClass::Psram
                     && !self.display.set_psram_region_mapped(backing, true)
                 {
                     return Err(Errno::Eio);
                 }
-                backing.base
+                (backing.base, backing.base + backing.size)
             } else {
-                0
+                (0, usize::MAX)
             };
             for (i, segment) in image.segments().iter().enumerate() {
-                let region = if image.pic {
-                    let size = segment
-                        .region
-                        .size
-                        .max(128)
-                        .checked_next_power_of_two()
-                        .ok_or(Errno::Enoexec)?;
-                    if segment.region.base % size != 0 {
-                        return Err(Errno::Enoexec);
-                    }
-                    Region {
-                        base: bias + segment.region.base,
-                        size,
-                    }
-                } else {
-                    self.allocator
-                        .reserve(owner, segment.region.base, segment.region.size)?
-                };
                 let mut rights = READ;
                 if segment.flags & 1 != 0 {
                     rights |= EXECUTE;
@@ -562,16 +552,50 @@ impl Runtime {
                 if segment.flags & 2 != 0 {
                     rights |= WRITE;
                 }
-                space.insert(region, rights)?;
                 let data = image.data(i).ok_or(Errno::Enoexec)?;
-                // Reserved private SRAM or mapped PSRAM. Clear BSS and all PMP-visible padding.
-                unsafe {
-                    core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        region.base as *mut u8,
-                        data.len(),
-                    );
+                if image.pic {
+                    let (tiles, count) = vela_kernel::elf::tile_pie_segment(
+                        segment.region.base,
+                        segment.region.size,
+                    )
+                    .map_err(|_| Errno::Enoexec)?;
+                    for tile in &tiles[..count] {
+                        let base = bias + tile.base;
+                        if base.checked_add(tile.size).is_none_or(|e| e > backing_end) {
+                            return Err(Errno::Enoexec);
+                        }
+                        let region = Region {
+                            base,
+                            size: tile.size,
+                        };
+                        space.insert(region, rights)?;
+                        // Reserved private SRAM or mapped PSRAM. Clear BSS and PMP padding.
+                        unsafe {
+                            core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
+                        }
+                    }
+                    // SAFETY: contiguous tiled regions cover `[bias + vaddr .. bias + vaddr + size)`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            (bias + segment.region.base) as *mut u8,
+                            data.len(),
+                        );
+                    }
+                } else {
+                    let region =
+                        self.allocator
+                            .reserve(owner, segment.region.base, segment.region.size)?;
+                    space.insert(region, rights)?;
+                    // Reserved private SRAM. Clear BSS and all PMP-visible padding.
+                    unsafe {
+                        core::ptr::write_bytes(region.base as *mut u8, 0, region.size);
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            region.base as *mut u8,
+                            data.len(),
+                        );
+                    }
                 }
             }
             image
@@ -583,7 +607,22 @@ impl Runtime {
                 })
                 .map_err(|_| Errno::Enoexec)?;
             let entry = bias + image.entry;
-            let stack = self.allocator.allocate(owner, 4096)?;
+            let stack = if code_class == MemoryClass::Psram {
+                match self.allocator.allocate(owner, 8192) {
+                    Ok(region) => region,
+                    Err(_) => {
+                        let region =
+                            self.allocator
+                                .allocate_in(MemoryClass::Psram, owner, 65536)?;
+                        if !self.display.set_psram_region_mapped(region, true) {
+                            return Err(Errno::Eio);
+                        }
+                        region
+                    }
+                }
+            } else {
+                self.allocator.allocate(owner, 4096)?
+            };
             space.insert(stack, READ | WRITE)?;
             let (arg0, arg1) = if dma_driver {
                 let dma_obj = self.dma.acquire(DMA_CH_GDMA_AHB_CH1, owner)?;

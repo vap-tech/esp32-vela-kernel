@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
-//! `sysd`: root userspace namespace service for `/proc`, `/sys`, `/dev`, and mounted filesystems (`/sd`).
+//! `sysd`: root userspace namespace service for `/proc`, `/sys`, `/dev`, and mounted
+//! filesystems/drivers (`/sd`, dynamic `/dev/*`, `/mnt/*`).
 
 mod dev;
 mod proc;
@@ -27,8 +28,11 @@ struct SnapshotCache {
     path: [u8; 48],
     path_len: usize,
     status: u8,
-    text: TextBuf<1024>,
+    text: TextBuf<2048>,
 }
+
+/// NOLOAD `.bss` cache so `sysd`'s 4 KiB stack never holds the 2 KiB render buffer.
+static mut CACHE: SnapshotCache = SnapshotCache::new();
 
 impl SnapshotCache {
     const fn new() -> Self {
@@ -44,12 +48,18 @@ impl SnapshotCache {
         self.path_len = 0;
     }
 
-    fn render_or_reuse(&mut self, offset: usize, path: &[u8], caps: Caps) -> (u8, &[u8]) {
+    fn render_or_reuse(
+        &mut self,
+        offset: usize,
+        path: &[u8],
+        mounts: &MountTable,
+        caps: Caps,
+    ) -> (u8, &[u8]) {
         let same_path =
             offset > 0 && path.len() == self.path_len && self.path[..self.path_len] == *path;
         if !same_path {
             self.text.clear();
-            self.status = render_virtual(path, caps, &mut self.text);
+            self.status = render_virtual(path, mounts, caps, &mut self.text);
             if path.len() <= self.path.len() {
                 self.path[..path.len()].copy_from_slice(path);
                 self.path_len = path.len();
@@ -61,9 +71,18 @@ impl SnapshotCache {
     }
 }
 
+fn is_virtual_dir(norm: &[u8], mounts: &MountTable) -> bool {
+    matches!(norm, b"/" | b"/proc" | b"/sys" | b"/dev" | b"/sys/sentinel")
+        || mounts.has_descendant(norm)
+}
+
 #[inline(never)]
-fn render_virtual(path: &[u8], caps: Caps, out: &mut TextBuf<1024>) -> u8 {
+fn render_virtual(path: &[u8], mounts: &MountTable, caps: Caps, out: &mut TextBuf<2048>) -> u8 {
     let norm = mount::normalize_path(path);
+    if norm == b"/proc/mounts" {
+        mounts.render_mounts(out);
+        return fs_abi::STATUS_OK;
+    }
     if let Some(rel) = norm.strip_prefix(b"/proc/") {
         return proc::read(rel, out);
     }
@@ -73,7 +92,7 @@ fn render_virtual(path: &[u8], caps: Caps, out: &mut TextBuf<1024>) -> u8 {
     if let Some(rel) = norm.strip_prefix(b"/dev/") {
         return dev::read(rel, caps.dev, out);
     }
-    if matches!(norm, b"/" | b"/proc" | b"/sys" | b"/dev" | b"/sys/sentinel") {
+    if is_virtual_dir(norm, mounts) {
         out.append(b"sysd: is a directory\n");
         return fs_abi::STATUS_ERR;
     }
@@ -81,19 +100,58 @@ fn render_virtual(path: &[u8], caps: Caps, out: &mut TextBuf<1024>) -> u8 {
     fs_abi::STATUS_NOENT
 }
 
-fn handle_read(
-    offset: usize,
+fn prune_if_dead(alive: bool, ep: u32, mounts: &mut MountTable, cache: &mut SnapshotCache) {
+    if !alive {
+        mounts.remove_endpoint(ep);
+        let _ = usys::endpoint_close(ep);
+        cache.invalidate();
+    }
+}
+
+fn handle_stat(
     path: &[u8],
-    mounts: &MountTable,
+    mounts: &mut MountTable,
     caps: Caps,
     cache: &mut SnapshotCache,
     response: &mut Buffer,
 ) {
     if let Some((ep, rel)) = mounts.resolve(path) {
-        mount::forward_pos(ep, fs_abi::OP_READ, offset as u32, rel, response);
+        let alive = mount::forward_stat(ep, rel, response);
+        prune_if_dead(alive, ep, mounts, cache);
         return;
     }
-    let (status, bytes) = cache.render_or_reuse(offset, path, caps);
+    let norm = mount::normalize_path(path);
+    if is_virtual_dir(norm, mounts) {
+        response.push(fs_abi::STATUS_OK);
+        response.append(&0u32.to_le_bytes());
+        response.push(fs_abi::KIND_DIR);
+        return;
+    }
+    let (status, bytes) = cache.render_or_reuse(0, path, mounts, caps);
+    if status != fs_abi::STATUS_OK {
+        response.push(status);
+        response.append(bytes);
+        return;
+    }
+    response.push(fs_abi::STATUS_OK);
+    response.append(&(bytes.len() as u32).to_le_bytes());
+    response.push(fs_abi::KIND_FILE);
+}
+
+fn handle_read(
+    offset: usize,
+    path: &[u8],
+    mounts: &mut MountTable,
+    caps: Caps,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    if let Some((ep, rel)) = mounts.resolve(path) {
+        let alive = mount::forward_pos(ep, fs_abi::OP_READ, offset as u32, rel, response);
+        prune_if_dead(alive, ep, mounts, cache);
+        return;
+    }
+    let (status, bytes) = cache.render_or_reuse(offset, path, mounts, caps);
     response.push(status);
     if status != fs_abi::STATUS_OK {
         response.append(bytes);
@@ -106,17 +164,71 @@ fn handle_read(
     response.append(&bytes[offset..end]);
 }
 
-fn handle_list(cursor: u32, path: &[u8], mounts: &MountTable, response: &mut Buffer) {
+fn handle_read_bulk(
+    pending_token: u32,
+    offset: usize,
+    max_len: usize,
+    path: &[u8],
+    mounts: &mut MountTable,
+    caps: Caps,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
     if let Some((ep, rel)) = mounts.resolve(path) {
-        mount::forward_pos(ep, fs_abi::OP_LIST, cursor, rel, response);
+        let alive = mount::forward_read_bulk(
+            ep,
+            pending_token,
+            offset as u32,
+            max_len as u32,
+            rel,
+            response,
+        );
+        prune_if_dead(alive, ep, mounts, cache);
+        return;
+    }
+    let (status, bytes) = cache.render_or_reuse(offset, path, mounts, caps);
+    if status != fs_abi::STATUS_OK {
+        response.push(status);
+        response.append(bytes);
+        return;
+    }
+    if offset >= bytes.len() || max_len == 0 {
+        response.push(fs_abi::STATUS_OK);
+        response.append(&0u32.to_le_bytes());
+        return;
+    }
+    let end = (offset + max_len).min(bytes.len());
+    let slice = &bytes[offset..end];
+    if usys::ipc_bulk_write(pending_token, 0, slice).is_err() {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: bulk write failed\n");
+        return;
+    }
+    response.push(fs_abi::STATUS_OK);
+    response.append(&(slice.len() as u32).to_le_bytes());
+}
+
+fn handle_list(
+    cursor: u32,
+    path: &[u8],
+    mounts: &mut MountTable,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    if let Some((ep, rel)) = mounts.resolve(path) {
+        let alive = mount::forward_pos(ep, fs_abi::OP_LIST, cursor, rel, response);
+        prune_if_dead(alive, ep, mounts, cache);
         return;
     }
     match mount::normalize_path(path) {
-        b"/" => mount::list_static(ROOT_ENTRIES, cursor, response),
+        b"/" => mount::list_dir(ROOT_ENTRIES, b"/", mounts, cursor, response),
         b"/proc" => mount::list_static(proc::ENTRIES, cursor, response),
         b"/sys" => mount::list_static(sys::ENTRIES, cursor, response),
         b"/sys/sentinel" => mount::list_static(sys::SENTINEL_ENTRIES, cursor, response),
-        b"/dev" => mount::list_static(dev::ENTRIES, cursor, response),
+        b"/dev" => mount::list_dir(dev::ENTRIES, b"/dev", mounts, cursor, response),
+        other if mounts.has_descendant(other) => {
+            mount::list_dir(&[], other, mounts, cursor, response);
+        }
         _ => {
             response.push(fs_abi::STATUS_NOENT);
             response.append(b"sysd: not a directory\n");
@@ -128,14 +240,15 @@ fn handle_write(
     offset: u32,
     path: &[u8],
     data: &[u8],
-    mounts: &MountTable,
+    mounts: &mut MountTable,
     caps: Caps,
     cache: &mut SnapshotCache,
     response: &mut Buffer,
 ) {
     cache.invalidate();
     if let Some((ep, rel)) = mounts.resolve(path) {
-        mount::forward_write(ep, offset, rel, data, response);
+        let alive = mount::forward_write(ep, offset, rel, data, response);
+        prune_if_dead(alive, ep, mounts, cache);
         return;
     }
     let norm = mount::normalize_path(path);
@@ -155,9 +268,138 @@ fn handle_write(
     response.append(cache.text.as_slice());
 }
 
+fn handle_write_bulk(
+    pending_token: u32,
+    offset: u32,
+    len: u32,
+    path: &[u8],
+    mounts: &mut MountTable,
+    caps: Caps,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    cache.invalidate();
+    if let Some((ep, rel)) = mounts.resolve(path) {
+        let alive = mount::forward_write_bulk(ep, pending_token, offset, len, rel, response);
+        prune_if_dead(alive, ep, mounts, cache);
+        return;
+    }
+    let want = len as usize;
+    if want > abi::IPC_BYTES {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: virtual device write too large\n");
+        return;
+    }
+    let mut scratch = [0u8; abi::IPC_BYTES];
+    if want > 0 && usys::ipc_bulk_read(pending_token, 0, &mut scratch[..want]).is_err() {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: bulk read failed\n");
+        return;
+    }
+    let mut inner = Buffer::new();
+    handle_write(
+        offset,
+        path,
+        &scratch[..want],
+        mounts,
+        caps,
+        cache,
+        &mut inner,
+    );
+    if inner.get(0) == fs_abi::STATUS_OK {
+        response.push(fs_abi::STATUS_OK);
+        response.append(&(want as u32).to_le_bytes());
+    } else {
+        response.append(inner.as_slice());
+    }
+}
+
+fn handle_mount(
+    pending_token: u32,
+    prefix: &[u8],
+    mounts: &mut MountTable,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    let Ok((rights, has_cap)) = usys::ipc_call_rights(pending_token) else {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: mount call invalid\n");
+        return;
+    };
+    if rights & abi::CAP_ADMIN == 0 {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: mount permission denied\n");
+        return;
+    }
+    if !has_cap {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: missing mount endpoint\n");
+        return;
+    }
+    if !mount::is_valid_dynamic_prefix(prefix) {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: invalid mount prefix\n");
+        return;
+    }
+    let Ok((new_ep, _)) = usys::ipc_accept_cap(pending_token) else {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: cannot accept mount endpoint\n");
+        return;
+    };
+    match mounts.mount(prefix, new_ep) {
+        Ok(Some(old_ep)) => {
+            let _ = usys::endpoint_close(old_ep);
+            cache.invalidate();
+            response.push(fs_abi::STATUS_OK);
+        }
+        Ok(None) => {
+            cache.invalidate();
+            response.push(fs_abi::STATUS_OK);
+        }
+        Err(()) => {
+            let _ = usys::endpoint_close(new_ep);
+            response.push(fs_abi::STATUS_ERR);
+            response.append(b"sysd: mount table full\n");
+        }
+    }
+}
+
+fn handle_unmount(
+    pending_token: u32,
+    prefix: &[u8],
+    mounts: &mut MountTable,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    let Ok((rights, _)) = usys::ipc_call_rights(pending_token) else {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: unmount call invalid\n");
+        return;
+    };
+    if rights & abi::CAP_ADMIN == 0 {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: unmount permission denied\n");
+        return;
+    }
+    if !mount::is_valid_dynamic_prefix(prefix) {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: invalid mount prefix\n");
+        return;
+    }
+    if let Some(old_ep) = mounts.unmount(prefix) {
+        let _ = usys::endpoint_close(old_ep);
+        cache.invalidate();
+        response.push(fs_abi::STATUS_OK);
+    } else {
+        response.push(fs_abi::STATUS_NOENT);
+        response.append(b"sysd: not mounted\n");
+    }
+}
+
 fn handle_request(
+    pending_token: u32,
     request: &Buffer,
-    mounts: &MountTable,
+    mounts: &mut MountTable,
     caps: Caps,
     cache: &mut SnapshotCache,
     response: &mut Buffer,
@@ -169,9 +411,26 @@ fn handle_request(
             let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
             handle_read(offset, path, mounts, caps, cache, response);
         }
+        [fs_abi::OP_READ_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+            let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
+            let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
+            handle_read_bulk(
+                pending_token,
+                offset,
+                max_len,
+                path,
+                mounts,
+                caps,
+                cache,
+                response,
+            );
+        }
+        [fs_abi::OP_STAT, path @ ..] if !path.is_empty() => {
+            handle_stat(path, mounts, caps, cache, response);
+        }
         [fs_abi::OP_LIST, a, b, c, d, path @ ..] if !path.is_empty() => {
             let cursor = u32::from_le_bytes([*a, *b, *c, *d]);
-            handle_list(cursor, path, mounts, response);
+            handle_list(cursor, path, mounts, cache, response);
         }
         [fs_abi::OP_WRITE, a, b, c, d, path_len, rest @ ..]
             if usize::from(*path_len) > 0 && usize::from(*path_len) <= rest.len() =>
@@ -181,6 +440,36 @@ fn handle_request(
             let path = &rest[..plen];
             let data = &rest[plen..];
             handle_write(offset, path, data, mounts, caps, cache, response);
+        }
+        [fs_abi::OP_WRITE_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+            let offset = u32::from_le_bytes([*a, *b, *c, *d]);
+            let len = u32::from_le_bytes([*e, *f, *g, *h]);
+            handle_write_bulk(
+                pending_token,
+                offset,
+                len,
+                path,
+                mounts,
+                caps,
+                cache,
+                response,
+            );
+        }
+        [fs_abi::OP_MOUNT, prefix @ ..] if !prefix.is_empty() => {
+            handle_mount(pending_token, prefix, mounts, cache, response);
+        }
+        [fs_abi::OP_UNMOUNT, prefix @ ..] if !prefix.is_empty() => {
+            handle_unmount(pending_token, prefix, mounts, cache, response);
+        }
+        [op @ (fs_abi::OP_UNLINK | fs_abi::OP_MKDIR), path @ ..] if !path.is_empty() => {
+            cache.invalidate();
+            if let Some((ep, rel)) = mounts.resolve(path) {
+                let alive = mount::forward_path_op(ep, *op, rel, response);
+                prune_if_dead(alive, ep, mounts, cache);
+            } else {
+                response.push(fs_abi::STATUS_ERR);
+                response.append(b"sysd: read-only filesystem\n");
+            }
         }
         _ => {
             response.push(fs_abi::STATUS_ERR);
@@ -212,7 +501,8 @@ fn main(
     if ext4_handle != 0 {
         let _ = mounts.mount(b"/sd", ext4_handle);
     }
-    let mut cache = SnapshotCache::new();
+    // SAFETY: single-threaded service, `CACHE` is never aliased.
+    let cache = unsafe { &mut *core::ptr::addr_of_mut!(CACHE) };
     let mut request = Buffer::new();
     let mut response = Buffer::new();
     let mut pending_token = 0u32;
@@ -229,6 +519,13 @@ fn main(
         if pending_token == 0 {
             continue;
         }
-        handle_request(&request, &mounts, caps, &mut cache, &mut response);
+        handle_request(
+            pending_token,
+            &request,
+            &mut mounts,
+            caps,
+            cache,
+            &mut response,
+        );
     }
 }

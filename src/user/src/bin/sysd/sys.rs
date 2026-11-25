@@ -13,7 +13,7 @@ pub struct SysCaps {
     pub sentinel: u32,
 }
 
-pub fn read(rel: &[u8], caps: SysCaps, out: &mut TextBuf<1024>) -> u8 {
+pub fn read(rel: &[u8], caps: SysCaps, out: &mut TextBuf<2048>) -> u8 {
     match rel {
         b"power" => render_power(caps.i2c_system, out),
         b"freq" => freq_op(abi::FREQ_MODE_QUERY, caps.sentinel, out),
@@ -31,7 +31,7 @@ pub fn read(rel: &[u8], caps: SysCaps, out: &mut TextBuf<1024>) -> u8 {
     }
 }
 
-pub fn write(rel: &[u8], data: &[u8], caps: SysCaps, out: &mut TextBuf<1024>) -> u8 {
+pub fn write(rel: &[u8], data: &[u8], caps: SysCaps, out: &mut TextBuf<2048>) -> u8 {
     let text = data.trim_ascii();
     match rel {
         b"freq" => {
@@ -74,7 +74,7 @@ fn parse_u32_range(bytes: &[u8], min: u32, max: u32) -> Option<u32> {
 }
 
 #[inline(never)]
-fn render_power(i2c_system: u32, out: &mut TextBuf<1024>) -> u8 {
+fn render_power(i2c_system: u32, out: &mut TextBuf<2048>) -> u8 {
     let Ok(reading) = ina226::sample_tab5(i2c_system) else {
         out.append(b"service unavailable\n");
         return fs_abi::STATUS_ERR;
@@ -102,7 +102,7 @@ fn render_power(i2c_system: u32, out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn freq_op(mode: u32, sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
+fn freq_op(mode: u32, sentinel_cap: u32, out: &mut TextBuf<2048>) -> u8 {
     let (cpu_mhz, active_mode) = sys::call6(abi::CLOCK_CONTROL, sentinel_cap, mode, 0, 0, 0, 0);
     if (cpu_mhz as i32) <= 0 {
         if cpu_mhz as i32 == -16 {
@@ -126,7 +126,7 @@ fn freq_op(mode: u32, sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_display(out: &mut TextBuf<1024>) -> u8 {
+fn render_display(out: &mut TextBuf<2048>) -> u8 {
     let mut snap = [0u8; abi::STATS_DISPLAY_BYTES];
     if sys::call(
         abi::STATS,
@@ -151,7 +151,7 @@ fn render_display(out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn write_display(text: &[u8], display_cap: u32, out: &mut TextBuf<1024>) -> u8 {
+fn write_display(text: &[u8], display_cap: u32, out: &mut TextBuf<2048>) -> u8 {
     if text == b"off" {
         let rc = sys::call(abi::DISPLAY_TEST, display_cap, abi::DISPLAY_MODE_OFF, 0, 0);
         if rc == 0 {
@@ -208,7 +208,7 @@ fn sentinel_log_call(sentinel_cap: u32, sequence: u32, data: &mut [u8; 24]) -> (
 }
 
 #[inline(never)]
-fn render_sentinel_status(sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
+fn render_sentinel_status(sentinel_cap: u32, out: &mut TextBuf<2048>) -> u8 {
     let mut data = [0u8; 24];
     let (result, notices) = sys::call6(
         abi::SENTINEL_QUERY,
@@ -245,7 +245,7 @@ fn render_sentinel_status(sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn render_sentinel_log(sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
+fn render_sentinel_log(sentinel_cap: u32, out: &mut TextBuf<2048>) -> u8 {
     let mut data = [0u8; 24];
     let (result, notices) = sentinel_log_call(sentinel_cap, 0, &mut data);
     if result != 24 {
@@ -310,7 +310,7 @@ fn render_sentinel_log(sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
 }
 
 #[inline(never)]
-fn write_sentinel_sleep(text: &[u8], sentinel_cap: u32, out: &mut TextBuf<1024>) -> u8 {
+fn write_sentinel_sleep(text: &[u8], sentinel_cap: u32, out: &mut TextBuf<2048>) -> u8 {
     let Some(ms) = parse_u32_range(text, 1, 60_000) else {
         out.append(b"sys/sentinel/sleep: expected 1..60000 ms\n");
         return fs_abi::STATUS_ERR;
