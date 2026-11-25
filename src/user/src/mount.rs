@@ -1,13 +1,14 @@
-//! Userspace VFS mount table, path normalization, and static directory listing.
+//! Userspace VFS mount table, path normalization, and directory listing.
 //!
-//! Used by `sysd` to route `/sd/*` (and future dynamically mounted `/dev/*` drivers)
-//! to their backing service endpoints while serving built-in directories via `OP_LIST`.
+//! Used by `sysd` to route `/sd/*` and dynamically mounted `/dev/*` or `/mnt/*`
+//! services to their backing IPC endpoints while serving built-in and synthesized
+//! parent directories via `OP_LIST`.
 
-use crate::{Buffer, sys};
+use crate::{Buffer, TextBuf, sys};
 use vela_abi::{fs as fs_abi, syscall as abi};
 
-pub const MAX_MOUNTS: usize = 4;
-const MAX_PREFIX: usize = 24;
+pub const MAX_MOUNTS: usize = 8;
+pub const MAX_PREFIX: usize = 32;
 
 #[derive(Clone, Copy)]
 struct MountEntry {
@@ -45,24 +46,64 @@ impl MountTable {
         }
     }
 
-    pub fn mount(&mut self, prefix: &[u8], endpoint: u32) -> bool {
+    /// Mount `endpoint` at `prefix` (replacing an existing mount on the same prefix).
+    /// Returns `Ok(Some(old_endpoint))` on in-place replace, `Ok(None)` on new slot,
+    /// or `Err(())` if `prefix`/`endpoint` is invalid or the mount table is full.
+    pub fn mount(&mut self, prefix: &[u8], endpoint: u32) -> Result<Option<u32>, ()> {
         let prefix = normalize_path(prefix);
         if prefix.len() < 2
             || prefix.len() > MAX_PREFIX
             || !prefix.starts_with(b"/")
             || endpoint == 0
         {
-            return false;
+            return Err(());
+        }
+        // Replace an existing mount on the exact same prefix first so a full table
+        // can still remount in place.
+        for slot in &mut self.entries {
+            if slot.endpoint != 0 && slot.prefix() == prefix {
+                let old = slot.endpoint;
+                slot.endpoint = endpoint;
+                return Ok(Some(old));
+            }
         }
         for slot in &mut self.entries {
-            if slot.endpoint == 0 || slot.prefix() == prefix {
+            if slot.endpoint == 0 {
                 slot.prefix[..prefix.len()].copy_from_slice(prefix);
                 slot.prefix_len = prefix.len();
                 slot.endpoint = endpoint;
-                return true;
+                return Ok(None);
             }
         }
-        false
+        Err(())
+    }
+
+    /// Unmount `prefix`, returning its previous endpoint handle if present.
+    pub fn unmount(&mut self, prefix: &[u8]) -> Option<u32> {
+        let prefix = normalize_path(prefix);
+        for slot in &mut self.entries {
+            if slot.endpoint != 0 && slot.prefix() == prefix {
+                let old = slot.endpoint;
+                *slot = MountEntry::EMPTY;
+                return Some(old);
+            }
+        }
+        None
+    }
+
+    /// Remove any mount backed by `endpoint` (used to auto-prune dead driver endpoints).
+    pub fn remove_endpoint(&mut self, endpoint: u32) -> bool {
+        if endpoint == 0 {
+            return false;
+        }
+        let mut removed = false;
+        for slot in &mut self.entries {
+            if slot.endpoint == endpoint {
+                *slot = MountEntry::EMPTY;
+                removed = true;
+            }
+        }
+        removed
     }
 
     /// Match the longest mounted prefix for `path`, returning `(endpoint, relative_path)`.
@@ -88,6 +129,69 @@ impl MountTable {
         }
         best.map(|(_, ep, rel)| (ep, rel))
     }
+
+    /// True if any active mount lives strictly underneath `dir` (so `dir` is a valid
+    /// virtual parent directory, e.g. `/mnt` when `/mnt/ram` is mounted).
+    pub fn has_descendant(&self, dir: &[u8]) -> bool {
+        let norm = normalize_path(dir);
+        self.entries
+            .iter()
+            .any(|slot| slot.endpoint != 0 && direct_child_under(slot.prefix(), norm).is_some())
+    }
+
+    /// Render active mount prefixes (one per line) for `/proc/mounts`.
+    pub fn render_mounts<const N: usize>(&self, out: &mut TextBuf<N>) {
+        for slot in &self.entries {
+            if slot.endpoint != 0 {
+                out.append(slot.prefix());
+                out.push(b'\n');
+            }
+        }
+    }
+}
+
+/// Validate a prefix submitted to `OP_MOUNT` / `OP_UNMOUNT`.
+/// Rejects malformed paths and protects core kernel/virtual trees (`/`, `/proc/*`,
+/// `/sys/*`, and `/dev` itself). Dynamic mounts under `/dev/<name>`, `/mnt/<name>`,
+/// or top-level paths like `/sd` or `/ram` are allowed.
+pub fn is_valid_dynamic_prefix(prefix: &[u8]) -> bool {
+    let norm = normalize_path(prefix);
+    if norm.len() < 2 || norm.len() > MAX_PREFIX || !norm.starts_with(b"/") {
+        return false;
+    }
+    if matches!(norm, b"/proc" | b"/sys" | b"/dev")
+        || norm.starts_with(b"/proc/")
+        || norm.starts_with(b"/sys/")
+    {
+        return false;
+    }
+    // Check printable ASCII components, no empty segments (`//`), no `.` or `..`.
+    for component in norm[1..].split(|&b| b == b'/') {
+        if component.is_empty()
+            || component == b"."
+            || component == b".."
+            || !component.iter().all(|&b| (0x21..=0x7e).contains(&b))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Return the immediate child component of `prefix` under `dir`, if `prefix` is strictly
+/// beneath `dir` (e.g. `direct_child_under("/dev/ram0", "/dev") == Some("ram0")`,
+/// `direct_child_under("/mnt/a/b", "/") == Some("mnt")`).
+fn direct_child_under<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+    let rest = if dir == b"/" {
+        prefix.strip_prefix(b"/")?
+    } else {
+        prefix.strip_prefix(dir)?.strip_prefix(b"/")?
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let end = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
+    Some(&rest[..end])
 }
 
 /// Strip trailing `/` bytes while preserving root `"/"`.
@@ -111,29 +215,82 @@ pub fn list_static(entries: &[&[u8]], cursor: u32, response: &mut Buffer) {
     response.append(name);
 }
 
+/// Encode one directory entry for `OP_LIST`, merging `static_entries` with
+/// deduplicated direct child names of active mounts under `dir`.
+pub fn list_dir(
+    static_entries: &[&[u8]],
+    dir: &[u8],
+    mounts: &MountTable,
+    cursor: u32,
+    response: &mut Buffer,
+) {
+    let norm = normalize_path(dir);
+    let idx = cursor as usize;
+    if idx < static_entries.len() {
+        list_static(static_entries, cursor, response);
+        return;
+    }
+    let mut dynamic_idx = static_entries.len();
+    for (slot_idx, slot) in mounts.entries.iter().enumerate() {
+        if slot.endpoint == 0 {
+            continue;
+        }
+        let Some(child) = direct_child_under(slot.prefix(), norm) else {
+            continue;
+        };
+        if static_entries.contains(&child) {
+            continue;
+        }
+        let dup = mounts.entries[..slot_idx].iter().any(|prev| {
+            prev.endpoint != 0 && direct_child_under(prev.prefix(), norm) == Some(child)
+        });
+        if dup {
+            continue;
+        }
+        if dynamic_idx == idx {
+            response.push(fs_abi::STATUS_OK);
+            let next = cursor.saturating_add(1);
+            response.append(&next.to_le_bytes());
+            response.push(1);
+            response.append(child);
+            return;
+        }
+        dynamic_idx += 1;
+    }
+    response.push(fs_abi::STATUS_OK);
+}
+
 /// Forward `OP_READ` or `OP_LIST` to a mounted service endpoint with the mount prefix stripped.
-pub fn forward_pos(endpoint: u32, op: u8, pos: u32, rel_path: &[u8], response: &mut Buffer) {
+/// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
+pub fn forward_pos(
+    endpoint: u32,
+    op: u8,
+    pos: u32,
+    rel_path: &[u8],
+    response: &mut Buffer,
+) -> bool {
     let mut fwd = Buffer::new();
     fwd.push(op);
     fwd.append(&pos.to_le_bytes());
     fwd.append(rel_path);
-    forward_raw(endpoint, &fwd, 500, response);
+    forward_raw(endpoint, &fwd, 500, response)
 }
 
 /// Forward `OP_WRITE` to a mounted service endpoint with the mount prefix stripped.
+/// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
 pub fn forward_write(
     endpoint: u32,
     offset: u32,
     rel_path: &[u8],
     data: &[u8],
     response: &mut Buffer,
-) {
+) -> bool {
     if rel_path.len() > u8::MAX as usize
         || fs_abi::WRITE_HEADER + rel_path.len() + data.len() > abi::IPC_BYTES
     {
         response.push(fs_abi::STATUS_ERR);
         response.append(b"sysd: write exceeds IPC frame\n");
-        return;
+        return true;
     }
     let mut fwd = Buffer::new();
     fwd.push(fs_abi::OP_WRITE);
@@ -141,19 +298,21 @@ pub fn forward_write(
     fwd.push(rel_path.len() as u8);
     fwd.append(rel_path);
     fwd.append(data);
-    forward_raw(endpoint, &fwd, 0, response);
+    forward_raw(endpoint, &fwd, 0, response)
 }
 
 /// Forward `OP_STAT` to a mounted service endpoint with the mount prefix stripped.
-pub fn forward_stat(endpoint: u32, rel_path: &[u8], response: &mut Buffer) {
+/// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
+pub fn forward_stat(endpoint: u32, rel_path: &[u8], response: &mut Buffer) -> bool {
     let mut fwd = Buffer::new();
     fwd.push(fs_abi::OP_STAT);
     fwd.append(rel_path);
-    forward_raw(endpoint, &fwd, 500, response);
+    forward_raw(endpoint, &fwd, 500, response)
 }
 
 /// Forward `OP_READ_BULK` to a mounted service endpoint, transitively forwarding
 /// the caller's bulk memory window bound to `forward_token` with zero intermediate copy.
+/// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
 pub fn forward_read_bulk(
     endpoint: u32,
     forward_token: u32,
@@ -161,7 +320,7 @@ pub fn forward_read_bulk(
     max_len: u32,
     rel_path: &[u8],
     response: &mut Buffer,
-) {
+) -> bool {
     let mut fwd = Buffer::new();
     fwd.push(fs_abi::OP_READ_BULK);
     fwd.append(&offset.to_le_bytes());
@@ -178,18 +337,20 @@ pub fn forward_read_bulk(
         bulk_flags: abi::IPC_BULK_FORWARD | abi::IPC_BULK_WRITE,
         forward_token,
     };
-    let count = sys::ipc_call_bulk(endpoint, &desc) as usize;
+    let raw = sys::ipc_call_bulk(endpoint, &desc) as u32;
+    let count = raw as usize;
     if !(1..=abi::IPC_BYTES).contains(&count) {
         response.clear();
         response.push(fs_abi::STATUS_ERR);
         response.append(b"sysd: mount unavailable\n");
-        return;
+        return !matches!(raw, abi::EBADF | abi::EPIPE);
     }
     response.set_len(count);
+    true
 }
 
-fn forward_raw(endpoint: u32, request: &Buffer, timeout: u32, response: &mut Buffer) {
-    let count = sys::call6(
+fn forward_raw(endpoint: u32, request: &Buffer, timeout: u32, response: &mut Buffer) -> bool {
+    let raw = sys::call6(
         abi::IPC_CALL,
         endpoint,
         request.ptr() as u32,
@@ -198,14 +359,16 @@ fn forward_raw(endpoint: u32, request: &Buffer, timeout: u32, response: &mut Buf
         abi::IPC_BYTES as u32,
         timeout,
     )
-    .0 as usize;
+    .0;
+    let count = raw as usize;
     if !(1..=abi::IPC_BYTES).contains(&count) {
         response.clear();
         response.push(fs_abi::STATUS_ERR);
         response.append(b"sysd: mount unavailable\n");
-        return;
+        return !matches!(raw, abi::EBADF | abi::EPIPE);
     }
     response.set_len(count);
+    true
 }
 
 #[cfg(test)]
@@ -224,9 +387,9 @@ mod tests {
     #[test]
     fn resolves_longest_mount_prefix_with_path_boundaries() {
         let mut mounts = MountTable::new();
-        assert!(mounts.mount(b"/sd", 10));
-        assert!(mounts.mount(b"/dev/fb1", 20));
-        assert!(mounts.mount(b"/sd/sub", 30));
+        assert_eq!(mounts.mount(b"/sd", 10), Ok(None));
+        assert_eq!(mounts.mount(b"/dev/fb1", 20), Ok(None));
+        assert_eq!(mounts.mount(b"/sd/sub", 30), Ok(None));
 
         assert_eq!(mounts.resolve(b"/sd"), Some((10, b"/".as_slice())));
         assert_eq!(mounts.resolve(b"/sd/"), Some((10, b"/".as_slice())));
@@ -246,19 +409,76 @@ mod tests {
     }
 
     #[test]
-    fn mount_rejects_invalid_and_remounts_in_place() {
+    fn mount_rejects_invalid_remounts_in_place_and_unmounts() {
         let mut mounts = MountTable::new();
-        assert!(!mounts.mount(b"/", 1));
-        assert!(!mounts.mount(b"sd", 1));
-        assert!(!mounts.mount(b"/sd", 0));
+        assert_eq!(mounts.mount(b"/", 1), Err(()));
+        assert_eq!(mounts.mount(b"sd", 1), Err(()));
+        assert_eq!(mounts.mount(b"/sd", 0), Err(()));
 
-        assert!(mounts.mount(b"/sd", 1));
-        assert!(mounts.mount(b"/sd/", 2));
+        assert_eq!(mounts.mount(b"/sd", 1), Ok(None));
+        assert_eq!(mounts.mount(b"/sd/", 2), Ok(Some(1)));
         assert_eq!(mounts.resolve(b"/sd"), Some((2, b"/".as_slice())));
-        assert!(mounts.mount(b"/a", 3));
-        assert!(mounts.mount(b"/b", 4));
-        assert!(mounts.mount(b"/c", 5));
-        assert!(!mounts.mount(b"/d", 6));
+        for i in 0..(MAX_MOUNTS - 1) {
+            let name = [b'/', b'a' + i as u8];
+            assert_eq!(mounts.mount(&name, 10 + i as u32), Ok(None));
+        }
+        // Full table rejects new mount, but still allows in-place remount and unmount.
+        assert_eq!(mounts.mount(b"/overflow", 99), Err(()));
+        assert_eq!(mounts.mount(b"/sd", 3), Ok(Some(2)));
+        assert_eq!(mounts.unmount(b"/sd"), Some(3));
+        assert_eq!(mounts.unmount(b"/sd"), None);
+        assert_eq!(mounts.mount(b"/overflow", 99), Ok(None));
+        assert!(mounts.remove_endpoint(99));
+        assert_eq!(mounts.resolve(b"/overflow"), None);
+    }
+
+    #[test]
+    fn dynamic_prefix_validation_protects_core_trees() {
+        assert!(is_valid_dynamic_prefix(b"/dev/ram0"));
+        assert!(is_valid_dynamic_prefix(b"/mnt/usb/"));
+        assert!(is_valid_dynamic_prefix(b"/sd"));
+        assert!(!is_valid_dynamic_prefix(b"/"));
+        assert!(!is_valid_dynamic_prefix(b"/proc"));
+        assert!(!is_valid_dynamic_prefix(b"/proc/foo"));
+        assert!(!is_valid_dynamic_prefix(b"/sys"));
+        assert!(!is_valid_dynamic_prefix(b"/sys/bar"));
+        assert!(!is_valid_dynamic_prefix(b"/dev"));
+        assert!(!is_valid_dynamic_prefix(b"/dev//foo"));
+        assert!(!is_valid_dynamic_prefix(b"/dev/../foo"));
+        assert!(!is_valid_dynamic_prefix(b"/dev/bad space"));
+    }
+
+    #[test]
+    fn list_dir_merges_static_and_deduplicated_dynamic_children() {
+        let mut mounts = MountTable::new();
+        mounts.mount(b"/sd", 1).unwrap();
+        mounts.mount(b"/dev/ram0", 2).unwrap();
+        mounts.mount(b"/dev/zero", 3).unwrap(); // overlaps static `/dev/zero`
+        mounts.mount(b"/mnt/a", 4).unwrap();
+        mounts.mount(b"/mnt/b", 5).unwrap();
+
+        assert!(mounts.has_descendant(b"/mnt"));
+        assert!(!mounts.has_descendant(b"/nope"));
+
+        let mut resp = Buffer::new();
+        let dev_static: &[&[u8]] = &[b"zero"];
+        list_dir(dev_static, b"/dev", &mounts, 0, &mut resp);
+        assert_eq!(resp.as_slice(), b"\x00\x01\x00\x00\x00\x01zero");
+        resp.clear();
+        list_dir(dev_static, b"/dev", &mounts, 1, &mut resp);
+        assert_eq!(resp.as_slice(), b"\x00\x02\x00\x00\x00\x01ram0");
+        resp.clear();
+        list_dir(dev_static, b"/dev", &mounts, 2, &mut resp);
+        assert_eq!(resp.as_slice(), &[fs_abi::STATUS_OK]);
+
+        // Root synthesizes `/mnt` once even with two mounts underneath.
+        let root_static: &[&[u8]] = &[b"dev", b"proc", b"sd", b"sys"];
+        resp.clear();
+        list_dir(root_static, b"/", &mounts, 4, &mut resp);
+        assert_eq!(resp.as_slice(), b"\x00\x05\x00\x00\x00\x01mnt");
+        resp.clear();
+        list_dir(root_static, b"/", &mounts, 5, &mut resp);
+        assert_eq!(resp.as_slice(), &[fs_abi::STATUS_OK]);
     }
 
     #[test]

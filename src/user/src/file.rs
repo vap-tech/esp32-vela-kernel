@@ -3,11 +3,92 @@ use crate::{Buffer, arena::Arena, sys};
 use vela_abi::{fs, syscall as abi};
 
 pub use vela_abi::fs::{
-    DIR_HEADER, KIND_DIR, KIND_FILE, OP_LIST, OP_READ, OP_READ_BULK, OP_STAT, OP_WRITE, STATUS_ERR,
-    STATUS_NOENT, STATUS_OK,
+    DIR_HEADER, KIND_DIR, KIND_FILE, OP_LIST, OP_MOUNT, OP_READ, OP_READ_BULK, OP_STAT, OP_UNMOUNT,
+    OP_WRITE, STATUS_ERR, STATUS_NOENT, STATUS_OK,
 };
 
 const BULK_CHUNK_MAX: usize = 64 * 1024;
+
+/// Mount a service endpoint (for which the caller holds `GRANT | SEND`) at `prefix`
+/// in `sysd`. Requires `CAP_ADMIN` on `vfs_handle`.
+pub fn fs_mount(
+    vfs_handle: u32,
+    prefix: &[u8],
+    endpoint_handle: u32,
+    response: &mut Buffer,
+) -> Result<(), u8> {
+    response.clear();
+    if prefix.len() < 2
+        || prefix.len() > abi::IPC_BYTES - fs::MOUNT_HEADER
+        || !prefix.starts_with(b"/")
+        || endpoint_handle == 0
+    {
+        response.push(STATUS_ERR);
+        response.append(b"invalid mount request\n");
+        return Err(STATUS_ERR);
+    }
+    let mut request = Buffer::new();
+    request.push(OP_MOUNT);
+    request.append(prefix);
+    let desc = abi::IpcCapCall {
+        req_ptr: request.ptr() as u32,
+        req_len: request.len() as u32,
+        reply_ptr: response.mut_ptr() as u32,
+        reply_cap: abi::IPC_BYTES as u32,
+        timeout: 500,
+        cap_handle: endpoint_handle,
+        cap_rights: abi::CAP_SEND,
+    };
+    let count = sys::ipc_call_cap(vfs_handle, &desc) as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.push(STATUS_ERR);
+        response.append(b"mount service unavailable\n");
+        return Err(STATUS_ERR);
+    }
+    response.set_len(count);
+    let status = response.get(0);
+    if status != STATUS_OK {
+        return Err(status);
+    }
+    Ok(())
+}
+
+/// Unmount `prefix` in `sysd`. Requires `CAP_ADMIN` on `vfs_handle`.
+pub fn fs_unmount(vfs_handle: u32, prefix: &[u8], response: &mut Buffer) -> Result<(), u8> {
+    response.clear();
+    if prefix.len() < 2
+        || prefix.len() > abi::IPC_BYTES - fs::MOUNT_HEADER
+        || !prefix.starts_with(b"/")
+    {
+        response.push(STATUS_ERR);
+        response.append(b"invalid mount path\n");
+        return Err(STATUS_ERR);
+    }
+    let mut request = Buffer::new();
+    request.push(OP_UNMOUNT);
+    request.append(prefix);
+    let count = sys::call6(
+        abi::IPC_CALL,
+        vfs_handle,
+        request.ptr() as u32,
+        request.len() as u32,
+        response.mut_ptr() as u32,
+        abi::IPC_BYTES as u32,
+        500,
+    )
+    .0 as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.push(STATUS_ERR);
+        response.append(b"mount service unavailable\n");
+        return Err(STATUS_ERR);
+    }
+    response.set_len(count);
+    let status = response.get(0);
+    if status != STATUS_OK {
+        return Err(status);
+    }
+    Ok(())
+}
 
 /// Query `(size, kind)` for `path` without printing diagnostics.
 pub fn fs_stat_raw(handle: u32, path: &[u8], response: &mut Buffer) -> Result<(u32, u8), u8> {

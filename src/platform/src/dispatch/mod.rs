@@ -51,6 +51,8 @@ impl Runtime {
             syscall::IPC_CALL => self.sys_ipc_call(current, args, switch),
             syscall::IPC_CALL_BULK => self.sys_ipc_call_bulk(current, args, switch),
             syscall::IPC_BULK_IO => self.sys_ipc_bulk_io(current, args, frame),
+            syscall::IPC_CALL_CAP => self.sys_ipc_call_cap(current, args, switch),
+            syscall::IPC_ACCEPT_CAP => self.sys_ipc_accept_cap(current, args, frame),
             syscall::IPC_REPLY => self.sys_ipc_reply(current, args, switch),
             syscall::IPC_REPLY_RECV => self.sys_ipc_reply_recv(current, args, frame, switch),
             syscall::CAP_GRANT | syscall::MEM_GRANT => self.sys_cap_or_mem_grant(current, args),

@@ -228,6 +228,51 @@ impl<'a> Image<'a> {
     }
 }
 
+/// Cover a PIE segment `[vaddr .. vaddr + size)` with up to 6 contiguous,
+/// naturally aligned power-of-two NAPOT regions (`>= 128 B` each).
+/// Handles segments whose `.data + .bss` exceeds their start-address alignment
+/// (e.g. `.data` at `0x1000` with a 4 KiB `.bss` -> `[0x1000, 4K]` + `[0x2000, 128B]`).
+pub fn tile_pie_segment(vaddr: usize, size: usize) -> Result<([Region; 6], usize), Error> {
+    if size == 0 || (vaddr & 127) != 0 {
+        return Err(Error::Segment);
+    }
+    let mut out = [Region { base: 0, size: 0 }; 6];
+    let mut count = 0usize;
+    let mut cur = vaddr;
+    let target = vaddr.checked_add(size).ok_or(Error::Bounds)?;
+    while cur < target {
+        if count >= out.len() {
+            return Err(Error::Segment);
+        }
+        let rem = target - cur;
+        let align_limit = if cur == 0 {
+            usize::MAX
+        } else {
+            1usize << cur.trailing_zeros()
+        };
+        if align_limit < 128 {
+            return Err(Error::Segment);
+        }
+        let need = rem
+            .max(128)
+            .checked_next_power_of_two()
+            .ok_or(Error::Bounds)?;
+        let chunk = if need <= align_limit {
+            need
+        } else {
+            align_limit
+        };
+        let next = cur.checked_add(chunk).ok_or(Error::Bounds)?;
+        out[count] = Region {
+            base: cur,
+            size: chunk,
+        };
+        count += 1;
+        cur = next;
+    }
+    Ok((out, count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +413,51 @@ mod tests {
             b[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             assert!(matches!(Image::parse(&b), Err(e) if e == error));
         }
+    }
+
+    #[test]
+    fn tiles_pie_segments_into_minimal_napot_regions() {
+        // Text at vaddr=0 fits in a single NAPOT slot.
+        let (r, n) = tile_pie_segment(0, 0x8d8).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            r[0],
+            Region {
+                base: 0,
+                size: 0x1000
+            }
+        );
+
+        // Data+BSS at 0x1000 exceeding 4 KiB splits into 4 KiB + 128 B.
+        let (r, n) = tile_pie_segment(0x1000, 0x1048).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            r[0],
+            Region {
+                base: 0x1000,
+                size: 0x1000
+            }
+        );
+        assert_eq!(
+            r[1],
+            Region {
+                base: 0x2000,
+                size: 0x80
+            }
+        );
+
+        // Large 64 KiB + 72 B BSS at 0x1000 fits in 5 NAPOT slots.
+        let (r, n) = tile_pie_segment(0x1000, 0x10048).unwrap();
+        assert_eq!(n, 5);
+        for slot in &r[..n] {
+            assert!(slot.size >= 128 && slot.size.is_power_of_two());
+            assert_eq!(slot.base % slot.size, 0);
+        }
+        assert_eq!(r[0].base, 0x1000);
+        assert!(r[n - 1].base + r[n - 1].size >= 0x11048);
+
+        // Unaligned vaddr or zero size rejected.
+        assert_eq!(tile_pie_segment(0x40, 0x100), Err(Error::Segment));
+        assert_eq!(tile_pie_segment(0, 0), Err(Error::Segment));
     }
 }

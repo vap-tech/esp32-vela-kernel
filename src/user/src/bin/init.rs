@@ -45,7 +45,7 @@ fn load_and_run(caps: Caps, path: &[u8], arg: &[u8]) -> Result<(), ()> {
         caps: [
             SpawnCap {
                 handle: caps.vfs,
-                rights: abi::CAP_SEND | abi::CAP_PASS_ON_SPAWN,
+                rights: abi::CAP_SEND | abi::CAP_ADMIN | abi::CAP_PASS_ON_SPAWN,
             },
             SpawnCap {
                 handle: caps.input,
@@ -118,7 +118,7 @@ fn main(vfs: u32, input: u32, spawn: u32, display: u32, _a4: u32, _a5: u32) -> !
                 sys::write(b" -- prepare media with /bin utilities (shell.elf, ls.elf, cat.elf)\n");
                 alerted = true;
             }
-            sys::sleep_ticks(200);
+            sys::sleep_ticks(150);
         }
     }
 }

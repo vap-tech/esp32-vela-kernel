@@ -1,5 +1,5 @@
 //! Unified userspace file-service IPC wire format shared by `sysd`, `ext4fs`,
-//! future `/dev/*` drivers, and clients (`shell`, `cat`, `ls`, `init`).
+//! dynamically mounted `/dev/*` drivers, and clients (`shell`, `cat`, `ls`, `init`).
 //!
 //! All requests carry a leading operation byte:
 //! - `OP_READ`:      `[0, offset: u32 LE, path..]` -> `[STATUS_OK, bytes..]` (empty = EOF)
@@ -10,6 +10,10 @@
 //! - `OP_STAT`:      `[3, path..]` -> `[STATUS_OK, size: u32 LE, kind: u8]`
 //! - `OP_READ_BULK`: `[4, offset: u32 LE, max_len: u32 LE, path..]` via `IPC_CALL_BULK`
 //!                   (`IPC_BULK_WRITE`) -> `[STATUS_OK, bytes_read: u32 LE]`
+//! - `OP_MOUNT`:     `[5, prefix..]` via `IPC_CALL_CAP` attaching `(endpoint, CAP_SEND)`
+//!                   (requires `CAP_ADMIN` on the `sysd` VFS handle) -> `[STATUS_OK]`
+//! - `OP_UNMOUNT`:   `[6, prefix..]` via `IPC_CALL`
+//!                   (requires `CAP_ADMIN` on the `sysd` VFS handle) -> `[STATUS_OK]`
 //!
 //! Any reply with `status != STATUS_OK` carries a human-readable diagnostic in `reply[1..]`.
 
@@ -20,6 +24,8 @@ pub const OP_LIST: u8 = 1;
 pub const OP_WRITE: u8 = 2;
 pub const OP_STAT: u8 = 3;
 pub const OP_READ_BULK: u8 = 4;
+pub const OP_MOUNT: u8 = 5;
+pub const OP_UNMOUNT: u8 = 6;
 
 /// Reply status codes.
 pub const STATUS_OK: u8 = 0;
@@ -50,6 +56,9 @@ pub const BULK_READ_HEADER: usize = 9;
 
 /// Byte length of a successful `OP_READ_BULK` reply: `[status: u8, bytes_read: u32 LE]`.
 pub const BULK_READ_REPLY_BYTES: usize = 5;
+
+/// Header bytes for `OP_MOUNT` / `OP_UNMOUNT` requests: `[op: u8]`.
+pub const MOUNT_HEADER: usize = 1;
 
 /// Maximum path bytes accepted in `OP_READ` and `OP_LIST` requests.
 pub const MAX_PATH: usize = IPC_BYTES - REQ_HEADER;

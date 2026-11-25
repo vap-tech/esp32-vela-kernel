@@ -76,3 +76,9 @@ name = "vela-sdexport"
 path = "tools/sdexport.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-ramdev"
+path = "tools/ramdev.rs"
+test = false
+bench = false

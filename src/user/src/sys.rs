@@ -79,8 +79,50 @@ pub fn irq_ack(handle: u32) -> u32 {
     call(abi::IRQ_ACK, handle, 0, 0, 0)
 }
 
+pub fn endpoint_create() -> Result<u32, i32> {
+    let rc = call(abi::ENDPOINT_CREATE, 0, 0, 0, 0) as i32;
+    if rc <= 0 { Err(rc) } else { Ok(rc as u32) }
+}
+
+pub fn endpoint_close(handle: u32) -> i32 {
+    call(abi::ENDPOINT_CLOSE, handle, 0, 0, 0) as i32
+}
+
 pub fn ipc_call_bulk(endpoint: u32, desc: &abi::IpcBulkCall) -> i32 {
     call(abi::IPC_CALL_BULK, endpoint, desc as *const _ as u32, 0, 0) as i32
+}
+
+pub fn ipc_call_cap(endpoint: u32, desc: &abi::IpcCapCall) -> i32 {
+    call(abi::IPC_CALL_CAP, endpoint, desc as *const _ as u32, 0, 0) as i32
+}
+
+/// Query `(caller_rights, has_attached_cap)` for an in-flight RPC call without
+/// allocating a capability slot.
+pub fn ipc_call_rights(token: u32) -> Result<(u32, bool), i32> {
+    let (rights, has_cap) = call6(
+        abi::IPC_ACCEPT_CAP,
+        token,
+        abi::IPC_ACCEPT_CAP_QUERY,
+        0,
+        0,
+        0,
+        0,
+    );
+    if (rights as i32) < 0 {
+        Err(rights as i32)
+    } else {
+        Ok((rights, has_cap != 0))
+    }
+}
+
+/// Accept the capability attached to `token`, returning `(installed_handle, caller_rights)`.
+pub fn ipc_accept_cap(token: u32) -> Result<(u32, u32), i32> {
+    let (handle, rights) = call6(abi::IPC_ACCEPT_CAP, token, 0, 0, 0, 0, 0);
+    if (handle as i32) <= 0 {
+        Err(handle as i32)
+    } else {
+        Ok((handle, rights))
+    }
 }
 
 pub fn ipc_bulk_write(token: u32, client_offset: usize, src: &[u8]) -> Result<usize, i32> {

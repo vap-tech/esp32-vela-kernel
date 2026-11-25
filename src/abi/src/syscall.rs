@@ -33,9 +33,11 @@ pub const DISPLAY_FLAG_SD_EXPORT: u32 = 2;
 pub const DISPLAY_FLAG_SD_EXPORT_RW: u32 = 4;
 pub const STATS_DISPLAY_BYTES: usize = 4;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
+pub const EBADF: u32 = (-9i32) as u32;
 pub const EFAULT: u32 = (-14i32) as u32;
 pub const EBUSY: u32 = (-16i32) as u32;
 pub const EINVAL: u32 = (-22i32) as u32;
+pub const EPIPE: u32 = (-32i32) as u32;
 pub const ENOSYS: u32 = (-38i32) as u32;
 pub const ETIMEDOUT: u32 = (-110i32) as u32;
 
@@ -73,6 +75,8 @@ pub const CAP_WAIT: u32 = 64;
 pub const CAP_ACK: u32 = 128;
 pub const CAP_CONTROL: u32 = 256;
 pub const CAP_PASS_ON_SPAWN: u32 = 512;
+/// Unforgeable administrative privilege on a service endpoint (e.g. `sysd` mount/unmount).
+pub const CAP_ADMIN: u32 = 1024;
 
 pub const IPC_CALL: u32 = 20; // a0=endpoint handle (SEND), a1=req, a2=len, a3=reply buf, a4=cap, a5=timeout ticks
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
@@ -215,4 +219,29 @@ pub struct IpcBulkCall {
     pub bulk_len: u32,
     pub bulk_flags: u32,
     pub forward_token: u32,
+}
+
+/// Synchronous RPC with one attached capability (`a0=endpoint handle (SEND)`,
+/// `a1=pointer to IpcCapCall` -> `a0=reply length`).
+/// No capability slot is allocated in the server unless the server explicitly calls
+/// `IPC_ACCEPT_CAP` with the call's reply token.
+pub const IPC_CALL_CAP: u32 = 51;
+/// Accept a capability attached to an in-flight RPC call or query caller endpoint rights:
+/// - `a0=reply_token`, `a1=0`: installs the attached capability into the server's table ->
+///   `a0=new handle` (or `-ENOENT` if none attached), `a1=caller endpoint rights`.
+/// - `a0=reply_token`, `a1=IPC_ACCEPT_CAP_QUERY`: does not install a capability ->
+///   `a0=caller endpoint rights`, `a1=1 if a capability is attached else 0`.
+pub const IPC_ACCEPT_CAP: u32 = 52;
+pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcCapCall {
+    pub req_ptr: u32,
+    pub req_len: u32,
+    pub reply_ptr: u32,
+    pub reply_cap: u32,
+    pub timeout: u32,
+    pub cap_handle: u32,
+    pub cap_rights: u32,
 }

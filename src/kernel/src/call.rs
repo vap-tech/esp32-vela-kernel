@@ -4,6 +4,7 @@
 //! [`Context`].
 
 use crate::{
+    capability::Capability,
     errno::Errno,
     id::{ProcSlot, ThreadSlot},
     sched::{Scheduler, TASKS},
@@ -27,6 +28,22 @@ pub struct BulkWindow {
     pub flags: u8,
 }
 
+/// Optional per-call metadata carried across an active synchronous RPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallExtra {
+    pub bulk: Option<BulkWindow>,
+    pub caller_rights: u16,
+    pub attached_cap: Option<Capability>,
+}
+
+impl CallExtra {
+    pub const EMPTY: Self = Self {
+        bulk: None,
+        caller_rights: 0,
+        attached_cap: None,
+    };
+}
+
 #[derive(Clone, Copy)]
 pub struct Call {
     generation: u32,
@@ -34,6 +51,8 @@ pub struct Call {
     endpoint: usize,
     server: Option<ThreadSlot>,
     bulk: Option<BulkWindow>,
+    caller_rights: u16,
+    attached_cap: Option<Capability>,
 }
 
 impl Call {
@@ -43,6 +62,8 @@ impl Call {
         endpoint: 0,
         server: None,
         bulk: None,
+        caller_rights: 0,
+        attached_cap: None,
     };
 
     pub fn endpoint(&self) -> usize {
@@ -79,7 +100,7 @@ impl CallTable {
     }
 
     pub fn activate(&mut self, client: ThreadSlot, generation: u32, endpoint: usize) {
-        self.activate_with_bulk(client, generation, endpoint, None);
+        self.activate_extra(client, generation, endpoint, CallExtra::EMPTY);
     }
 
     pub fn activate_with_bulk(
@@ -89,18 +110,66 @@ impl CallTable {
         endpoint: usize,
         bulk: Option<BulkWindow>,
     ) {
+        self.activate_extra(
+            client,
+            generation,
+            endpoint,
+            CallExtra {
+                bulk,
+                ..CallExtra::EMPTY
+            },
+        );
+    }
+
+    pub fn activate_extra(
+        &mut self,
+        client: ThreadSlot,
+        generation: u32,
+        endpoint: usize,
+        extra: CallExtra,
+    ) {
         self.entries[client.index()] = Call {
             generation,
             active: true,
             endpoint,
             server: None,
-            bulk,
+            bulk: extra.bulk,
+            caller_rights: extra.caller_rights,
+            attached_cap: extra.attached_cap,
         };
     }
 
     pub fn deactivate(&mut self, client: ThreadSlot) {
-        self.entries[client.index()].active = false;
-        self.entries[client.index()].bulk = None;
+        let entry = &mut self.entries[client.index()];
+        entry.active = false;
+        entry.bulk = None;
+        entry.caller_rights = 0;
+        entry.attached_cap = None;
+    }
+
+    /// Inspect `(caller_rights, has_attached_cap)` for an active call bound to `server`.
+    pub fn query_meta(&self, token: u32, server: ThreadSlot) -> Result<(u16, bool), Errno> {
+        let (client, bound_server) = self.lookup_for_reply(token)?;
+        if bound_server != server {
+            return Err(Errno::Eperm);
+        }
+        let call = &self.entries[client.index()];
+        Ok((call.caller_rights, call.attached_cap.is_some()))
+    }
+
+    /// Consume the optional capability attached to `token` held by `server`, returning
+    /// `(caller_rights, attached_cap)`.
+    pub fn take_attached_cap(
+        &mut self,
+        token: u32,
+        server: ThreadSlot,
+    ) -> Result<(u16, Option<Capability>), Errno> {
+        let (client, bound_server) = self.lookup_for_reply(token)?;
+        if bound_server != server {
+            return Err(Errno::Eperm);
+        }
+        let call = &mut self.entries[client.index()];
+        Ok((call.caller_rights, call.attached_cap.take()))
     }
 
     fn verify_bulk_live(&self, bulk: BulkWindow) -> Result<BulkWindow, Errno> {
@@ -214,6 +283,8 @@ impl CallTable {
             }
             self.entries[i].active = false;
             self.entries[i].bulk = None;
+            self.entries[i].caller_rights = 0;
+            self.entries[i].attached_cap = None;
             if matches!(scheduler.task(client).wait, Wait::Reply { .. }) {
                 scheduler.wake_with(client, error.to_abi());
             }
@@ -243,6 +314,7 @@ impl CallTable {
 mod tests {
     use super::*;
     use crate::{
+        capability::{ADMIN, Object, SEND},
         id::Ticks,
         task::{Region, State},
     };
@@ -444,6 +516,50 @@ mod tests {
         assert_eq!(
             calls.prepare_bulk_io(tok1, ThreadSlot(2), 0, 16, true),
             Err(Errno::Epipe)
+        );
+    }
+
+    #[test]
+    fn attached_cap_and_caller_rights_are_server_scoped_and_single_use() {
+        let mut calls = CallTable::new();
+        let mut s = scheduler();
+        let (gen0, tok0) = calls.next_token(ThreadSlot(0)).unwrap();
+        let cap = Capability {
+            object: Object::Endpoint {
+                index: 3,
+                generation: 7,
+            },
+            rights: SEND,
+        };
+        calls.activate_extra(
+            ThreadSlot(0),
+            gen0,
+            1,
+            CallExtra {
+                bulk: None,
+                caller_rights: SEND | ADMIN,
+                attached_cap: Some(cap),
+            },
+        );
+        calls.bind_reply(&mut s, tok0, ThreadSlot(1));
+
+        assert_eq!(calls.query_meta(tok0, ThreadSlot(2)), Err(Errno::Eperm));
+        assert_eq!(
+            calls.query_meta(tok0, ThreadSlot(1)),
+            Ok((SEND | ADMIN, true))
+        );
+        assert_eq!(
+            calls.take_attached_cap(tok0, ThreadSlot(1)),
+            Ok((SEND | ADMIN, Some(cap)))
+        );
+        // Single-use: a second take yields None while preserving caller_rights.
+        assert_eq!(
+            calls.query_meta(tok0, ThreadSlot(1)),
+            Ok((SEND | ADMIN, false))
+        );
+        assert_eq!(
+            calls.take_attached_cap(tok0, ThreadSlot(1)),
+            Ok((SEND | ADMIN, None))
         );
     }
 }

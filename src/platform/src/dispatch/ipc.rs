@@ -1,6 +1,7 @@
 use core::fmt::Write;
 use vela_kernel::{
-    call::{BULK_READ, BULK_WRITE, BulkWindow},
+    call::{BULK_READ, BULK_WRITE, BulkWindow, CallExtra},
+    capability::Capability,
     errno::Errno,
     id::{Handle, Pid, ProcSlot},
     ipc::{self, Message},
@@ -28,6 +29,7 @@ impl Runtime {
         capacity: usize,
         timeout: u32,
         bulk: Option<BulkWindow>,
+        attached_cap: Option<Capability>,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
         let thread = self.scheduler.current;
@@ -41,7 +43,7 @@ impl Runtime {
         if !self.readable(req_ptr, length) || !self.writable(reply_ptr, capacity) {
             return Err(Errno::Efault);
         }
-        let (ep, server) = lifecycle::find_rpc_server(
+        let (ep, server, caller_rights) = lifecycle::find_rpc_server_with_rights(
             &self.processes,
             &self.ipc,
             &self.scheduler,
@@ -57,12 +59,17 @@ impl Runtime {
             }
             w
         });
+        let extra = CallExtra {
+            bulk,
+            caller_rights,
+            attached_cap,
+        };
         let until = if timeout == 0 {
             None
         } else {
             Some(self.scheduler.uptime().saturating_add(u64::from(timeout)))
         };
-        if let Some(woken_tid) = lifecycle::try_direct_ipc_call_bulk(
+        if let Some(woken_tid) = lifecycle::try_direct_ipc_call_extra(
             &self.processes,
             &self.ipc,
             &mut self.calls,
@@ -76,7 +83,7 @@ impl Runtime {
             reply_ptr,
             capacity,
             until,
-            bulk,
+            extra,
             copy_between_users,
         ) {
             self.note_woken_receiver(Some(woken_tid));
@@ -87,7 +94,7 @@ impl Runtime {
         message.length = length;
         message.reply_token = token;
         copy_from_user(self.memory(), req_ptr, &mut message.data[..length])?;
-        let woken = lifecycle::commit_ipc_call_bulk(
+        let woken = lifecycle::commit_ipc_call_extra(
             &self.processes,
             &mut self.ipc,
             &mut self.calls,
@@ -99,7 +106,7 @@ impl Runtime {
             reply_ptr,
             capacity,
             until,
-            bulk,
+            extra,
             copy_to_user_within,
         )?;
         self.note_woken_receiver(woken);
@@ -121,6 +128,7 @@ impl Runtime {
             args.a3 as usize,
             args.a4 as usize,
             args.a5,
+            None,
             None,
             switch,
         )
@@ -190,6 +198,7 @@ impl Runtime {
             reply_cap,
             timeout,
             bulk,
+            None,
             switch,
         )
     }
@@ -239,6 +248,80 @@ impl Runtime {
             )?;
         }
         Ok(len as u32)
+    }
+
+    pub(super) fn sys_ipc_call_cap(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        let mut raw = [0u8; core::mem::size_of::<syscall::IpcCapCall>()];
+        copy_from_user(self.memory(), args.a1 as usize, &mut raw)?;
+        let word =
+            |off: usize| u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+        let req_ptr = word(0) as usize;
+        let req_len = word(4) as usize;
+        let reply_ptr = word(8) as usize;
+        let reply_cap = word(12) as usize;
+        let timeout = word(16);
+        let cap_handle = word(20);
+        let cap_rights = word(24);
+        let attached_cap = if cap_handle == 0 {
+            None
+        } else {
+            let rights = u16::try_from(cap_rights).map_err(|_| Errno::Einval)?;
+            Some(lifecycle::prepare_ipc_cap(
+                &self.processes,
+                &self.ipc,
+                current,
+                Handle(cap_handle),
+                rights,
+            )?)
+        };
+        self.do_ipc_call(
+            current,
+            Handle(args.a0),
+            req_ptr,
+            req_len,
+            reply_ptr,
+            reply_cap,
+            timeout,
+            None,
+            attached_cap,
+            switch,
+        )
+    }
+
+    pub(super) fn sys_ipc_accept_cap(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        frame: &mut arch::TrapFrame,
+    ) -> Result<u32, Errno> {
+        let token = args.a0;
+        let flags = args.a1;
+        let server = self.scheduler.current;
+        match flags {
+            0 => {
+                let (handle, caller_rights) = lifecycle::accept_ipc_cap(
+                    &mut self.processes,
+                    &self.ipc,
+                    &mut self.calls,
+                    current,
+                    server,
+                    token,
+                )?;
+                frame.set_return2(u32::from(caller_rights));
+                Ok(handle.raw())
+            }
+            syscall::IPC_ACCEPT_CAP_QUERY => {
+                let (caller_rights, has_cap) = self.calls.query_meta(token, server)?;
+                frame.set_return2(u32::from(has_cap));
+                Ok(u32::from(caller_rights))
+            }
+            _ => Err(Errno::Einval),
+        }
     }
 
     pub(super) fn sys_ipc_reply(

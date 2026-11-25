@@ -3,8 +3,8 @@
 
 use vela_abi::syscall::{self as abi, SpawnCap, SpawnCaps};
 use vela_user::{
-    Buffer,
-    file::{STATUS_NOENT, fs_load_arena, fs_write},
+    Buffer, TextBuf,
+    file::{STATUS_NOENT, fs_load_arena, fs_unmount, fs_write},
     sys,
     term::EscapeFilter,
 };
@@ -22,7 +22,13 @@ struct Caps {
 }
 
 #[inline(never)]
-fn run_program(caps: Caps, path: &[u8], argument: &[u8], implicit_cmd: bool) {
+fn spawn_program(
+    caps: Caps,
+    path: &[u8],
+    argument: &[u8],
+    implicit_cmd: bool,
+    background_driver: bool,
+) {
     if argument.len() > abi::SPAWN_ARG_MAX {
         sys::write(b"run: argument too long\n");
         return;
@@ -44,7 +50,11 @@ fn run_program(caps: Caps, path: &[u8], argument: &[u8], implicit_cmd: bool) {
     spawn_caps.count = 1;
     spawn_caps.caps[0] = SpawnCap {
         handle: caps.vfs,
-        rights: abi::CAP_SEND,
+        rights: if background_driver {
+            abi::CAP_SEND | abi::CAP_ADMIN
+        } else {
+            abi::CAP_SEND
+        },
     };
     if path == b"/sd/bin/sdexport.elf" && caps.display != 0 {
         spawn_caps.count = 2;
@@ -53,8 +63,13 @@ fn run_program(caps: Caps, path: &[u8], argument: &[u8], implicit_cmd: bool) {
             rights: abi::CAP_CONTROL,
         };
     }
+    let syscall_num = if background_driver {
+        abi::SPAWN_IMAGE
+    } else {
+        abi::SPAWN_IMAGE_WAIT
+    };
     let (pid, _) = sys::call6(
-        abi::SPAWN_IMAGE_WAIT,
+        syscall_num,
         caps.spawn,
         arena.base() as u32,
         len as u32,
@@ -62,10 +77,16 @@ fn run_program(caps: Caps, path: &[u8], argument: &[u8], implicit_cmd: bool) {
         argument.len() as u32,
         &raw const spawn_caps as u32,
     );
+    let _ = arena.release();
     if (pid as i32) < 0 {
         sys::write(b"run: ELF rejected or process slots exhausted\n");
+    } else if background_driver {
+        let mut out = TextBuf::<64>::new();
+        out.append(b"started pid=");
+        out.decimal(pid);
+        out.push(b'\n');
+        sys::write(out.as_slice());
     }
-    let _ = arena.release();
 }
 
 #[inline(never)]
@@ -89,6 +110,18 @@ fn echo_command(rest: &[u8], vfs: u32) {
     }
 }
 
+#[inline(never)]
+fn umount_command(prefix: &[u8], vfs: u32) {
+    if !prefix.starts_with(b"/") {
+        sys::write(b"usage: umount </mount/prefix>\n");
+        return;
+    }
+    let mut response = Buffer::new();
+    if fs_unmount(vfs, prefix, &mut response).is_err() && response.len() > 1 {
+        sys::write(&response.as_slice()[1..]);
+    }
+}
+
 fn is_tool_name(name: &[u8]) -> bool {
     !name.is_empty()
         && name.len() <= 32
@@ -109,17 +142,21 @@ fn command(line: &Buffer, caps: Caps) {
     match cmd {
         b"help" => {
             sys::write(
-                b"\x1b[96mhelp\x1b[0m | \x1b[96mls\x1b[0m [path] | \x1b[96mcat\x1b[0m <path> | \x1b[96mecho\x1b[0m <val> [> <path>] | \x1b[96mrun\x1b[0m <elf> [arg] | \x1b[96msdexport\x1b[0m [s|rw] | \x1b[96mexit\x1b[0m\nPaths: /proc  /sys (power, freq, display, sentinel/*)  /dev (i2c-*, kbdled, random)  /sd\n",
+                b"\x1b[96mhelp\x1b[0m | \x1b[96mls\x1b[0m [path] | \x1b[96mcat\x1b[0m <path> | \x1b[96mecho\x1b[0m <val> [> <path>] | \x1b[96mrun\x1b[0m <elf> [arg] | \x1b[96mstart\x1b[0m <drv.elf> [arg] | \x1b[96mumount\x1b[0m <path> | \x1b[96msdexport\x1b[0m [s|rw] | \x1b[96mexit\x1b[0m\nPaths: /proc (mounts, tasks, ...)  /sys  /dev  /sd\n",
             );
         }
         b"echo" => echo_command(arg, caps.vfs),
+        b"umount" => umount_command(arg, caps.vfs),
         b"exit" => sys::process_exit(),
-        b"run" => {
+        b"run" | b"start" => {
+            let background = cmd == b"start";
             let mut parts = arg.splitn(2, |&b| b == b' ');
             let path = parts.next().unwrap_or_default();
             let prog_arg = parts.next().unwrap_or_default().trim_ascii();
             if path.starts_with(b"/") {
-                run_program(caps, path, prog_arg, false);
+                spawn_program(caps, path, prog_arg, false, background);
+            } else if background {
+                sys::write(b"usage: start </path/to/driver.elf> [arg]\n");
             } else {
                 sys::write(b"usage: run </path/to/app.elf> [arg]\n");
             }
@@ -129,7 +166,7 @@ fn command(line: &Buffer, caps: Caps) {
             path.append(b"/sd/bin/");
             path.append(cmd);
             path.append(b".elf");
-            run_program(caps, path.as_slice(), arg, true);
+            spawn_program(caps, path.as_slice(), arg, true, false);
         }
         _ => sys::write(b"\x1b[31munknown command (try help)\x1b[0m\n"),
     }

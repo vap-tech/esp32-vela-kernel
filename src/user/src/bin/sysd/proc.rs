@@ -9,6 +9,7 @@ pub const ENTRIES: &[&[u8]] = &[
     b"interrupts",
     b"cpuinfo",
     b"tasks",
+    b"mounts",
     b"streams",
     b"sdcard",
     b"i2c",
