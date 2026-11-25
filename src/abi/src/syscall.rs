@@ -241,6 +241,8 @@ pub const FBCON_SUPERVISE: u32 = 53;
 pub const KBD_SUPERVISE: u32 = 54;
 /// Join the boot storage service or start its replacement and wait for exit.
 pub const EXT4_SUPERVISE: u32 = 55;
+/// Wait for sysd and restart it on the retained namespace endpoint.
+pub const SYSD_SUPERVISE: u32 = 56;
 pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
 
 #[repr(C)]

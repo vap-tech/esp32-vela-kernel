@@ -401,6 +401,8 @@ The trusted display driver powers LDO2 at 1.8 V and the shared MSPI PHY, verifie
 32 MiB AP HEX PSRAM density, and switches the link to 80 MHz HEX x16 DDR (`SPLL/6`).
 All 32 MiB (`0x88000000..0x8a000000`, `pages 0..512`) are managed as a unified
 64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM`).
+If `sysd` exits, pending namespace calls fail and its request queue is discarded. The kernel reserves the namespace endpoint until `init` starts its replacement. Existing client handles then reach the new `sysd` with their original rights, and the live SD service supplies `/sd`. Dynamic mounts need fresh registration.
+
 If `ext4fs` exits, outstanding SD requests can fail. After 100 ticks `init` starts a fresh instance, which registers a new endpoint at the reserved `/sd` mount in the running `sysd`. Clients can issue new requests using their existing namespace handles. Interrupted writes are not replayed.
 
 A separate `init` thread supervises the Tab5 keyboard. After driver exit it waits 100 ticks, then starts a fresh instance with an Ext.Port1 I²C capability, a new GPIO50 event binding, and send access to the existing shell input endpoint.

@@ -63,17 +63,11 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
     let mut directory: Option<(Buffer, Directory)> = None;
     let mut request = Buffer::new();
     let mut response = Buffer::new();
-    let endpoint = if mount_vfs != 0 {
-        let Ok(ep) = sys::endpoint_create() else {
-            sys::exit()
-        };
-        if vela_user::file::fs_mount(mount_vfs, b"/sd", ep, &mut response).is_err() {
-            sys::exit();
-        }
-        ep
-    } else {
-        endpoint
-    };
+    if mount_vfs != 0
+        && vela_user::file::fs_mount(mount_vfs, b"/sd", endpoint, &mut response).is_err()
+    {
+        sys::exit();
+    }
     let mut pending = 0;
     loop {
         let ok = if pending == 0 {

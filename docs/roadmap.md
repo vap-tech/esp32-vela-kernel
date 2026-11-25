@@ -21,7 +21,7 @@
 
 ### 4. Живучесть микроядра (реальный супервизор и восстановление драйверов)
 Главный смысл микроядра — **падение драйвера не роняет ОС**.
-`init` перезапускает shell и драйверы `kbd`, `fbcon`, `ext4fs`. После выхода `ext4fs` новый экземпляр регистрирует свой endpoint в работающем `sysd` по пути `/sd`. Остаётся восстановление самого `sysd` и клиентских подключений к нему.
+`init` перезапускает shell и драйверы `kbd`, `fbcon`, `ext4fs`. После выхода `ext4fs` новый экземпляр регистрирует свой endpoint в работающем `sysd` по пути `/sd`. При сбое `sysd` ядро сохраняет endpoint пространства имён. Новый `sysd` подключается к нему и к живому `ext4fs`. Остаётся восстановление динамических монтирований.
 
 Что делает микроядро по-настоящему живучим:
 - `init` держит серверные endpoint'ы или отслеживает смерть **любого** системного сервиса и автоматически его перезапускает;
@@ -68,7 +68,7 @@
 
 ## Next
 
-1. **Service supervision & driver recovery**: `init` now restarts the bundled `fbcon` and `kbd` after exit. Each replacement keyboard instance binds GPIO50 and sends to the existing terminal endpoint. `init` also restarts `ext4fs`, whose new endpoint replaces the reserved `/sd` mount. Extend supervision to `sysd` and reconnect namespace clients.
+1. **Service supervision & driver recovery**: `init` now restarts the bundled `fbcon` and `kbd` after exit. Each replacement keyboard instance binds GPIO50 and sends to the existing terminal endpoint. `init` also restarts `ext4fs`, whose new endpoint replaces the reserved `/sd` mount. A replacement `sysd` serves existing namespace handles and reconnects to the live SD service. Dynamic mount registrations still need recovery.
 2. **Crash diagnostics, stack guards & userland SDK**: add stack guard regions and clear crash reports (process, PC, fault cause) on U-mode faults, and separate a clean application SDK from kernel-adjacent helpers.
 3. **Display wallpapers & graphics**: reuse the retained `vela_boot_and_display_assets/` pipeline for boot/background wallpapers alongside `fbcon`.
 4. **Cache, storage performance & connectivity**: evaluate cached `L1-DCache` mappings with explicit DMA cache maintenance, Flash XIP for larger images, and networking (ESP32-C6 co-processor or USB).

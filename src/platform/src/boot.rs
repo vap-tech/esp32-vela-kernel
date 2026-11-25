@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub(crate) const EXT4FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ext4fs.elf"));
-const SYSD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sysd.elf"));
+pub(crate) const SYSD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sysd.elf"));
 const INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
 pub(crate) const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
@@ -131,6 +131,8 @@ extern "C" fn rust_main() -> ! {
             tickless_armed: false,
             tickless_enter_16m: 0,
             tickless_period_16m: soc::timer::PERIOD_10MS_16M,
+            sysd_pid: None,
+            sd_endpoint: None,
             ext4_pid: None,
             fbcon_pid: None,
             kbd_pid: None,
@@ -157,6 +159,8 @@ extern "C" fn rust_main() -> ! {
         .get(vfs_request, cap::CONTROL)
         .unwrap()
         .object;
+    runtime.ipc.retain_on_exit(vfs_object).unwrap();
+    runtime.sysd_pid = Some(sysd.pid);
     let init_vfs = runtime
         .processes
         .slot_mut(init_proc.slot)
@@ -190,6 +194,15 @@ extern "C" fn rust_main() -> ! {
 
     let fs_request =
         create_endpoint(&mut runtime.ipc, &mut runtime.processes, ext4fs.slot).unwrap();
+    runtime.sd_endpoint = Some(
+        runtime
+            .processes
+            .slot(ext4fs.slot)
+            .capabilities
+            .get(fs_request, cap::CONTROL)
+            .unwrap()
+            .object,
+    );
     let sysd_ext4 = grant(
         &mut runtime.processes,
         ext4fs.slot,
@@ -225,32 +238,6 @@ extern "C" fn rust_main() -> ! {
         cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
     )
     .unwrap();
-    let sysd_caps = &mut runtime.processes.slot_mut(sysd.slot).capabilities;
-    let sysd_i2c_system = sysd_caps
-        .install(Capability {
-            object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_SYSTEM)),
-            rights: cap::READ | cap::WRITE,
-        })
-        .unwrap();
-    let sysd_i2c_ext1 = sysd_caps
-        .install(Capability {
-            object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_EXT1)),
-            rights: cap::READ | cap::WRITE,
-        })
-        .unwrap();
-    let sysd_display = sysd_caps
-        .install(Capability {
-            object: Object::Authority(Authority::Display),
-            rights: cap::CONTROL,
-        })
-        .unwrap();
-    let sysd_sentinel = sysd_caps
-        .install(Capability {
-            object: Object::Authority(Authority::Sentinel),
-            rights: cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL,
-        })
-        .unwrap();
-
     let init_caps = &mut runtime.processes.slot_mut(init_proc.slot).capabilities;
     let supervisor = init_caps
         .install(Capability {
@@ -278,19 +265,7 @@ extern "C" fn rust_main() -> ! {
         .unwrap();
 
     runtime
-        .start_loaded(
-            sysd,
-            [
-                vfs_request.raw(),
-                sysd_ext4.raw(),
-                sysd_i2c_system.raw(),
-                sysd_i2c_ext1.raw(),
-                sysd_display.raw(),
-                sysd_sentinel.raw(),
-            ],
-            0,
-            1,
-        )
+        .start_sysd(sysd, vfs_request, sysd_ext4.raw())
         .unwrap();
     runtime
         .start_loaded(

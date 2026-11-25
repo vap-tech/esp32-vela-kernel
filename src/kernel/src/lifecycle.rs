@@ -1263,7 +1263,7 @@ pub fn terminate_current_thread<C: Context>(
     });
     let closed = ipc.remove_task(process);
     for (i, is_closed) in closed.iter().enumerate() {
-        if *is_closed {
+        if *is_closed && !ipc.is_detached(i) {
             invalidate_object(processes, scheduler, objects[i], None);
         }
     }

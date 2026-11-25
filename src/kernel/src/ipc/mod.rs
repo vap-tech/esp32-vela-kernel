@@ -27,6 +27,7 @@ struct Endpoint {
     queue: [Message; QUEUE_DEPTH],
     head: usize,
     count: usize,
+    persistent: bool,
     stream: bool,
     had_sender: bool,
     eof: bool,
@@ -38,6 +39,7 @@ impl Endpoint {
         queue: [Message::EMPTY; QUEUE_DEPTH],
         head: 0,
         count: 0,
+        persistent: false,
         stream: false,
         had_sender: false,
         eof: false,
@@ -76,7 +78,7 @@ impl Ipc {
         let index = self
             .endpoints
             .iter()
-            .position(|e| e.owner.is_none())
+            .position(|e| e.owner.is_none() && !e.persistent)
             .ok_or(Errno::Enospc)?;
         self.generation = self.generation.checked_add(1).ok_or(Errno::Enospc)?;
         self.endpoints[index] = Endpoint {
@@ -90,6 +92,31 @@ impl Ipc {
             generation: self.generation,
         })
     }
+    /// Reserve this endpoint identity across server exits. Only boot policy calls this.
+    pub fn retain_on_exit(&mut self, object: Object) -> Result<(), Errno> {
+        let index = self.resolve(object)?;
+        self.endpoints[index].persistent = true;
+        Ok(())
+    }
+
+    pub fn is_detached(&self, index: usize) -> bool {
+        self.endpoints[index].persistent && self.endpoints[index].owner.is_none()
+    }
+
+    pub fn reattach(&mut self, object: Object, owner: ProcSlot) -> Result<(), Errno> {
+        let Object::Endpoint { index, generation } = object else {
+            return Err(Errno::Ebadf);
+        };
+        if index >= MAX_ENDPOINTS
+            || !self.is_detached(index)
+            || self.endpoints[index].generation != generation
+        {
+            return Err(Errno::Ebadf);
+        }
+        self.endpoints[index].owner = Some(owner);
+        Ok(())
+    }
+
     pub fn is_stream(&self, ep: usize) -> bool {
         self.endpoints
             .get(ep)
@@ -170,7 +197,16 @@ impl Ipc {
         let mut closed = [false; MAX_ENDPOINTS];
         for (ep, flag) in closed.iter_mut().enumerate() {
             if self.endpoints[ep].owner == Some(task) {
-                self.close(ep);
+                let previous = &self.endpoints[ep];
+                if previous.persistent {
+                    self.endpoints[ep] = Endpoint {
+                        persistent: true,
+                        generation: previous.generation,
+                        ..Endpoint::EMPTY
+                    };
+                } else {
+                    self.close(ep);
+                }
                 *flag = true;
             }
         }
@@ -182,6 +218,23 @@ impl Ipc {
 mod tests {
     use super::*;
     use crate::{id::Pid, task::Region};
+
+    #[test]
+    fn retained_endpoint_drops_pending_messages_and_keeps_its_generation() {
+        let mut ipc = Ipc::new();
+        let object = ipc.create(ProcSlot(1)).unwrap();
+        let ep = ipc.resolve(object).unwrap();
+        ipc.retain_on_exit(object).unwrap();
+        ipc.send(ep, Message::EMPTY).unwrap();
+        assert!(ipc.remove_task(ProcSlot(1))[ep]);
+        assert_eq!(ipc.resolve(object), Err(Errno::Epipe));
+        let other = ipc.create(ProcSlot(1)).unwrap();
+        assert_ne!(ipc.resolve(other).unwrap(), ep);
+        ipc.reattach(object, ProcSlot(3)).unwrap();
+        assert_eq!(ipc.resolve(object), Ok(ep));
+        assert!(ipc.receive(ep, MESSAGE_BYTES).unwrap().is_none());
+        assert!(ipc.reattach(object, ProcSlot(1)).is_err());
+    }
 
     fn make_message(bytes: &[u8], token: u32) -> Message {
         let mut msg = Message::EMPTY;

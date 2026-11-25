@@ -63,6 +63,8 @@ pub struct Runtime {
     /// indexed by `ThreadSlot` and 16-byte aligned in internal L2MEM SRAM.
     pub ext_contexts: [arch::ExtendedContext; TASKS],
     pub processes: Processes,
+    pub sysd_pid: Option<Pid>,
+    pub sd_endpoint: Option<Object>,
     pub ext4_pid: Option<Pid>,
     pub fbcon_pid: Option<Pid>,
     pub kbd_pid: Option<Pid>,
@@ -461,8 +463,12 @@ impl Runtime {
         if self.kbd_pid == Some(reaped.pid) {
             self.kbd_pid = None;
         }
+        if self.sysd_pid == Some(reaped.pid) {
+            self.sysd_pid = None;
+        }
         if self.ext4_pid == Some(reaped.pid) {
             self.ext4_pid = None;
+            self.sd_endpoint = None;
         }
         if self.fbcon_pid == Some(reaped.pid) {
             self.fbcon_pid = None;
@@ -701,6 +707,37 @@ impl Runtime {
             *self.processes.slot_mut(process) = Process::EMPTY;
         }
         result
+    }
+
+    pub fn start_sysd(&mut self, child: LoadedElf, request: Handle, sd: u32) -> Result<Tid, Errno> {
+        use vela_kernel::capability::Authority;
+        let caps = &mut self.processes.slot_mut(child.slot).capabilities;
+        let mut install = |authority, rights| {
+            caps.install(Capability {
+                object: Object::Authority(authority),
+                rights,
+            })
+            .map(|h| h.raw())
+        };
+        let system = install(
+            Authority::I2c(syscall::I2C_BUS_SYSTEM),
+            cap::READ | cap::WRITE,
+        )?;
+        let ext1 = install(
+            Authority::I2c(syscall::I2C_BUS_EXT1),
+            cap::READ | cap::WRITE,
+        )?;
+        let display = install(Authority::Display, cap::CONTROL)?;
+        let sentinel = install(
+            Authority::Sentinel,
+            cap::READ | cap::WRITE | cap::WAIT | cap::CONTROL,
+        )?;
+        self.start_loaded(
+            child,
+            [request.raw(), sd, system, ext1, display, sentinel],
+            0,
+            1,
+        )
     }
 
     pub fn start_loaded(

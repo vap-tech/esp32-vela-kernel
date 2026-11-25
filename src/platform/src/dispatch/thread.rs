@@ -98,6 +98,47 @@ impl Runtime {
             return Err(Errno::Ebadf);
         };
         let storage = args.number == syscall::EXT4_SUPERVISE;
+        if args.number == syscall::SYSD_SUPERVISE {
+            let pid = if let Some(pid) = self.sysd_pid {
+                pid
+            } else {
+                let namespace = self
+                    .processes
+                    .slot(current)
+                    .capabilities
+                    .get(vfs, cap::SEND)?
+                    .object;
+                let (child, _, _) = self.load_elf(crate::boot::SYSD_ELF, false)?;
+                let result = (|| {
+                    let caps = &mut self.processes.slot_mut(child.slot).capabilities;
+                    let receive = caps.install(Capability {
+                        object: namespace,
+                        rights: cap::RECEIVE,
+                    })?;
+                    let sd = match self.sd_endpoint {
+                        Some(object) => caps
+                            .install(Capability {
+                                object,
+                                rights: cap::SEND,
+                            })?
+                            .raw(),
+                        None => 0,
+                    };
+                    self.ipc.reattach(namespace, child.slot)?;
+                    self.start_sysd(child, receive, sd)
+                })();
+                if let Err(error) = result {
+                    self.ipc.remove_task(child.slot);
+                    self.abort_loaded(child);
+                    return Err(error);
+                }
+                self.sysd_pid = Some(child.pid);
+                child.pid
+            };
+            self.scheduler.block(Wait::ProcessExit { pid });
+            *switch = true;
+            return Ok(0);
+        }
         let existing = if storage {
             self.ext4_pid
         } else {
@@ -125,11 +166,24 @@ impl Runtime {
                     object: Object::Authority(Authority::SdSystemPartition),
                     rights: cap::READ | cap::WRITE,
                 })?;
-                self.start_loaded(child, [0, disk.raw(), mount.raw(), 0, 0, 0], 1, 1)
+                let ep =
+                    lifecycle::create_endpoint(&mut self.ipc, &mut self.processes, child.slot)?;
+                let object = self
+                    .processes
+                    .slot(child.slot)
+                    .capabilities
+                    .get(ep, cap::CONTROL)?
+                    .object;
+                self.start_loaded(child, [ep.raw(), disk.raw(), mount.raw(), 0, 0, 0], 1, 1)?;
+                Ok(object)
             })();
-            if let Err(error) = result {
-                self.abort_loaded(child);
-                return Err(error);
+            match result {
+                Ok(object) => self.sd_endpoint = Some(object),
+                Err(error) => {
+                    self.ipc.remove_task(child.slot);
+                    self.abort_loaded(child);
+                    return Err(error);
+                }
             }
             self.ext4_pid = Some(child.pid);
             child.pid
