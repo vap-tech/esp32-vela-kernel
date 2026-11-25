@@ -234,6 +234,8 @@ pub const IPC_CALL_CAP: u32 = 51;
 /// - `a0=reply_token`, `a1=IPC_ACCEPT_CAP_QUERY`: does not install a capability ->
 ///   `a0=caller endpoint rights`, `a1=1 if a capability is attached else 0`.
 pub const IPC_ACCEPT_CAP: u32 = 52;
+/// Start the bundled framebuffer console or join the existing instance; wait for exit.
+pub const FBCON_SUPERVISE: u32 = 53;
 pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
 
 #[repr(C)]

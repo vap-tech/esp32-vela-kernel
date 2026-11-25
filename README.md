@@ -401,6 +401,8 @@ The trusted display driver powers LDO2 at 1.8 V and the shared MSPI PHY, verifie
 32 MiB AP HEX PSRAM density, and switches the link to 80 MHz HEX x16 DDR (`SPLL/6`).
 All 32 MiB (`0x88000000..0x8a000000`, `pages 0..512`) are managed as a unified
 64 KiB-page NAPOT PSRAM pool by `RegionAllocator` (`MEM_CLASS_PSRAM`).
+An `init` thread starts the bundled framebuffer console and waits for its process to exit. On exit the kernel detaches its scanout before reclaiming PSRAM, and `init` retries after 100 ticks.
+
 At boot, `vela-fbcon` allocates a 2 MiB framebuffer from `RegionAllocator`, initializes
 the ST7121 panel and MIPI-DSI video pipeline (`DW-GDMA CH0`, 4-frame descriptor ring
 reading the `0x48xx_xxxx` bus alias), and renders the 80×22 ANSI console. Writing

@@ -63,6 +63,7 @@ pub struct Runtime {
     /// indexed by `ThreadSlot` and 16-byte aligned in internal L2MEM SRAM.
     pub ext_contexts: [arch::ExtendedContext; TASKS],
     pub processes: Processes,
+    pub fbcon_pid: Option<Pid>,
     pub harts: [HartState; HARTS],
     /// Per-process prepared PMP CSR image `(revision, prepared, verified_hart_mask)`.
     pub pmp_images: [Option<(u32, pmp::Prepared, u8)>; vela_kernel::process::PROCESSES],
@@ -455,6 +456,9 @@ impl Runtime {
                 self.mask_irq_slot(index);
             }
         }
+        if self.fbcon_pid == Some(reaped.pid) {
+            self.fbcon_pid = None;
+        }
         self.sentinel.release_wake_on_exit(reaped.pid);
         if self.sd_export_owner == Some(reaped.pid) {
             self.stop_sd_export(false);
@@ -474,6 +478,7 @@ impl Runtime {
     pub fn terminate(&mut self) {
         let local = self.scheduler.active_hart;
         let harts = &mut self.harts;
+        let dma = &mut self.dma;
         let display = &mut self.display;
         if let Some(reaped) = lifecycle::terminate_current_thread(
             &mut self.processes,
@@ -484,6 +489,7 @@ impl Runtime {
             &mut self.scheduler,
             |processes, allocator, owner| {
                 Self::sync_remote_pmp(processes, harts, local);
+                display.detach_owner(owner, allocator, dma);
                 allocator.release_psram_owner_with(owner, |region| {
                     let _ = display.set_psram_region_mapped(region, false);
                 });

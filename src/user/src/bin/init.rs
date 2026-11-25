@@ -74,7 +74,40 @@ fn load_and_run(caps: Caps, path: &[u8], arg: &[u8]) -> Result<(), ()> {
     if (pid as i32) < 0 { Err(()) } else { Ok(()) }
 }
 
-fn main(vfs: u32, input: u32, spawn: u32, display: u32, _a4: u32, _a5: u32) -> ! {
+extern "C" fn supervise_fbcon(handle: u32) -> ! {
+    loop {
+        let rc = sys::call(abi::FBCON_SUPERVISE, handle, 0, 0, 0);
+        if (rc as i32) < 0 {
+            sys::write(b"[init] fbcon start failed, retrying\n");
+        } else {
+            sys::write(b"[init] fbcon exited, restarting\n");
+        }
+        sys::sleep_ticks(100);
+    }
+}
+
+fn main(vfs: u32, input: u32, spawn: u32, display: u32, supervisor: u32, _a5: u32) -> ! {
+    if supervisor != 0 {
+        loop {
+            if let Ok(mut stack) = vela_user::arena::Arena::new(4096) {
+                let (tid, _) = sys::call6(
+                    abi::THREAD_CREATE,
+                    supervise_fbcon as *const () as u32,
+                    stack.base() as u32,
+                    stack.size() as u32,
+                    supervisor,
+                    1,
+                    abi::AFFINITY_HP0,
+                );
+                if (tid as i32) > 0 {
+                    break;
+                }
+                let _ = stack.release();
+            }
+            sys::write(b"[init] fbcon supervisor thread unavailable\n");
+            sys::sleep_ticks(100);
+        }
+    }
     let caps = Caps {
         vfs,
         input,

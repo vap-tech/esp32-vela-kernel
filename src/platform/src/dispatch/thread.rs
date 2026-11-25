@@ -30,6 +30,48 @@ const _: () = {
 };
 
 impl Runtime {
+    pub(super) fn sys_fbcon_supervise(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        lifecycle::require_authority(
+            &self.processes,
+            current,
+            Handle(args.a0),
+            Authority::FbconSupervisor,
+            cap::CONTROL,
+        )?;
+        let pid = if let Some(pid) = self.fbcon_pid {
+            pid
+        } else {
+            let (child, _, _) =
+                self.load_elf_in(crate::boot::FBCON_ELF, MemoryClass::Psram, false)?;
+            let result = (|| {
+                let caps = &mut self.processes.slot_mut(child.slot).capabilities;
+                let display = caps.install(Capability {
+                    object: Object::Authority(Authority::Display),
+                    rights: cap::CONTROL,
+                })?;
+                let log = caps.install(Capability {
+                    object: Object::Authority(Authority::ConsoleLog),
+                    rights: cap::READ,
+                })?;
+                self.start_loaded(child, [display.raw(), log.raw(), 0, 0, 0, 0], 1, 1)
+            })();
+            if let Err(error) = result {
+                self.abort_loaded(child);
+                return Err(error);
+            }
+            self.fbcon_pid = Some(child.pid);
+            child.pid
+        };
+        self.scheduler.block(Wait::ProcessExit { pid });
+        *switch = true;
+        Ok(0)
+    }
+
     pub(super) fn sys_spawn_image(
         &mut self,
         current: ProcSlot,
@@ -293,6 +335,7 @@ impl Runtime {
     pub(super) fn sys_process_exit(&mut self, switch: &mut bool) -> Result<u32, Errno> {
         let local = self.scheduler.active_hart;
         let harts = &mut self.harts;
+        let dma = &mut self.dma;
         let display = &mut self.display;
         let reaped = lifecycle::terminate_process(
             &mut self.processes,
@@ -303,6 +346,7 @@ impl Runtime {
             &mut self.scheduler,
             |processes, allocator, owner| {
                 Self::sync_remote_pmp(processes, harts, local);
+                display.detach_owner(owner, allocator, dma);
                 allocator.release_psram_owner_with(owner, |region| {
                     let _ = display.set_psram_region_mapped(region, false);
                 });

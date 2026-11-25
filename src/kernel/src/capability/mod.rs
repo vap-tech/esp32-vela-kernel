@@ -22,6 +22,7 @@ pub const ADMIN: u16 = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
     ProcessSpawn,
+    FbconSupervisor,
     Display,
     Sentinel,
     IrqControl,

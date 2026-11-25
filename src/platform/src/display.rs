@@ -137,6 +137,17 @@ impl DisplayControl {
         self.active = false;
     }
 
+    pub fn detach_owner(
+        &mut self,
+        owner: Pid,
+        allocator: &mut RegionAllocator,
+        dma: &mut DmaTable,
+    ) {
+        if self.external_owner == Some(owner) {
+            self.power_off(allocator, dma);
+        }
+    }
+
     fn ensure_framebuffer(
         &mut self,
         allocator: &mut RegionAllocator,

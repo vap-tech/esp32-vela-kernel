@@ -27,7 +27,7 @@ const SYSD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sysd.elf"));
 const INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
 const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
-const FBCON_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fbcon.elf"));
+pub(crate) const FBCON_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fbcon.elf"));
 
 unsafe extern "C" {
     static _stack_top: u8;
@@ -131,6 +131,7 @@ extern "C" fn rust_main() -> ! {
             tickless_armed: false,
             tickless_enter_16m: 0,
             tickless_period_16m: soc::timer::PERIOD_10MS_16M,
+            fbcon_pid: None,
             logs: BootLogs::EMPTY,
         })
     };
@@ -145,10 +146,6 @@ extern "C" fn rust_main() -> ! {
     let (ext4fs, _, _) = runtime
         .load_elf_in(EXT4FS_ELF, MemoryClass::Psram, false)
         .expect("ext4fs ELF");
-    let (fbcon_proc, _, _) = runtime
-        .load_elf_in(FBCON_ELF, MemoryClass::Psram, false)
-        .expect("fbcon ELF");
-
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let vfs_request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, sysd.slot).unwrap();
     let vfs_object = runtime
@@ -235,20 +232,6 @@ extern "C" fn rust_main() -> ! {
             rights: cap::READ | cap::WRITE,
         })
         .unwrap();
-    // The framebuffer console owns the screen and mirrors the console output ring.
-    let fbcon_caps = &mut runtime.processes.slot_mut(fbcon_proc.slot).capabilities;
-    let fbcon_display = fbcon_caps
-        .install(Capability {
-            object: Object::Authority(Authority::Display),
-            rights: cap::CONTROL,
-        })
-        .unwrap();
-    let fbcon_log = fbcon_caps
-        .install(Capability {
-            object: Object::Authority(Authority::ConsoleLog),
-            rights: cap::READ,
-        })
-        .unwrap();
     let rx_event = bind_event(
         &mut runtime.events,
         &mut runtime.processes,
@@ -295,6 +278,12 @@ extern "C" fn rust_main() -> ! {
         .unwrap();
 
     let init_caps = &mut runtime.processes.slot_mut(init_proc.slot).capabilities;
+    let supervisor = init_caps
+        .install(Capability {
+            object: Object::Authority(Authority::FbconSupervisor),
+            rights: cap::CONTROL,
+        })
+        .unwrap();
     let spawn_cap = init_caps
         .install(Capability {
             object: Object::Authority(Authority::ProcessSpawn),
@@ -331,7 +320,7 @@ extern "C" fn rust_main() -> ! {
                 init_input.raw(),
                 spawn_cap.raw(),
                 display_cap.raw(),
-                0,
+                supervisor.raw(),
                 0,
             ],
             1,
@@ -354,15 +343,6 @@ extern "C" fn rust_main() -> ! {
             2,
         )
         .unwrap();
-    runtime
-        .start_loaded(
-            fbcon_proc,
-            [fbcon_display.raw(), fbcon_log.raw(), 0, 0, 0, 0],
-            1,
-            1,
-        )
-        .unwrap();
-
     // SAFETY: isolated physical regions, no users executing yet.
     runtime
         .start_loaded(ext4fs, [fs_request.raw(), storage.raw(), 0, 0, 0, 0], 1, 1)
@@ -376,7 +356,7 @@ extern "C" fn rust_main() -> ! {
 
     let _ = writeln!(
         runtime.console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] sysd started (/proc /sys /dev /sd)\n[task] init started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[task] fbcon started (display console)\n[sched] preemptive scheduler online"
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] sysd started (/proc /sys /dev /sd)\n[task] init started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[sched] preemptive scheduler online"
     );
 
     unsafe {

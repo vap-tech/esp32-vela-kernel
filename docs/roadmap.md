@@ -68,7 +68,7 @@
 
 ## Next
 
-1. **Service supervision & driver recovery**: extend `init` to monitor and automatically restart crashed core drivers (`kbd`, `fbcon`, `ext4fs`, `sysd`) with clean endpoint re-attachment.
+1. **Service supervision & driver recovery**: `init` now supervises the bundled `fbcon` and restarts it after exit. Extend supervision to `kbd`, `ext4fs`, and `sysd`, including IRQ rebinding and endpoint re-attachment.
 2. **Crash diagnostics, stack guards & userland SDK**: add stack guard regions and clear crash reports (process, PC, fault cause) on U-mode faults, and separate a clean application SDK from kernel-adjacent helpers.
 3. **Display wallpapers & graphics**: reuse the retained `vela_boot_and_display_assets/` pipeline for boot/background wallpapers alongside `fbcon`.
 4. **Cache, storage performance & connectivity**: evaluate cached `L1-DCache` mappings with explicit DMA cache maintenance, Flash XIP for larger images, and networking (ESP32-C6 co-processor or USB).

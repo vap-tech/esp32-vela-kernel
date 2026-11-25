@@ -38,6 +38,7 @@ impl Runtime {
         let args = Args::from_frame(frame);
         let current = self.scheduler.current().process;
         let result = match args.number {
+            syscall::FBCON_SUPERVISE => self.sys_fbcon_supervise(current, args, switch),
             syscall::SD_EXPORT => self.sys_sd_export(current, args),
             syscall::SD_PARTITION => self.sys_sd_partition(current, args),
             syscall::SPAWN_IMAGE | syscall::SPAWN_IMAGE_WAIT => {
