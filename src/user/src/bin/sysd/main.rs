@@ -101,7 +101,8 @@ fn render_virtual(path: &[u8], mounts: &MountTable, caps: Caps, out: &mut TextBu
 }
 
 fn prune_if_dead(alive: bool, ep: u32, mounts: &mut MountTable, cache: &mut SnapshotCache) {
-    if !alive {
+    // Keep the reserved slot available for replacement even when all dynamic mounts are used.
+    if !alive && !mounts.resolve(b"/sd").is_some_and(|(sd, _)| sd == ep) {
         mounts.remove_endpoint(ep);
         let _ = usys::endpoint_close(ep);
         cache.invalidate();
@@ -326,19 +327,14 @@ fn handle_mount(
         response.append(b"sysd: mount call invalid\n");
         return;
     };
-    if rights & abi::CAP_ADMIN == 0 {
+    let allowed = if prefix == b"/sd" {
+        rights & abi::CAP_MOUNT_SD != 0
+    } else {
+        rights & abi::CAP_ADMIN != 0 && mount::is_valid_dynamic_prefix(prefix)
+    };
+    if !allowed || !has_cap {
         response.push(fs_abi::STATUS_ERR);
-        response.append(b"sysd: mount permission denied\n");
-        return;
-    }
-    if !has_cap {
-        response.push(fs_abi::STATUS_ERR);
-        response.append(b"sysd: missing mount endpoint\n");
-        return;
-    }
-    if !mount::is_valid_dynamic_prefix(prefix) {
-        response.push(fs_abi::STATUS_ERR);
-        response.append(b"sysd: invalid mount prefix\n");
+        response.append(b"sysd: mount denied or missing endpoint\n");
         return;
     }
     let Ok((new_ep, _)) = usys::ipc_accept_cap(pending_token) else {

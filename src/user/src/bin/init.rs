@@ -98,6 +98,18 @@ extern "C" fn supervise_kbd(handle: u32) -> ! {
     }
 }
 
+extern "C" fn supervise_ext4(handle: u32) -> ! {
+    loop {
+        let rc = sys::call(abi::EXT4_SUPERVISE, handle, 0, 0, 0);
+        sys::write(if (rc as i32) < 0 {
+            b"[init] ext4fs start failed, retrying\n"
+        } else {
+            b"[init] ext4fs exited, restarting\n"
+        });
+        sys::sleep_ticks(100);
+    }
+}
+
 fn start_supervisor(entry: extern "C" fn(u32) -> !, supervisor: u32) {
     if supervisor != 0 {
         loop {
@@ -125,6 +137,7 @@ fn start_supervisor(entry: extern "C" fn(u32) -> !, supervisor: u32) {
 fn main(vfs: u32, input: u32, spawn: u32, display: u32, supervisor: u32, keyboard: u32) -> ! {
     start_supervisor(supervise_fbcon, supervisor);
     start_supervisor(supervise_kbd, keyboard);
+    start_supervisor(supervise_ext4, supervisor);
     let caps = Caps {
         vfs,
         input,

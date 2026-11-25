@@ -78,6 +78,7 @@ pub const CAP_CONTROL: u32 = 256;
 pub const CAP_PASS_ON_SPAWN: u32 = 512;
 /// Unforgeable administrative privilege on a service endpoint (e.g. `sysd` mount/unmount).
 pub const CAP_ADMIN: u32 = 1024;
+pub const CAP_MOUNT_SD: u32 = 2048;
 
 pub const IPC_CALL: u32 = 20; // a0=endpoint handle (SEND), a1=req, a2=len, a3=reply buf, a4=cap, a5=timeout ticks
 pub const IPC_REPLY: u32 = 21; // a0=single-use reply token, a1=buffer, a2=len
@@ -238,6 +239,8 @@ pub const IPC_ACCEPT_CAP: u32 = 52;
 pub const FBCON_SUPERVISE: u32 = 53;
 /// Start or join the bundled keyboard driver and wait for its process to exit.
 pub const KBD_SUPERVISE: u32 = 54;
+/// Join the boot storage service or start its replacement and wait for exit.
+pub const EXT4_SUPERVISE: u32 = 55;
 pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
 
 #[repr(C)]

@@ -22,7 +22,7 @@ use crate::{
     soc,
 };
 
-const EXT4FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ext4fs.elf"));
+pub(crate) const EXT4FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ext4fs.elf"));
 const SYSD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sysd.elf"));
 const INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
@@ -131,6 +131,7 @@ extern "C" fn rust_main() -> ! {
             tickless_armed: false,
             tickless_enter_16m: 0,
             tickless_period_16m: soc::timer::PERIOD_10MS_16M,
+            ext4_pid: None,
             fbcon_pid: None,
             kbd_pid: None,
             logs: BootLogs::EMPTY,
@@ -146,6 +147,7 @@ extern "C" fn rust_main() -> ! {
     let (ext4fs, _, _) = runtime
         .load_elf_in(EXT4FS_ELF, MemoryClass::Psram, false)
         .expect("ext4fs ELF");
+    runtime.ext4_pid = Some(ext4fs.pid);
     // Explicit boot policy: IPC endpoints, managed hardware RX IRQ binding, and service authorities.
     let vfs_request = create_endpoint(&mut runtime.ipc, &mut runtime.processes, sysd.slot).unwrap();
     let vfs_object = runtime
@@ -252,7 +254,7 @@ extern "C" fn rust_main() -> ! {
     let init_caps = &mut runtime.processes.slot_mut(init_proc.slot).capabilities;
     let supervisor = init_caps
         .install(Capability {
-            object: Object::Authority(Authority::FbconSupervisor),
+            object: Object::Authority(Authority::ServiceSupervisor(init_vfs)),
             rights: cap::CONTROL,
         })
         .unwrap();

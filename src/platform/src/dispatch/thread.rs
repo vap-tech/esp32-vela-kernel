@@ -17,6 +17,7 @@ use crate::{
 };
 
 const _: () = {
+    assert!(syscall::CAP_MOUNT_SD == cap::MOUNT_SD as u32);
     assert!(syscall::CAP_READ == cap::READ as u32);
     assert!(syscall::CAP_WRITE == cap::WRITE as u32);
     assert!(syscall::CAP_EXECUTE == cap::EXECUTE as u32);
@@ -82,21 +83,56 @@ impl Runtime {
         Ok(0)
     }
 
-    pub(super) fn sys_fbcon_supervise(
+    pub(super) fn sys_service_supervise(
         &mut self,
         current: ProcSlot,
         args: Args,
         switch: &mut bool,
     ) -> Result<u32, Errno> {
-        lifecycle::require_authority(
-            &self.processes,
-            current,
-            Handle(args.a0),
-            Authority::FbconSupervisor,
-            cap::CONTROL,
-        )?;
-        let pid = if let Some(pid) = self.fbcon_pid {
+        let cap = self
+            .processes
+            .slot(current)
+            .capabilities
+            .get(Handle(args.a0), cap::CONTROL)?;
+        let Object::Authority(Authority::ServiceSupervisor(vfs)) = cap.object else {
+            return Err(Errno::Ebadf);
+        };
+        let storage = args.number == syscall::EXT4_SUPERVISE;
+        let existing = if storage {
+            self.ext4_pid
+        } else {
+            self.fbcon_pid
+        };
+        let pid = if let Some(pid) = existing {
             pid
+        } else if storage {
+            let namespace = self
+                .processes
+                .slot(current)
+                .capabilities
+                .get(vfs, cap::SEND)?
+                .object;
+            self.ipc.resolve(namespace)?;
+            let (child, _, _) =
+                self.load_elf_in(crate::boot::EXT4FS_ELF, MemoryClass::Psram, false)?;
+            let result = (|| {
+                let caps = &mut self.processes.slot_mut(child.slot).capabilities;
+                let mount = caps.install(Capability {
+                    object: namespace,
+                    rights: cap::SEND | cap::MOUNT_SD,
+                })?;
+                let disk = caps.install(Capability {
+                    object: Object::Authority(Authority::SdSystemPartition),
+                    rights: cap::READ | cap::WRITE,
+                })?;
+                self.start_loaded(child, [0, disk.raw(), mount.raw(), 0, 0, 0], 1, 1)
+            })();
+            if let Err(error) = result {
+                self.abort_loaded(child);
+                return Err(error);
+            }
+            self.ext4_pid = Some(child.pid);
+            child.pid
         } else {
             let (child, _, _) =
                 self.load_elf_in(crate::boot::FBCON_ELF, MemoryClass::Psram, false)?;

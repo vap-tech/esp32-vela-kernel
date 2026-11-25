@@ -19,10 +19,13 @@ pub const CONTROL: u16 = 256;
 pub const PASS_ON_SPAWN: u16 = 512;
 /// Unforgeable administrative privilege on a service endpoint (e.g. `sysd` mount/unmount).
 pub const ADMIN: u16 = 1024;
+/// Register the board storage endpoint at the reserved /sd mount.
+pub const MOUNT_SD: u16 = 2048;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
     ProcessSpawn,
-    FbconSupervisor,
+    /// Init-only authority carrying its namespace handle for restarting storage.
+    ServiceSupervisor(Handle),
     /// Boot-only authority; the handle names the terminal endpoint owned by init.
     KeyboardSupervisor(Handle),
     Display,

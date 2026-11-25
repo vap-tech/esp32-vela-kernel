@@ -63,6 +63,7 @@ pub struct Runtime {
     /// indexed by `ThreadSlot` and 16-byte aligned in internal L2MEM SRAM.
     pub ext_contexts: [arch::ExtendedContext; TASKS],
     pub processes: Processes,
+    pub ext4_pid: Option<Pid>,
     pub fbcon_pid: Option<Pid>,
     pub kbd_pid: Option<Pid>,
     pub harts: [HartState; HARTS],
@@ -459,6 +460,9 @@ impl Runtime {
         }
         if self.kbd_pid == Some(reaped.pid) {
             self.kbd_pid = None;
+        }
+        if self.ext4_pid == Some(reaped.pid) {
+            self.ext4_pid = None;
         }
         if self.fbcon_pid == Some(reaped.pid) {
             self.fbcon_pid = None;

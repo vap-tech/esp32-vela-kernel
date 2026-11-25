@@ -159,7 +159,7 @@ pub fn is_valid_dynamic_prefix(prefix: &[u8]) -> bool {
     if norm.len() < 2 || norm.len() > MAX_PREFIX || !norm.starts_with(b"/") {
         return false;
     }
-    if matches!(norm, b"/proc" | b"/sys" | b"/dev")
+    if matches!(norm, b"/proc" | b"/sys" | b"/dev" | b"/sd")
         || norm.starts_with(b"/proc/")
         || norm.starts_with(b"/sys/")
     {
@@ -482,7 +482,8 @@ mod tests {
     fn dynamic_prefix_validation_protects_core_trees() {
         assert!(is_valid_dynamic_prefix(b"/dev/ram0"));
         assert!(is_valid_dynamic_prefix(b"/mnt/usb/"));
-        assert!(is_valid_dynamic_prefix(b"/sd"));
+        assert!(!is_valid_dynamic_prefix(b"/sd"));
+        assert!(!is_valid_dynamic_prefix(b"/sd/"));
         assert!(!is_valid_dynamic_prefix(b"/"));
         assert!(!is_valid_dynamic_prefix(b"/proc"));
         assert!(!is_valid_dynamic_prefix(b"/proc/foo"));

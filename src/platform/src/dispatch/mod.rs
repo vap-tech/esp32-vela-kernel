@@ -39,7 +39,9 @@ impl Runtime {
         let current = self.scheduler.current().process;
         let result = match args.number {
             syscall::KBD_SUPERVISE => self.sys_kbd_supervise(current, args, switch),
-            syscall::FBCON_SUPERVISE => self.sys_fbcon_supervise(current, args, switch),
+            syscall::FBCON_SUPERVISE | syscall::EXT4_SUPERVISE => {
+                self.sys_service_supervise(current, args, switch)
+            }
             syscall::SD_EXPORT => self.sys_sd_export(current, args),
             syscall::SD_PARTITION => self.sys_sd_partition(current, args),
             syscall::SPAWN_IMAGE | syscall::SPAWN_IMAGE_WAIT => {
