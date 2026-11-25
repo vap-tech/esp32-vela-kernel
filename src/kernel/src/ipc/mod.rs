@@ -27,6 +27,9 @@ struct Endpoint {
     queue: [Message; QUEUE_DEPTH],
     head: usize,
     count: usize,
+    stream: bool,
+    had_sender: bool,
+    eof: bool,
 }
 impl Endpoint {
     const EMPTY: Self = Self {
@@ -35,6 +38,9 @@ impl Endpoint {
         queue: [Message::EMPTY; QUEUE_DEPTH],
         head: 0,
         count: 0,
+        stream: false,
+        had_sender: false,
+        eof: false,
     };
 }
 pub struct Ipc {
@@ -64,6 +70,9 @@ impl Ipc {
         Ok(index)
     }
     pub fn create(&mut self, owner: ProcSlot) -> Result<Object, Errno> {
+        self.create_with_flags(owner, false)
+    }
+    pub fn create_with_flags(&mut self, owner: ProcSlot, stream: bool) -> Result<Object, Errno> {
         let index = self
             .endpoints
             .iter()
@@ -73,12 +82,40 @@ impl Ipc {
         self.endpoints[index] = Endpoint {
             owner: Some(owner),
             generation: self.generation,
+            stream,
             ..Endpoint::EMPTY
         };
         Ok(Object::Endpoint {
             index,
             generation: self.generation,
         })
+    }
+    pub fn is_stream(&self, ep: usize) -> bool {
+        self.endpoints
+            .get(ep)
+            .is_some_and(|e| e.owner.is_some() && e.stream)
+    }
+    pub fn mark_sender_attached(&mut self, ep: usize) {
+        if let Some(e) = self.endpoints.get_mut(ep)
+            && e.owner.is_some()
+            && e.stream
+        {
+            e.had_sender = true;
+            e.eof = false;
+        }
+    }
+    pub fn has_writer(&self, ep: usize) -> bool {
+        self.endpoints
+            .get(ep)
+            .is_some_and(|e| e.owner.is_some() && e.stream && e.had_sender)
+    }
+    pub fn mark_eof(&mut self, ep: usize) {
+        if let Some(e) = self.endpoints.get_mut(ep)
+            && e.owner.is_some()
+            && e.stream
+        {
+            e.eof = true;
+        }
     }
     pub fn owner(&self, index: usize) -> Option<ProcSlot> {
         self.endpoints.get(index)?.owner
@@ -113,6 +150,9 @@ impl Ipc {
             return Err(Errno::Epipe);
         }
         if endpoint.count == 0 {
+            if endpoint.eof {
+                return Ok(Some(Message::EMPTY));
+            }
             return Ok(None);
         }
         if endpoint.queue[endpoint.head].length > capacity {
@@ -207,6 +247,27 @@ mod tests {
         let e0_new = ipc.create(ProcSlot(3)).unwrap();
         assert_eq!(ipc.resolve(e0_new), Ok(idx0));
         assert_eq!(ipc.resolve(e0), Err(Errno::Epipe));
+    }
+
+    #[test]
+    fn stream_endpoint_drains_buffer_before_reporting_eof() {
+        let mut ipc = Ipc::new();
+        let obj = ipc.create_with_flags(ProcSlot(1), true).unwrap();
+        let ep = ipc.resolve(obj).unwrap();
+        assert!(ipc.is_stream(ep));
+        ipc.mark_sender_attached(ep);
+        assert!(ipc.has_writer(ep));
+
+        ipc.send(ep, make_message(b"hello", 0)).unwrap();
+        ipc.mark_eof(ep);
+
+        // Queued payload must drain before EOF is observed.
+        let msg = ipc.receive(ep, MESSAGE_BYTES).unwrap().unwrap();
+        assert_eq!(&msg.data[..msg.length], b"hello");
+
+        // Once empty, stream returns 0-byte EOF cleanly.
+        let eof = ipc.receive(ep, MESSAGE_BYTES).unwrap().unwrap();
+        assert_eq!(eof.length, 0);
     }
 
     #[test]

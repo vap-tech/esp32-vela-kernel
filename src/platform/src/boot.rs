@@ -205,7 +205,7 @@ extern "C" fn rust_main() -> ! {
         .capabilities
         .install(Capability {
             object: Object::Authority(Authority::SdSystemPartition),
-            rights: cap::READ,
+            rights: cap::READ | cap::WRITE,
         })
         .unwrap();
 

@@ -349,6 +349,45 @@ pub fn forward_read_bulk(
     true
 }
 
+/// Forward `OP_WRITE_BULK` to a mounted service endpoint, transitively forwarding
+/// the caller's readable bulk memory window bound to `forward_token`.
+/// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
+pub fn forward_write_bulk(
+    endpoint: u32,
+    forward_token: u32,
+    offset: u32,
+    len: u32,
+    rel_path: &[u8],
+    response: &mut Buffer,
+) -> bool {
+    let mut fwd = Buffer::new();
+    fwd.push(fs_abi::OP_WRITE_BULK);
+    fwd.append(&offset.to_le_bytes());
+    fwd.append(&len.to_le_bytes());
+    fwd.append(rel_path);
+    let desc = abi::IpcBulkCall {
+        req_ptr: fwd.ptr() as u32,
+        req_len: fwd.len() as u32,
+        reply_ptr: response.mut_ptr() as u32,
+        reply_cap: abi::IPC_BYTES as u32,
+        timeout: 0,
+        bulk_ptr: 0,
+        bulk_len: 0,
+        bulk_flags: abi::IPC_BULK_FORWARD | abi::IPC_BULK_READ,
+        forward_token,
+    };
+    let raw = sys::ipc_call_bulk(endpoint, &desc) as u32;
+    let count = raw as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.clear();
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: mount unavailable\n");
+        return !matches!(raw, abi::EBADF | abi::EPIPE);
+    }
+    response.set_len(count);
+    true
+}
+
 fn forward_raw(endpoint: u32, request: &Buffer, timeout: u32, response: &mut Buffer) -> bool {
     let raw = sys::call6(
         abi::IPC_CALL,

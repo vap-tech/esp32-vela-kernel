@@ -1497,18 +1497,6 @@ unsafe fn read_sectors(
     }
 }
 
-/// Write `count` consecutive 512-byte sectors starting at `lba` (`1..=64` sectors)
-/// directly from `DMA_BUF` using hardware IDMAC (`CMD24` for 1 sector, `CMD25` for multi-sector).
-///
-/// # Safety
-/// Exclusive HP0 ownership of `SDHOST` and `DMA_BUF` with machine interrupts masked.
-pub unsafe fn write_sectors_dma(lba: u32, count: usize) -> Result<(), u32> {
-    if unsafe { EXPORTED } {
-        return Err(ERR_SD_WRITE);
-    }
-    unsafe { write_sectors(lba, count, &mut || {}) }
-}
-
 unsafe fn write_sectors(lba: u32, count: usize, service: &mut impl FnMut()) -> Result<(), u32> {
     if count == 0 || count > BENCH_CHUNK_SECTORS {
         return Err(ERR_SD_WRITE);
@@ -1768,11 +1756,27 @@ pub unsafe fn check_legacy_write_range(start: u32, count: u32) -> Result<(), u32
 /// # Safety
 /// Exclusive HP0 ownership of `SDHOST` / `GPIO39..44` with machine interrupts masked.
 pub unsafe fn write_sector(lba: u32, data: &[u8; SECTOR_BYTES]) -> Result<(), u32> {
+    unsafe { write_sector_with(lba, data, &mut || {}) }
+}
+
+/// Write one 512-byte sector at `lba`, allowing a keepalive callback to run during waits.
+///
+/// # Safety
+/// Exclusive HP0 ownership of `SDHOST` / `GPIO39..44` with machine interrupts masked.
+/// The callback must not access the SD driver.
+pub unsafe fn write_sector_with(
+    lba: u32,
+    data: &[u8; SECTOR_BYTES],
+    service: &mut impl FnMut(),
+) -> Result<(), u32> {
     unsafe {
+        if EXPORTED {
+            return Err(ERR_SD_WRITE);
+        }
         let dma_ptr = dma_buf_direct_ptr();
         core::ptr::copy_nonoverlapping(data.as_ptr(), dma_ptr, SECTOR_BYTES);
         fence();
-        write_sectors_dma(lba, 1)
+        write_sectors(lba, 1, service)
     }
 }
 

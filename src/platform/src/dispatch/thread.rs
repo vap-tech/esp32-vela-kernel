@@ -135,6 +135,11 @@ impl Runtime {
                         .capabilities
                         .install(capability)?
                         .raw();
+                    if capability.rights & cap::SEND != 0
+                        && let Ok(ep) = self.ipc.resolve(capability.object)
+                    {
+                        self.ipc.mark_sender_attached(ep);
+                    }
                 }
             }
             let top = loaded.stack.base + loaded.stack.size;

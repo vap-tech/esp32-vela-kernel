@@ -14,6 +14,8 @@
 //!                   (requires `CAP_ADMIN` on the `sysd` VFS handle) -> `[STATUS_OK]`
 //! - `OP_UNMOUNT`:   `[6, prefix..]` via `IPC_CALL`
 //!                   (requires `CAP_ADMIN` on the `sysd` VFS handle) -> `[STATUS_OK]`
+//! - `OP_WRITE_BULK`: `[7, offset: u32 LE, len: u32 LE, path..]` via `IPC_CALL_BULK`
+//!                   (`IPC_BULK_READ`) -> `[STATUS_OK, bytes_written: u32 LE]`
 //!
 //! Any reply with `status != STATUS_OK` carries a human-readable diagnostic in `reply[1..]`.
 
@@ -26,6 +28,7 @@ pub const OP_STAT: u8 = 3;
 pub const OP_READ_BULK: u8 = 4;
 pub const OP_MOUNT: u8 = 5;
 pub const OP_UNMOUNT: u8 = 6;
+pub const OP_WRITE_BULK: u8 = 7;
 
 /// Reply status codes.
 pub const STATUS_OK: u8 = 0;
@@ -56,6 +59,12 @@ pub const BULK_READ_HEADER: usize = 9;
 
 /// Byte length of a successful `OP_READ_BULK` reply: `[status: u8, bytes_read: u32 LE]`.
 pub const BULK_READ_REPLY_BYTES: usize = 5;
+
+/// Header bytes for `OP_WRITE_BULK` requests: `[op: u8, offset: u32 LE, len: u32 LE]`.
+pub const BULK_WRITE_HEADER: usize = 9;
+
+/// Byte length of a successful `OP_WRITE_BULK` reply: `[status: u8, bytes_written: u32 LE]`.
+pub const BULK_WRITE_REPLY_BYTES: usize = 5;
 
 /// Header bytes for `OP_MOUNT` / `OP_UNMOUNT` requests: `[op: u8]`.
 pub const MOUNT_HEADER: usize = 1;

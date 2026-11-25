@@ -20,7 +20,7 @@ fn parse_u32_range(bytes: &[u8], min: u32, max: u32) -> Option<u32> {
     (val >= min && val <= max).then_some(val)
 }
 
-fn main(_vfs: u32, arg: u32, len: u32, display_cap: u32, _a4: u32, _a5: u32) -> ! {
+fn main(_vfs: u32, arg: u32, len: u32, _stdin: u32, _stdout: u32, display_cap: u32) -> ! {
     if display_cap == 0 || len as usize > abi::SPAWN_ARG_MAX || (len != 0 && arg == 0) {
         sys::write(b"sdexport: display capability unavailable\n");
         sys::process_exit();

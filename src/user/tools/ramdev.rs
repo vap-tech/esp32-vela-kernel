@@ -78,6 +78,30 @@ fn handle_request(
             }
             response.push(fs_abi::STATUS_OK);
         }
+        [fs_abi::OP_WRITE_BULK, a, b, c, d, e, f, g, h, path @ ..] if path == b"/" => {
+            let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
+            let len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
+            let Some(end) = offset.checked_add(len) else {
+                response.push(fs_abi::STATUS_ERR);
+                response.append(b"ramdev: offset overflow\n");
+                return;
+            };
+            if end > CAPACITY {
+                response.push(fs_abi::STATUS_ERR);
+                response.append(b"ramdev: buffer full\n");
+                return;
+            }
+            if len > 0 && sys::ipc_bulk_read(pending_token, 0, &mut store[offset..end]).is_err() {
+                response.push(fs_abi::STATUS_ERR);
+                response.append(b"ramdev: bulk read failed\n");
+                return;
+            }
+            if offset == 0 || end > *used_len {
+                *used_len = end;
+            }
+            response.push(fs_abi::STATUS_OK);
+            response.append(&(len as u32).to_le_bytes());
+        }
         [fs_abi::OP_LIST, ..] => {
             response.push(fs_abi::STATUS_ERR);
             response.append(b"ramdev: not a directory\n");

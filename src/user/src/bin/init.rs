@@ -49,7 +49,7 @@ fn load_and_run(caps: Caps, path: &[u8], arg: &[u8]) -> Result<(), ()> {
             },
             SpawnCap {
                 handle: caps.input,
-                rights: abi::CAP_RECEIVE,
+                rights: abi::CAP_RECEIVE | abi::CAP_PASS_ON_SPAWN,
             },
             SpawnCap {
                 handle: caps.spawn,

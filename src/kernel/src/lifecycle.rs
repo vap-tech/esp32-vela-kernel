@@ -49,10 +49,21 @@ pub fn create_endpoint(
     processes: &mut Processes,
     owner: ProcSlot,
 ) -> Result<Handle, Errno> {
-    let object = ipc.create(owner)?;
+    create_endpoint_with_flags(ipc, processes, owner, false)
+}
+
+/// Create an IPC endpoint (optionally a stream/pipe endpoint with automatic EOF
+/// once all delegated `SEND` handles are closed) and install its root capability.
+pub fn create_endpoint_with_flags(
+    ipc: &mut Ipc,
+    processes: &mut Processes,
+    owner: ProcSlot,
+    stream: bool,
+) -> Result<Handle, Errno> {
+    let object = ipc.create_with_flags(owner, stream)?;
     match processes.slot_mut(owner).capabilities.install(Capability {
         object,
-        rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL,
+        rights: cap::SEND | cap::RECEIVE | cap::GRANT | cap::CONTROL | cap::PASS_ON_SPAWN,
     }) {
         Ok(handle) => Ok(handle),
         Err(e) => {
@@ -61,6 +72,33 @@ pub fn create_endpoint(
             Err(e)
         }
     }
+}
+
+/// If `ep` is a stream endpoint that previously had at least one delegated sender
+/// and no non-owner process still holds `SEND` on it, mark EOF and wake receivers.
+fn maybe_mark_stream_eof<C: Context>(
+    processes: &Processes,
+    ipc: &mut Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    ep: usize,
+    deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
+) -> Option<Tid> {
+    if !ipc.has_writer(ep) {
+        return None;
+    }
+    let owner = ipc.owner(ep)?;
+    let obj = ipc.object(ep);
+    let has_sender = processes.slots.iter().enumerate().any(|(slot_idx, proc)| {
+        proc.state == Lifecycle::Alive
+            && ProcSlot(slot_idx) != owner
+            && proc.capabilities.find(obj, cap::SEND).is_some()
+    });
+    if has_sender {
+        return None;
+    }
+    ipc.mark_eof(ep);
+    complete_receivers(processes, ipc, calls, scheduler, ep, false, deliver)
 }
 
 /// Bind hardware IRQ/event slot `index` to `owner` and install its root capability,
@@ -968,7 +1006,11 @@ pub fn close_endpoint<C: Context>(
             .capabilities
             .close(handle)
             .unwrap();
-        complete_receivers(processes, ipc, calls, scheduler, ep, false, deliver)
+        if capability.rights & cap::SEND != 0 && ipc.has_writer(ep) {
+            maybe_mark_stream_eof(processes, ipc, calls, scheduler, ep, deliver)
+        } else {
+            complete_receivers(processes, ipc, calls, scheduler, ep, false, deliver)
+        }
     };
     Ok(woken)
 }
@@ -1241,6 +1283,7 @@ pub fn terminate_current_thread<C: Context>(
     {
         unbound_events[index] = true;
     }
+    let mut stream_senders = [false; ipc::MAX_ENDPOINTS];
     for capability in processes
         .slot(process)
         .capabilities
@@ -1248,12 +1291,22 @@ pub fn terminate_current_thread<C: Context>(
         .into_iter()
         .flatten()
     {
-        if let Object::Memory {
-            owner: mem_owner, ..
-        } = capability.object
-            && mem_owner == owner
-        {
-            invalidate_object(processes, scheduler, capability.object, Some(process));
+        match capability.object {
+            Object::Memory {
+                owner: mem_owner, ..
+            } if mem_owner == owner => {
+                invalidate_object(processes, scheduler, capability.object, Some(process));
+            }
+            Object::Endpoint { .. }
+                if capability.rights & cap::SEND != 0 && capability.rights & cap::CONTROL == 0 =>
+            {
+                if let Ok(ep) = ipc.resolve(capability.object)
+                    && ipc.has_writer(ep)
+                {
+                    stream_senders[ep] = true;
+                }
+            }
+            _ => {}
         }
     }
     processes.slot_mut(process).capabilities.clear();
@@ -1266,6 +1319,11 @@ pub fn terminate_current_thread<C: Context>(
         if is_closed {
             let woken =
                 complete_receivers(processes, ipc, calls, scheduler, ep, true, &mut deliver);
+            if first_woken.is_none() {
+                first_woken = woken;
+            }
+        } else if stream_senders[ep] {
+            let woken = maybe_mark_stream_eof(processes, ipc, calls, scheduler, ep, &mut deliver);
             if first_woken.is_none() {
                 first_woken = woken;
             }
@@ -2827,5 +2885,63 @@ mod tests {
             ),
             Err(Errno::Epipe)
         );
+    }
+
+    #[test]
+    fn stream_endpoint_wakes_receiver_with_eof_when_producer_exits() {
+        let mut h = harness();
+        let shell = ProcSlot(0);
+        let producer = ProcSlot(1);
+        let consumer = ProcSlot(2);
+        let prod_t = ThreadSlot(1);
+        let cons_t = ThreadSlot(2);
+
+        // Shell creates a stream endpoint and delegates SEND to producer and RECEIVE to consumer.
+        let pipe = create_endpoint_with_flags(&mut h.ipc, &mut h.processes, shell, true).unwrap();
+        let prod_cap =
+            capability_for_spawn(&h.processes, &h.ipc, shell, false, pipe, cap::SEND).unwrap();
+        let cons_cap =
+            capability_for_spawn(&h.processes, &h.ipc, shell, false, pipe, cap::RECEIVE).unwrap();
+        let _prod_out = h
+            .processes
+            .slot_mut(producer)
+            .capabilities
+            .install(prod_cap)
+            .unwrap();
+        let cons_in = h
+            .processes
+            .slot_mut(consumer)
+            .capabilities
+            .install(cons_cap)
+            .unwrap();
+        let ep = h.ipc.resolve(prod_cap.object).unwrap();
+        h.ipc.mark_sender_attached(ep);
+
+        // Consumer blocks waiting to receive from the empty stream.
+        h.scheduler.current = cons_t;
+        h.scheduler.block(Wait::Receive {
+            endpoint: ep,
+            handle: cons_in,
+            pointer: 0x4ff1_2000,
+            capacity: ipc::MESSAGE_BYTES,
+        });
+        assert_eq!(h.scheduler.task(cons_t).state, State::Blocked);
+
+        // Producer exits (or faults) without explicitly sending an EOF frame.
+        h.scheduler.current = prod_t;
+        let reaped = terminate_current_thread(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.allocator,
+            &mut h.scheduler,
+            |_, _, _| {},
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(reaped.first_woken, Some(h.scheduler.task(cons_t).id));
+        assert_eq!(h.scheduler.task(cons_t).state, State::Ready);
+        assert_eq!(h.scheduler.task(cons_t).context.a0, 0);
     }
 }

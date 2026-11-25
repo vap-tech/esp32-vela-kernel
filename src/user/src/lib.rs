@@ -15,6 +15,7 @@ pub mod file;
 pub mod font;
 pub mod i2c;
 pub mod ina226;
+pub mod io;
 pub mod kbd;
 pub mod mount;
 pub mod sdcard;

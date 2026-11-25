@@ -41,7 +41,8 @@ pub const EPIPE: u32 = (-32i32) as u32;
 pub const ENOSYS: u32 = (-38i32) as u32;
 pub const ETIMEDOUT: u32 = (-110i32) as u32;
 
-pub const ENDPOINT_CREATE: u32 = 6;
+pub const ENDPOINT_CREATE: u32 = 6; // a0=flags (0=standard, ENDPOINT_STREAM=1 for pipe/stream EOF)
+pub const ENDPOINT_STREAM: u32 = 1; // automatic 0-byte EOF when last delegated SEND handle closes
 pub const SEND: u32 = 7; // a0=endpoint handle (SEND), a1=buffer, a2=len; full => EAGAIN
 pub const RECV: u32 = 8; // a0=endpoint handle (RECEIVE), a1=buffer, a2=capacity, a3=flags (0 / NONBLOCK)
 pub const ENDPOINT_CLOSE: u32 = 9; // a0=endpoint handle
@@ -184,6 +185,7 @@ pub const SD_EXPORT_STOP: u32 = 2;
 pub const SD_EXPORT_START_RW: u32 = 3;
 pub const SD_EXPORT_EJECTED: u32 = 2;
 pub const SD_PARTITION_EPOCH: u32 = 1; // SD_PARTITION a3 selects media epoch query (a2 must be 0)
+pub const SD_PARTITION_WRITE: u32 = 2; // SD_PARTITION a3 selects 512-byte sector write from a2 (requires CAP_WRITE)
 
 /// Like SPAWN_IMAGE, but the caller blocks until the new process has exited.
 /// Returns the child PID on completion, or an error if it could not start.

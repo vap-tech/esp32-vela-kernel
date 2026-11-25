@@ -82,3 +82,9 @@ name = "vela-ramdev"
 path = "tools/ramdev.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-wc"
+path = "tools/wc.rs"
+test = false
+bench = false

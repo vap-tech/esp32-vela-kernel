@@ -447,15 +447,25 @@ impl Runtime {
         args: Args,
     ) -> Result<u32, Errno> {
         let rights = u16::try_from(args.a2).map_err(|_| Errno::Einval)?;
-        lifecycle::grant_or_map(
+        let granted = lifecycle::grant_or_map(
             &mut self.processes,
             current,
             Handle(args.a0),
             Pid(args.a1),
             rights,
             args.number == syscall::MEM_GRANT,
-        )
-        .map(Handle::raw)
+        )?;
+        if rights & vela_kernel::capability::SEND != 0
+            && let Ok(src) = self
+                .processes
+                .slot(current)
+                .capabilities
+                .get(Handle(args.a0), 0)
+            && let Ok(ep) = self.ipc.resolve(src.object)
+        {
+            self.ipc.mark_sender_attached(ep);
+        }
+        Ok(granted.raw())
     }
 
     pub(super) fn sys_cap_revoke(
@@ -483,14 +493,28 @@ impl Runtime {
         Ok(0)
     }
 
-    pub(super) fn sys_endpoint_create(&mut self, current: ProcSlot) -> Result<u32, Errno> {
-        lifecycle::create_endpoint(&mut self.ipc, &mut self.processes, current).map(Handle::raw)
+    pub(super) fn sys_endpoint_create(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+    ) -> Result<u32, Errno> {
+        if args.a0 & !syscall::ENDPOINT_STREAM != 0 {
+            return Err(Errno::Einval);
+        }
+        lifecycle::create_endpoint_with_flags(
+            &mut self.ipc,
+            &mut self.processes,
+            current,
+            (args.a0 & syscall::ENDPOINT_STREAM) != 0,
+        )
+        .map(Handle::raw)
     }
 
     pub(super) fn sys_endpoint_close(
         &mut self,
         current: ProcSlot,
         args: Args,
+        switch: &mut bool,
     ) -> Result<u32, Errno> {
         let woken = lifecycle::close_endpoint(
             &mut self.processes,
@@ -502,6 +526,7 @@ impl Runtime {
             copy_to_user_within,
         )?;
         self.note_woken_receiver(woken);
+        *switch = self.scheduler.should_preempt();
         Ok(0)
     }
 

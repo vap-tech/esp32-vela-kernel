@@ -2,11 +2,12 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, div64, dword_le, sys};
+use vela_user::{Buffer, div64, dword_le, io, sys};
 
 vela_user::entry!(main);
 
-fn main(_fs: u32, _arg: u32, _len: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
+fn main(_fs: u32, _arg: u32, _len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
+    io::init(stdin, stdout);
     let mut stats = [0; abi::STATS_BYTES];
     if sys::call(
         abi::STATS,
@@ -24,9 +25,10 @@ fn main(_fs: u32, _arg: u32, _len: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
         out.push(b'0' + (hundredths / 10) as u8);
         out.push(b'0' + (hundredths % 10) as u8);
         out.push(b'\n');
-        sys::write(out.as_slice());
+        let _ = io::write(out.as_slice());
     } else {
-        sys::write(b"uptime: kernel statistics unavailable\n");
+        io::ewrite(b"uptime: kernel statistics unavailable\n");
     }
+    io::close_stdout();
     sys::process_exit();
 }

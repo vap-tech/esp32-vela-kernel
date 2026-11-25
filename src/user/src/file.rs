@@ -1,10 +1,10 @@
 //! Client for Vela's unified file-service IPC protocol (`sysd`, `ext4fs`, `/dev/*`).
-use crate::{Buffer, arena::Arena, sys};
+use crate::{Buffer, arena::Arena, io, sys};
 use vela_abi::{fs, syscall as abi};
 
 pub use vela_abi::fs::{
     DIR_HEADER, KIND_DIR, KIND_FILE, OP_LIST, OP_MOUNT, OP_READ, OP_READ_BULK, OP_STAT, OP_UNMOUNT,
-    OP_WRITE, STATUS_ERR, STATUS_NOENT, STATUS_OK,
+    OP_WRITE, OP_WRITE_BULK, STATUS_ERR, STATUS_NOENT, STATUS_OK,
 };
 
 const BULK_CHUNK_MAX: usize = 64 * 1024;
@@ -267,7 +267,7 @@ pub fn fs_read(handle: u32, path: &[u8], offset: u32, response: &mut Buffer) -> 
         Ok(len) => Ok(len),
         Err(_) => {
             if response.len() > 1 {
-                sys::write(&response.as_slice()[1..]);
+                io::ewrite(&response.as_slice()[1..]);
             }
             Err(())
         }
@@ -286,7 +286,7 @@ pub fn fs_read_dir(
         Ok(len) => len,
         Err(_) => {
             if response.len() > 1 {
-                sys::write(&response.as_slice()[1..]);
+                io::ewrite(&response.as_slice()[1..]);
             }
             return Err(());
         }
@@ -298,11 +298,11 @@ pub fn fs_read_dir(
             if next > cursor {
                 return Ok(Some((next, *end == 1)));
             }
-            sys::write(b"invalid directory reply\n");
+            io::ewrite(b"invalid directory reply\n");
             Err(())
         }
         _ => {
-            sys::write(b"invalid directory reply\n");
+            io::ewrite(b"invalid directory reply\n");
             Err(())
         }
     }
@@ -322,7 +322,7 @@ pub fn fs_write(
         || path.len() > u8::MAX as usize
         || fs::WRITE_HEADER + path.len() + data.len() > abi::IPC_BYTES
     {
-        sys::write(b"invalid write request\n");
+        io::ewrite(b"invalid write request\n");
         return Err(());
     }
     let mut request = Buffer::new();
@@ -343,15 +343,78 @@ pub fn fs_write(
     )
     .0 as usize;
     if !(1..=abi::IPC_BYTES).contains(&count) {
-        sys::write(b"file service unavailable\n");
+        io::ewrite(b"file service unavailable\n");
         return Err(());
     }
     response.set_len(count);
     if response.get(0) != STATUS_OK {
-        sys::write(&response.as_slice()[1..]);
+        io::ewrite(&response.as_slice()[1..]);
         return Err(());
     }
     Ok(count - 1)
+}
+
+/// Write arbitrary-sized `data` to `path` at `offset` using `OP_WRITE_BULK` (or
+/// inline `OP_WRITE` when the payload is empty or fits inside a single IPC frame).
+pub fn fs_write_bulk(
+    handle: u32,
+    path: &[u8],
+    offset: u32,
+    data: &[u8],
+    response: &mut Buffer,
+) -> Result<usize, ()> {
+    if data.is_empty() || fs::WRITE_HEADER + path.len() + data.len() <= abi::IPC_BYTES {
+        fs_write(handle, path, offset, data, response)?;
+        return Ok(data.len());
+    }
+    if path.is_empty() || path.len() > fs::MAX_BULK_PATH || !path.starts_with(b"/") {
+        io::ewrite(b"invalid write path\n");
+        return Err(());
+    }
+    let mut written = 0usize;
+    while written < data.len() {
+        let chunk_len = (data.len() - written).min(BULK_CHUNK_MAX);
+        let chunk = &data[written..written + chunk_len];
+        let mut request = Buffer::new();
+        request.push(OP_WRITE_BULK);
+        request.append(&(offset.saturating_add(written as u32)).to_le_bytes());
+        request.append(&(chunk_len as u32).to_le_bytes());
+        request.append(path);
+        let desc = abi::IpcBulkCall {
+            req_ptr: request.ptr() as u32,
+            req_len: request.len() as u32,
+            reply_ptr: response.mut_ptr() as u32,
+            reply_cap: abi::IPC_BYTES as u32,
+            timeout: 0,
+            bulk_ptr: chunk.as_ptr() as u32,
+            bulk_len: chunk_len as u32,
+            bulk_flags: abi::IPC_BULK_READ,
+            forward_token: 0,
+        };
+        response.clear();
+        let count = sys::ipc_call_bulk(handle, &desc) as usize;
+        if !(1..=abi::IPC_BYTES).contains(&count) {
+            io::ewrite(b"file service unavailable\n");
+            return Err(());
+        }
+        response.set_len(count);
+        if response.get(0) != STATUS_OK {
+            io::ewrite(&response.as_slice()[1..]);
+            return Err(());
+        }
+        let s = response.as_slice();
+        if s.len() < fs::BULK_WRITE_REPLY_BYTES {
+            io::ewrite(b"invalid bulk write reply\n");
+            return Err(());
+        }
+        let n = u32::from_le_bytes([s[1], s[2], s[3], s[4]]) as usize;
+        if n == 0 || n > chunk_len {
+            io::ewrite(b"short bulk write\n");
+            return Err(());
+        }
+        written += n;
+    }
+    Ok(written)
 }
 
 fn fs_pos_request(
@@ -402,12 +465,14 @@ pub fn cat(handle: u32, path: &[u8]) {
         match fs_read_bulk(handle, path, offset, &mut chunk, &mut response) {
             Ok(0) => break,
             Ok(count) => {
-                sys::write(&chunk[..count]);
+                if io::write(&chunk[..count]).is_err() {
+                    break;
+                }
                 offset = offset.saturating_add(count as u32);
             }
             Err(_) => {
                 if response.len() > 1 {
-                    sys::write(&response.as_slice()[1..]);
+                    io::ewrite(&response.as_slice()[1..]);
                 }
                 break;
             }

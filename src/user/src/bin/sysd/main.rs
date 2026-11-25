@@ -268,6 +268,52 @@ fn handle_write(
     response.append(cache.text.as_slice());
 }
 
+fn handle_write_bulk(
+    pending_token: u32,
+    offset: u32,
+    len: u32,
+    path: &[u8],
+    mounts: &mut MountTable,
+    caps: Caps,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    cache.invalidate();
+    if let Some((ep, rel)) = mounts.resolve(path) {
+        let alive = mount::forward_write_bulk(ep, pending_token, offset, len, rel, response);
+        prune_if_dead(alive, ep, mounts, cache);
+        return;
+    }
+    let want = len as usize;
+    if want > abi::IPC_BYTES {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: virtual device write too large\n");
+        return;
+    }
+    let mut scratch = [0u8; abi::IPC_BYTES];
+    if want > 0 && usys::ipc_bulk_read(pending_token, 0, &mut scratch[..want]).is_err() {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: bulk read failed\n");
+        return;
+    }
+    let mut inner = Buffer::new();
+    handle_write(
+        offset,
+        path,
+        &scratch[..want],
+        mounts,
+        caps,
+        cache,
+        &mut inner,
+    );
+    if inner.get(0) == fs_abi::STATUS_OK {
+        response.push(fs_abi::STATUS_OK);
+        response.append(&(want as u32).to_le_bytes());
+    } else {
+        response.append(inner.as_slice());
+    }
+}
+
 fn handle_mount(
     pending_token: u32,
     prefix: &[u8],
@@ -394,6 +440,20 @@ fn handle_request(
             let path = &rest[..plen];
             let data = &rest[plen..];
             handle_write(offset, path, data, mounts, caps, cache, response);
+        }
+        [fs_abi::OP_WRITE_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+            let offset = u32::from_le_bytes([*a, *b, *c, *d]);
+            let len = u32::from_le_bytes([*e, *f, *g, *h]);
+            handle_write_bulk(
+                pending_token,
+                offset,
+                len,
+                path,
+                mounts,
+                caps,
+                cache,
+                response,
+            );
         }
         [fs_abi::OP_MOUNT, prefix @ ..] if !prefix.is_empty() => {
             handle_mount(pending_token, prefix, mounts, cache, response);

@@ -4,7 +4,7 @@
 use vela_abi::{fs as fs_abi, syscall as abi};
 use vela_user::{
     Buffer,
-    ext4::{BlockRead, Directory, Error, Ext4, File, SECTOR},
+    ext4::{BlockRead, BlockWrite, Directory, Error, Ext4, File, SECTOR},
     sys,
 };
 
@@ -30,6 +30,23 @@ impl BlockRead for Partition {
             sector,
             out.as_mut_ptr() as u32,
             0,
+        ) == 0
+        {
+            Ok(())
+        } else {
+            Err(Error::Io)
+        }
+    }
+}
+
+impl BlockWrite for Partition {
+    fn write_sector(&mut self, sector: u32, data: &[u8; SECTOR]) -> Result<(), Error> {
+        if sys::call(
+            abi::SD_PARTITION,
+            self.handle,
+            sector,
+            data.as_ptr() as u32,
+            abi::SD_PARTITION_WRITE,
         ) == 0
         {
             Ok(())
@@ -69,9 +86,14 @@ fn main(endpoint: u32, storage: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> 
             ))?;
             if !matches!(
                 op,
-                fs_abi::OP_READ | fs_abi::OP_LIST | fs_abi::OP_STAT | fs_abi::OP_READ_BULK
+                fs_abi::OP_READ
+                    | fs_abi::OP_LIST
+                    | fs_abi::OP_WRITE
+                    | fs_abi::OP_STAT
+                    | fs_abi::OP_READ_BULK
+                    | fs_abi::OP_WRITE_BULK
             ) {
-                return Err((fs_abi::STATUS_ERR, b"read-only or invalid request"));
+                return Err((fs_abi::STATUS_ERR, b"unsupported request"));
             }
 
             let epoch = sys::call(abi::SD_PARTITION, storage, 0, 0, abi::SD_PARTITION_EPOCH);
@@ -190,7 +212,50 @@ fn main(endpoint: u32, storage: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> 
                     response.append(&(written as u32).to_le_bytes());
                     Ok(())
                 }
-                _ => Err((fs_abi::STATUS_ERR, b"read-only or invalid request")),
+                [fs_abi::OP_WRITE, a, b, c, d, path_len, rest @ ..]
+                    if usize::from(*path_len) > 0 && usize::from(*path_len) <= rest.len() =>
+                {
+                    let offset = u32::from_le_bytes([*a, *b, *c, *d]);
+                    let plen = usize::from(*path_len);
+                    let path = &rest[..plen];
+                    let data = &rest[plen..];
+                    opened = None;
+                    directory = None;
+                    fs.write(path, offset, data).map_err(err_reply)?;
+                    response.push(fs_abi::STATUS_OK);
+                    Ok(())
+                }
+                [fs_abi::OP_WRITE_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+                    let mut offset = u32::from_le_bytes([*a, *b, *c, *d]);
+                    let total_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
+                    opened = None;
+                    directory = None;
+                    if total_len == 0 {
+                        fs.write(path, offset, &[]).map_err(err_reply)?;
+                        response.push(fs_abi::STATUS_OK);
+                        response.append(&0u32.to_le_bytes());
+                        return Ok(());
+                    }
+                    // SAFETY: single-threaded service, never re-entered.
+                    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BULK_CHUNK) };
+                    let mut done = 0usize;
+                    while done < total_len {
+                        let step = (total_len - done).min(buf.len());
+                        let Ok(n) = sys::ipc_bulk_read(pending, done, &mut buf[..step]) else {
+                            return Err((fs_abi::STATUS_ERR, b"bulk read failed"));
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        fs.write(path, offset, &buf[..n]).map_err(err_reply)?;
+                        done += n;
+                        offset = offset.saturating_add(n as u32);
+                    }
+                    response.push(fs_abi::STATUS_OK);
+                    response.append(&(done as u32).to_le_bytes());
+                    Ok(())
+                }
+                _ => Err((fs_abi::STATUS_ERR, b"invalid request")),
             }
         })();
         if let Err((status, error)) = result {
@@ -223,5 +288,6 @@ fn message(error: Error) -> &'static [u8] {
         Error::NotFound => b"file not found",
         Error::NotFile => b"not a regular file",
         Error::NotDirectory => b"not a directory",
+        Error::NoSpace => b"no space left on device",
     }
 }

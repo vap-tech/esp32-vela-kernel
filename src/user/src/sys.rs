@@ -84,6 +84,13 @@ pub fn endpoint_create() -> Result<u32, i32> {
     if rc <= 0 { Err(rc) } else { Ok(rc as u32) }
 }
 
+/// Create a stream/pipe endpoint that automatically signals 0-byte EOF once all
+/// delegated `CAP_SEND` handles close (including on producer exit or fault).
+pub fn endpoint_create_stream() -> Result<u32, i32> {
+    let rc = call(abi::ENDPOINT_CREATE, abi::ENDPOINT_STREAM, 0, 0, 0) as i32;
+    if rc <= 0 { Err(rc) } else { Ok(rc as u32) }
+}
+
 pub fn endpoint_close(handle: u32) -> i32 {
     call(abi::ENDPOINT_CLOSE, handle, 0, 0, 0) as i32
 }
