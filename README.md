@@ -32,7 +32,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `cat <path>` | Read any file in `/proc`, `/sys`, `/dev`, or `/sd` via `/sd/bin/cat.elf`. |
 | `echo <val> [> <path>]` | Print text, or write control values to writable `/sys/*` and `/dev/*` nodes. |
 | `uptime` | Run `/sd/bin/uptime.elf` (or `cat /proc/uptime`). |
-| `run <elf> [arg]` | Run an RV32 static PIE ELF from `/sd` (up to 8 KiB) and wait for exit. |
+| `run <elf> [arg]` | Run an RV32 static PIE ELF from `/sd` (up to 64 KiB) and wait for exit. |
 | `sdexport [seconds \| rw]` | Run `/sd/bin/sdexport.elf` to export the microSD card over USB-C (read-only timeout or writable until host eject). |
 | `exit` | Exit the shell (`init` automatically respawns it). |
 
@@ -76,7 +76,7 @@ Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 | Available | Current limit |
 | --- | --- |
 | Dual-core HP0+HP1 SMP, priority scheduling, thread affinity/migration, synchronous IPI PMP shootdown, capabilities, and per-thread `RV32F` FPU + `ESP32-P4 v1.3` PIE (`Xespv2p1`) extended context | Static 8-process / 8-thread pools; eager FPU+PIE save/restore on thread switch (`vela_ext_save`/`vela_ext_restore`). |
-| ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled boot services in flash plus runtime `/sd/bin/*.elf` loading via `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` (up to 8 KiB, up to 4 passed capability handles); no dynamic linker. |
+| ELF32 and static PIE loading (internal SRAM + external PSRAM) | Bundled boot services in flash plus runtime `/sd/bin/*.elf` loading via `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` (up to 64 KiB, up to 4 passed capability handles); no dynamic linker. |
 | Managed SRAM (4 KiB) and unified 32 MiB PSRAM (64 KiB MMU) pool + capability DMA (`DmaTable`) | Flash XIP and general cached `L1-DCache` DMA are not enabled (`L1-ICache0` and `L1-ICache1` are enabled). |
 | Managed IRQ/Event capability slots (`EVENT_WAIT`, `IRQ_ACK`, `IRQ_BIND`, `IRQ_UNBIND`) | Fixed platform IRQ slot table; currently wired for USB Serial/JTAG RX (CLIC line 18). |
 | Userspace `INA226` power driver (`I2C_TRANSFER`, `/sys/power`) | Scoped by BSP policy to `0x41` on Tab5 system I²C (`GPIO31`/`GPIO32`); board expanders stay kernel-owned. |

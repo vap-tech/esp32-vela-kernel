@@ -249,7 +249,7 @@ fn render_tasks(out: &mut TextBuf<1024>) -> u8 {
     }
     out.append(b"tid pid state prio hart/aff mig ticks user_cycles preempt stack\n");
     let stride = abi::STATS_TASK_WORDS * 4;
-    for slot in 0..8 {
+    for slot in 0..snap.len() / stride {
         let base = slot * stride;
         let tid = word_le(&snap, base);
         if tid == 0 {

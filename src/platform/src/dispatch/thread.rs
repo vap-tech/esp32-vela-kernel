@@ -1,7 +1,7 @@
 use vela_kernel::{
     capability::{self as cap, Authority, Capability, Object},
     errno::Errno,
-    id::{Handle, ProcSlot, ThreadSlot, Tid},
+    id::{Handle, Pid, ProcSlot, ThreadSlot, Tid},
     lifecycle,
     memory::MemoryClass,
     task::{Context, Region, State, Wait},
@@ -108,15 +108,32 @@ impl Runtime {
             }
         }
 
-        // No concurrently running writer can access either source while the
-        // lock is held. Snapshot both before allocating the child.
-        let mut snapshot = [0; syscall::SPAWN_IMAGE_MAX];
-        copy_from_user(self.memory(), ptr, &mut snapshot[..len])?;
         let mut argument = [0; syscall::SPAWN_ARG_MAX];
         if arg_len != 0 {
             copy_from_user(self.memory(), arg_ptr, &mut argument[..arg_len])?;
         }
-        let (loaded, _, _) = self.load_elf_in(&snapshot[..len], MemoryClass::Psram, false)?;
+        if !self.readable(ptr, len) {
+            return Err(Errno::Efault);
+        }
+        self.ensure_psram_pool()?;
+        let scratch = self
+            .allocator
+            .allocate_in(MemoryClass::Psram, Pid::KERNEL, len)?;
+        let mapped = self.display.set_psram_region_mapped(scratch, true);
+        let image = if mapped {
+            // SAFETY: scratch is freshly mapped, exclusively kernel-owned, and
+            // disjoint from the checked source. Initialize it before borrowing.
+            unsafe {
+                core::ptr::copy_nonoverlapping(ptr as *const u8, scratch.base as *mut u8, len);
+                let bytes = core::slice::from_raw_parts(scratch.base as *const u8, len);
+                self.load_elf_in(bytes, MemoryClass::Psram, false)
+            }
+        } else {
+            Err(Errno::Eio)
+        };
+        self.display.set_psram_region_mapped(scratch, false);
+        self.allocator.free(Pid::KERNEL, scratch)?;
+        let (loaded, _, _) = image?;
         let result = (|| {
             let mut handles = [0u32; syscall::SPAWN_CAPS_MAX];
             for (dst, cap_opt) in handles.iter_mut().zip(inherited) {
@@ -479,7 +496,11 @@ impl Runtime {
                 copy_to_user(self.memory(), ptr, &flags.to_le_bytes())
             }
             syscall::STATS_TASKS => {
-                if len != syscall::STATS_TASKS_BYTES {
+                const _: () = assert!(
+                    vela_kernel::sched::TASKS * syscall::STATS_TASK_WORDS * 4
+                        == syscall::STATS_TASKS_BYTES
+                );
+                if len != 8 * syscall::STATS_TASK_WORDS * 4 && len != syscall::STATS_TASKS_BYTES {
                     return Err(Errno::Einval);
                 }
                 let mut buffer = [0u8; syscall::STATS_TASKS_BYTES];
@@ -519,7 +540,7 @@ impl Runtime {
                         buffer[base + i * 4..base + i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                     }
                 }
-                copy_to_user(self.memory(), ptr, &buffer)
+                copy_to_user(self.memory(), ptr, &buffer[..len])
             }
             syscall::STATS_SDCARD => {
                 if !matches!(

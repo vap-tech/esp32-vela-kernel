@@ -10,7 +10,7 @@ pub const PSRAM_MMU_PAGE: usize = 64 * 1024;
 const PAGES: usize = 64;
 const WORDS: usize = 8;
 pub const MAX_POOL_PAGES: usize = WORDS * 64;
-const ALLOCATIONS: usize = 24;
+const ALLOCATIONS: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryClass {

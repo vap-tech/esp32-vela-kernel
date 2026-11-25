@@ -5,7 +5,7 @@ use crate::{
     id::{Pid, ProcSlot},
     task::Region,
 };
-pub const PROCESSES: usize = 8;
+pub const PROCESSES: usize = 16;
 pub const REGIONS: usize = 6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifecycle {

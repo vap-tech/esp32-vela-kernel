@@ -18,9 +18,9 @@ pub const STATS_IRQ_SMP_BYTES: usize = 56; // 7-source SMP IRQ table (+ ipi_hp0,
 pub const STATS_IRQ_FULL_BYTES: usize = 80; // 10-source table (+ kbd_gpio50, kbd_arm_low, kbd_arm_wait)
 pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
 pub const STATS_STREAMS_BYTES: usize = 36;
-pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
+pub const STATS_TASKS: u32 = 4; // per slot: 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
 pub const STATS_TASK_WORDS: usize = 9;
-pub const STATS_TASKS_BYTES: usize = 8 * STATS_TASK_WORDS * 4;
+pub const STATS_TASKS_BYTES: usize = 16 * STATS_TASK_WORDS * 4;
 pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors (+ clk_khz, bench_write_kib_s, bench_read_kib_s)
 pub const STATS_SDCARD_BYTES: usize = 32;
 pub const STATS_SDCARD_EXT_BYTES: usize = 44;
@@ -141,7 +141,7 @@ pub const SD_PARTITION: u32 = 45; // a0=read capability, a1=relative LBA, a2=512
 /// Child entry receives `(cap0, arg_ptr, arg_len, cap1, cap2, cap3)`.
 pub const SPAWN_IMAGE: u32 = 46;
 pub const SPAWN_ARG_MAX: usize = 80;
-pub const SPAWN_IMAGE_MAX: usize = 8192;
+pub const SPAWN_IMAGE_MAX: usize = 64 * 1024;
 pub const SPAWN_CAPS_MAX: usize = 4;
 
 #[repr(C)]

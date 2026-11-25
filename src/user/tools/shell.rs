@@ -68,7 +68,7 @@ fn run_program(caps: Caps, path: &[u8], argument: &[u8], implicit_cmd: bool) {
             }
             Ok(count) => {
                 if len + count > abi::SPAWN_IMAGE_MAX {
-                    sys::write(b"run: ELF exceeds 8 KiB\n");
+                    sys::write(b"run: ELF exceeds 64 KiB\n");
                     break;
                 }
                 // SAFETY: arena is privately allocated and len + count fits.

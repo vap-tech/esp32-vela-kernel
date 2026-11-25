@@ -6,7 +6,7 @@ use crate::{
     task::{Context, Region, State, Thread, Wait},
 };
 
-pub const TASKS: usize = 8;
+pub const TASKS: usize = 16;
 pub const BOOT_THREADS: usize = 3;
 pub const HARTS: usize = 2;
 
