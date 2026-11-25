@@ -7,7 +7,7 @@
 //! host-tested without SoC or raw user pointer dependencies.
 
 use crate::{
-    call::CallTable,
+    call::{BulkWindow, CallTable},
     capability::{self as cap, Authority, Capability, Object},
     dma::DmaTable,
     errno::Errno,
@@ -521,6 +521,50 @@ pub fn try_direct_ipc_call<C: Context>(
     reply_pointer: usize,
     reply_capacity: usize,
     deadline: Option<Ticks>,
+    copy_direct: impl FnMut(
+        &AddressSpace,
+        usize,
+        &AddressSpace,
+        usize,
+        usize,
+        usize,
+    ) -> Result<(), Errno>,
+) -> Option<Tid> {
+    try_direct_ipc_call_bulk(
+        processes,
+        ipc,
+        calls,
+        scheduler,
+        current,
+        ep,
+        generation,
+        token,
+        req_pointer,
+        req_length,
+        reply_pointer,
+        reply_capacity,
+        deadline,
+        None,
+        copy_direct,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_direct_ipc_call_bulk<C: Context>(
+    processes: &Processes,
+    ipc: &Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    ep: usize,
+    generation: u32,
+    token: u32,
+    req_pointer: usize,
+    req_length: usize,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    bulk: Option<BulkWindow>,
     mut copy_direct: impl FnMut(
         &AddressSpace,
         usize,
@@ -568,7 +612,7 @@ pub fn try_direct_ipc_call<C: Context>(
     )
     .ok()?;
     let client = scheduler.current;
-    calls.activate(client, generation, ep);
+    calls.activate_with_bulk(client, generation, ep, bulk);
     scheduler.block_opt(
         Wait::Reply {
             token,
@@ -603,10 +647,43 @@ pub fn commit_ipc_call<C: Context>(
     deadline: Option<Ticks>,
     deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
 ) -> Result<Option<Tid>, Errno> {
+    commit_ipc_call_bulk(
+        processes,
+        ipc,
+        calls,
+        scheduler,
+        ep,
+        server,
+        generation,
+        message,
+        reply_pointer,
+        reply_capacity,
+        deadline,
+        None,
+        deliver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn commit_ipc_call_bulk<C: Context>(
+    processes: &Processes,
+    ipc: &mut Ipc,
+    calls: &mut CallTable,
+    scheduler: &mut Scheduler<C>,
+    ep: usize,
+    server: ThreadSlot,
+    generation: u32,
+    message: Message,
+    reply_pointer: usize,
+    reply_capacity: usize,
+    deadline: Option<Ticks>,
+    bulk: Option<BulkWindow>,
+    deliver: impl FnMut(&AddressSpace, usize, usize, &[u8]) -> Result<(), Errno>,
+) -> Result<Option<Tid>, Errno> {
     let client = scheduler.current;
     let token = message.reply_token;
     ipc.send(ep, message)?;
-    calls.activate(client, generation, ep);
+    calls.activate_with_bulk(client, generation, ep, bulk);
     scheduler.block_opt(
         Wait::Reply {
             token,

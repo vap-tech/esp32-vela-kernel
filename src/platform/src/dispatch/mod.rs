@@ -49,6 +49,8 @@ impl Runtime {
             syscall::THREAD_PRIORITY => self.sys_thread_priority(current, args, switch),
             syscall::THREAD_AFFINITY => self.sys_thread_affinity(current, args, frame, switch),
             syscall::IPC_CALL => self.sys_ipc_call(current, args, switch),
+            syscall::IPC_CALL_BULK => self.sys_ipc_call_bulk(current, args, switch),
+            syscall::IPC_BULK_IO => self.sys_ipc_bulk_io(current, args, frame),
             syscall::IPC_REPLY => self.sys_ipc_reply(current, args, switch),
             syscall::IPC_REPLY_RECV => self.sys_ipc_reply_recv(current, args, frame, switch),
             syscall::CAP_GRANT | syscall::MEM_GRANT => self.sys_cap_or_mem_grant(current, args),

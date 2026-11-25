@@ -4,8 +4,7 @@
 use vela_abi::syscall::{self as abi, SpawnCap, SpawnCaps};
 use vela_user::{
     Buffer,
-    arena::Arena,
-    file::{STATUS_NOENT, fs_read_raw, fs_write},
+    file::{STATUS_NOENT, fs_load_arena, fs_write},
     sys,
     term::EscapeFilter,
 };
@@ -28,68 +27,43 @@ fn run_program(caps: Caps, path: &[u8], argument: &[u8], implicit_cmd: bool) {
         sys::write(b"run: argument too long\n");
         return;
     }
-    let Ok(mut arena) =
-        Arena::new_psram(abi::SPAWN_IMAGE_MAX).or_else(|_| Arena::new(abi::SPAWN_IMAGE_MAX))
-    else {
-        sys::write(b"run: no space for ELF\n");
-        return;
-    };
     let mut response = Buffer::new();
-    let mut len = 0;
-    loop {
-        match fs_read_raw(caps.vfs, path, len as u32, &mut response) {
-            Ok(0) => {
-                let mut spawn_caps = SpawnCaps::EMPTY;
-                spawn_caps.count = 1;
-                spawn_caps.caps[0] = SpawnCap {
-                    handle: caps.vfs,
-                    rights: abi::CAP_SEND,
-                };
-                if path == b"/sd/bin/sdexport.elf" && caps.display != 0 {
-                    spawn_caps.count = 2;
-                    spawn_caps.caps[1] = SpawnCap {
-                        handle: caps.display,
-                        rights: abi::CAP_CONTROL,
-                    };
-                }
-                let (pid, _) = sys::call6(
-                    abi::SPAWN_IMAGE_WAIT,
-                    caps.spawn,
-                    arena.base() as u32,
-                    len as u32,
-                    argument.as_ptr() as u32,
-                    argument.len() as u32,
-                    &raw const spawn_caps as u32,
-                );
-                if (pid as i32) < 0 {
-                    sys::write(b"run: ELF rejected or process slots exhausted\n");
-                }
-                break;
+    let (mut arena, len) = match fs_load_arena(caps.vfs, path, abi::SPAWN_IMAGE_MAX, &mut response)
+    {
+        Ok(loaded) => loaded,
+        Err(status) => {
+            if implicit_cmd && status == STATUS_NOENT {
+                sys::write(b"\x1b[31munknown command (try help)\x1b[0m\n");
+            } else if response.len() > 1 {
+                sys::write(&response.as_slice()[1..]);
             }
-            Ok(count) => {
-                if len + count > abi::SPAWN_IMAGE_MAX {
-                    sys::write(b"run: ELF exceeds 8 KiB\n");
-                    break;
-                }
-                // SAFETY: arena is privately allocated and len + count fits.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        response.as_slice()[1..].as_ptr(),
-                        (arena.base() + len) as *mut u8,
-                        count,
-                    );
-                }
-                len += count;
-            }
-            Err(status) => {
-                if implicit_cmd && len == 0 && status == STATUS_NOENT {
-                    sys::write(b"\x1b[31munknown command (try help)\x1b[0m\n");
-                } else if response.len() > 1 {
-                    sys::write(&response.as_slice()[1..]);
-                }
-                break;
-            }
+            return;
         }
+    };
+    let mut spawn_caps = SpawnCaps::EMPTY;
+    spawn_caps.count = 1;
+    spawn_caps.caps[0] = SpawnCap {
+        handle: caps.vfs,
+        rights: abi::CAP_SEND,
+    };
+    if path == b"/sd/bin/sdexport.elf" && caps.display != 0 {
+        spawn_caps.count = 2;
+        spawn_caps.caps[1] = SpawnCap {
+            handle: caps.display,
+            rights: abi::CAP_CONTROL,
+        };
+    }
+    let (pid, _) = sys::call6(
+        abi::SPAWN_IMAGE_WAIT,
+        caps.spawn,
+        arena.base() as u32,
+        len as u32,
+        argument.as_ptr() as u32,
+        argument.len() as u32,
+        &raw const spawn_caps as u32,
+    );
+    if (pid as i32) < 0 {
+        sys::write(b"run: ELF rejected or process slots exhausted\n");
     }
     let _ = arena.release();
 }

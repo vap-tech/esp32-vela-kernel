@@ -144,6 +144,50 @@ pub fn forward_write(
     forward_raw(endpoint, &fwd, 0, response);
 }
 
+/// Forward `OP_STAT` to a mounted service endpoint with the mount prefix stripped.
+pub fn forward_stat(endpoint: u32, rel_path: &[u8], response: &mut Buffer) {
+    let mut fwd = Buffer::new();
+    fwd.push(fs_abi::OP_STAT);
+    fwd.append(rel_path);
+    forward_raw(endpoint, &fwd, 500, response);
+}
+
+/// Forward `OP_READ_BULK` to a mounted service endpoint, transitively forwarding
+/// the caller's bulk memory window bound to `forward_token` with zero intermediate copy.
+pub fn forward_read_bulk(
+    endpoint: u32,
+    forward_token: u32,
+    offset: u32,
+    max_len: u32,
+    rel_path: &[u8],
+    response: &mut Buffer,
+) {
+    let mut fwd = Buffer::new();
+    fwd.push(fs_abi::OP_READ_BULK);
+    fwd.append(&offset.to_le_bytes());
+    fwd.append(&max_len.to_le_bytes());
+    fwd.append(rel_path);
+    let desc = abi::IpcBulkCall {
+        req_ptr: fwd.ptr() as u32,
+        req_len: fwd.len() as u32,
+        reply_ptr: response.mut_ptr() as u32,
+        reply_cap: abi::IPC_BYTES as u32,
+        timeout: 1500,
+        bulk_ptr: 0,
+        bulk_len: 0,
+        bulk_flags: abi::IPC_BULK_FORWARD | abi::IPC_BULK_WRITE,
+        forward_token,
+    };
+    let count = sys::ipc_call_bulk(endpoint, &desc) as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.clear();
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: mount unavailable\n");
+        return;
+    }
+    response.set_len(count);
+}
+
 fn forward_raw(endpoint: u32, request: &Buffer, timeout: u32, response: &mut Buffer) {
     let count = sys::call6(
         abi::IPC_CALL,

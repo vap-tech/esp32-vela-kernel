@@ -1,7 +1,7 @@
 //! Single-hart IPC. Serialize with scheduler under masked machine IRQs.
 //! No user pointers inside this module.
 use crate::{capability::Object, errno::Errno, id::ProcSlot};
-pub const MAX_ENDPOINTS: usize = 8;
+pub const MAX_ENDPOINTS: usize = 16;
 pub const HANDLES: usize = 6;
 pub const MESSAGE_BYTES: usize = 96;
 pub const QUEUE_DEPTH: usize = 4;

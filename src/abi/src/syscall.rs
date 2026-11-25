@@ -18,9 +18,10 @@ pub const STATS_IRQ_SMP_BYTES: usize = 56; // 7-source SMP IRQ table (+ ipi_hp0,
 pub const STATS_IRQ_FULL_BYTES: usize = 80; // 10-source table (+ kbd_gpio50, kbd_arm_low, kbd_arm_wait)
 pub const STATS_STREAMS: u32 = 3; // DW-GDMA DSI scanout + GDMA-AHB CH1 counters
 pub const STATS_STREAMS_BYTES: usize = 36;
-pub const STATS_TASKS: u32 = 4; // 8 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
+pub const STATS_TASKS: u32 = 4; // 16 slots * 9 u32 words (tid, pid, meta, stack, preempt, ticks, cycles)
+pub const STATS_TASKS_SLOTS: usize = 16;
 pub const STATS_TASK_WORDS: usize = 9;
-pub const STATS_TASKS_BYTES: usize = 8 * STATS_TASK_WORDS * 4;
+pub const STATS_TASKS_BYTES: usize = STATS_TASKS_SLOTS * STATS_TASK_WORDS * 4;
 pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors (+ clk_khz, bench_write_kib_s, bench_read_kib_s)
 pub const STATS_SDCARD_BYTES: usize = 32;
 pub const STATS_SDCARD_EXT_BYTES: usize = 44;
@@ -141,7 +142,7 @@ pub const SD_PARTITION: u32 = 45; // a0=read capability, a1=relative LBA, a2=512
 /// Child entry receives `(cap0, arg_ptr, arg_len, cap1, cap2, cap3)`.
 pub const SPAWN_IMAGE: u32 = 46;
 pub const SPAWN_ARG_MAX: usize = 80;
-pub const SPAWN_IMAGE_MAX: usize = 8192;
+pub const SPAWN_IMAGE_MAX: usize = 1024 * 1024;
 pub const SPAWN_CAPS_MAX: usize = 4;
 
 #[repr(C)]
@@ -183,3 +184,35 @@ pub const SD_PARTITION_EPOCH: u32 = 1; // SD_PARTITION a3 selects media epoch qu
 /// Like SPAWN_IMAGE, but the caller blocks until the new process has exited.
 /// Returns the child PID on completion, or an error if it could not start.
 pub const SPAWN_IMAGE_WAIT: u32 = 48;
+
+/// Synchronous RPC with an attached bulk memory window (`a0=endpoint handle (SEND)`,
+/// `a1=pointer to IpcBulkCall` -> `a0=reply length`).
+/// While the caller blocks in `Wait::Reply`, the server (or a transitive forwardee)
+/// may read/write the caller's bulk window via `IPC_BULK_IO` using its reply token.
+pub const IPC_CALL_BULK: u32 = 49;
+/// Transfer bytes between the server's buffer and the client's bulk window bound to
+/// `reply_token`: `a0=reply_token`, `a1=client_offset`, `a2=local_ptr`, `a3=len`,
+/// `a4=direction (IPC_BULK_DIR_*)` -> `a0=bytes transferred`.
+/// When `a2==0 && a3==0`, returns `a0=bulk_len`, `a1=bulk_flags` without copying.
+pub const IPC_BULK_IO: u32 = 50;
+
+pub const IPC_BULK_READ: u32 = 1; // Server may read from the client's bulk buffer.
+pub const IPC_BULK_WRITE: u32 = 2; // Server may write into the client's bulk buffer.
+pub const IPC_BULK_FORWARD: u32 = 4; // Forward the bulk window bound to `forward_token`.
+pub const IPC_BULK_DIR_READ: u32 = 0; // Copy client bulk -> server local buffer.
+pub const IPC_BULK_DIR_WRITE: u32 = 1; // Copy server local buffer -> client bulk.
+pub const IPC_BULK_MAX: usize = 4 * 1024 * 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcBulkCall {
+    pub req_ptr: u32,
+    pub req_len: u32,
+    pub reply_ptr: u32,
+    pub reply_cap: u32,
+    pub timeout: u32,
+    pub bulk_ptr: u32,
+    pub bulk_len: u32,
+    pub bulk_flags: u32,
+    pub forward_token: u32,
+}

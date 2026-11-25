@@ -346,6 +346,16 @@ impl<B: BlockRead> Ext4<B> {
         Ok(inode)
     }
 
+    pub fn stat(&mut self, path: &[u8]) -> Result<(u32, bool), Error> {
+        let path = if path.len() > 1 {
+            path.strip_suffix(b"/").unwrap_or(path)
+        } else {
+            path
+        };
+        let inode = self.resolve(path)?;
+        Ok((inode.size, inode.kind == 0x4000))
+    }
+
     pub fn open(&mut self, path: &[u8]) -> Result<File, Error> {
         let inode = self.resolve(path)?;
         if inode.kind != 0x8000 {

@@ -5,12 +5,27 @@
 
 use crate::{
     errno::Errno,
-    id::ThreadSlot,
+    id::{ProcSlot, ThreadSlot},
     sched::{Scheduler, TASKS},
     task::{Context, Thread, Wait},
 };
 
 pub const MAX_GENERATION: u32 = 0x7f_ffff;
+pub const BULK_READ: u8 = 1;
+pub const BULK_WRITE: u8 = 2;
+
+/// Client-owned bulk memory window attached to an in-flight synchronous RPC.
+/// Survives transitive forwarding (`client -> proxy -> worker`) and stays valid
+/// only while the root client's call slot remains active with `root_gen`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BulkWindow {
+    pub root_thread: ThreadSlot,
+    pub root_gen: u32,
+    pub owner: ProcSlot,
+    pub ptr: usize,
+    pub len: usize,
+    pub flags: u8,
+}
 
 #[derive(Clone, Copy)]
 pub struct Call {
@@ -18,6 +33,7 @@ pub struct Call {
     active: bool,
     endpoint: usize,
     server: Option<ThreadSlot>,
+    bulk: Option<BulkWindow>,
 }
 
 impl Call {
@@ -26,6 +42,7 @@ impl Call {
         active: false,
         endpoint: 0,
         server: None,
+        bulk: None,
     };
 
     pub fn endpoint(&self) -> usize {
@@ -62,16 +79,77 @@ impl CallTable {
     }
 
     pub fn activate(&mut self, client: ThreadSlot, generation: u32, endpoint: usize) {
+        self.activate_with_bulk(client, generation, endpoint, None);
+    }
+
+    pub fn activate_with_bulk(
+        &mut self,
+        client: ThreadSlot,
+        generation: u32,
+        endpoint: usize,
+        bulk: Option<BulkWindow>,
+    ) {
         self.entries[client.index()] = Call {
             generation,
             active: true,
             endpoint,
             server: None,
+            bulk,
         };
     }
 
     pub fn deactivate(&mut self, client: ThreadSlot) {
         self.entries[client.index()].active = false;
+        self.entries[client.index()].bulk = None;
+    }
+
+    fn verify_bulk_live(&self, bulk: BulkWindow) -> Result<BulkWindow, Errno> {
+        let root = self
+            .entries
+            .get(bulk.root_thread.index())
+            .ok_or(Errno::Epipe)?;
+        if !root.active || root.generation != bulk.root_gen {
+            return Err(Errno::Epipe);
+        }
+        Ok(bulk)
+    }
+
+    /// Resolve a bulk window attached to `token` held by `server`, verifying that
+    /// both `token` and the root client's RPC are still active.
+    pub fn lookup_bulk(&self, token: u32, server: ThreadSlot) -> Result<BulkWindow, Errno> {
+        let (client, bound_server) = self.lookup_for_reply(token)?;
+        if bound_server != server {
+            return Err(Errno::Eperm);
+        }
+        let bulk = self.entries[client.index()].bulk.ok_or(Errno::Einval)?;
+        self.verify_bulk_live(bulk)
+    }
+
+    /// Validate a bulk read or write at `offset..offset + len` against the bulk
+    /// window attached to `token`, returning `(owner_process, target_addr)`.
+    pub fn prepare_bulk_io(
+        &self,
+        token: u32,
+        server: ThreadSlot,
+        offset: usize,
+        len: usize,
+        write_to_client: bool,
+    ) -> Result<(ProcSlot, usize), Errno> {
+        let bulk = self.lookup_bulk(token, server)?;
+        let need = if write_to_client {
+            BULK_WRITE
+        } else {
+            BULK_READ
+        };
+        if bulk.flags & need != need {
+            return Err(Errno::Eperm);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::Einval)?;
+        if end > bulk.len {
+            return Err(Errno::Einval);
+        }
+        let addr = bulk.ptr.checked_add(offset).ok_or(Errno::Efault)?;
+        Ok((bulk.owner, addr))
     }
 
     /// Resolve a reply token to `(client, bound_server)`.
@@ -135,6 +213,7 @@ impl CallTable {
                 continue;
             }
             self.entries[i].active = false;
+            self.entries[i].bulk = None;
             if matches!(scheduler.task(client).wait, Wait::Reply { .. }) {
                 scheduler.wake_with(client, error.to_abi());
             }
@@ -317,5 +396,54 @@ mod tests {
         assert_eq!(s.task(ThreadSlot(1)).state, State::Ready);
         assert_eq!(calls.lookup_for_reply(t1), Err(Errno::Epipe));
         assert_eq!(s.task(ThreadSlot(2)).state, State::Blocked);
+    }
+
+    #[test]
+    fn bulk_window_supports_forwarding_and_invalidates_when_root_expires() {
+        let mut calls = CallTable::new();
+        let mut s = scheduler();
+        // Client (slot 0, proc 0) calls proxy (slot 1) with a writable bulk window.
+        let (gen0, tok0) = calls.next_token(ThreadSlot(0)).unwrap();
+        let root_bulk = BulkWindow {
+            root_thread: ThreadSlot(0),
+            root_gen: gen0,
+            owner: ProcSlot(0),
+            ptr: 0x8800_0000,
+            len: 4096,
+            flags: BULK_WRITE,
+        };
+        calls.activate_with_bulk(ThreadSlot(0), gen0, 1, Some(root_bulk));
+        calls.bind_reply(&mut s, tok0, ThreadSlot(1));
+
+        // Only the bound server (slot 1) can inspect or forward the bulk window.
+        assert_eq!(calls.lookup_bulk(tok0, ThreadSlot(2)), Err(Errno::Eperm));
+        let forwarded = calls.lookup_bulk(tok0, ThreadSlot(1)).unwrap();
+        assert_eq!(forwarded, root_bulk);
+
+        // Proxy (slot 1) forwards the bulk window to worker (slot 2).
+        let (gen1, tok1) = calls.next_token(ThreadSlot(1)).unwrap();
+        calls.activate_with_bulk(ThreadSlot(1), gen1, 2, Some(forwarded));
+        calls.bind_reply(&mut s, tok1, ThreadSlot(2));
+
+        // Worker writes into root client's memory; reads are rejected by flags.
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), 512, 1024, true),
+            Ok((ProcSlot(0), 0x8800_0200))
+        );
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), 0, 16, false),
+            Err(Errno::Eperm)
+        );
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), 4000, 100, true),
+            Err(Errno::Einval)
+        );
+
+        // If root client's RPC times out or exits, the forwarded window fails with EPIPE.
+        calls.deactivate(ThreadSlot(0));
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), 0, 16, true),
+            Err(Errno::Epipe)
+        );
     }
 }

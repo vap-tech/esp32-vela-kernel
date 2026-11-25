@@ -27,8 +27,11 @@ struct SnapshotCache {
     path: [u8; 48],
     path_len: usize,
     status: u8,
-    text: TextBuf<1024>,
+    text: TextBuf<2048>,
 }
+
+/// NOLOAD `.bss` cache so `sysd`'s 4 KiB stack never holds the 2 KiB render buffer.
+static mut CACHE: SnapshotCache = SnapshotCache::new();
 
 impl SnapshotCache {
     const fn new() -> Self {
@@ -61,8 +64,12 @@ impl SnapshotCache {
     }
 }
 
+fn is_virtual_dir(norm: &[u8]) -> bool {
+    matches!(norm, b"/" | b"/proc" | b"/sys" | b"/dev" | b"/sys/sentinel")
+}
+
 #[inline(never)]
-fn render_virtual(path: &[u8], caps: Caps, out: &mut TextBuf<1024>) -> u8 {
+fn render_virtual(path: &[u8], caps: Caps, out: &mut TextBuf<2048>) -> u8 {
     let norm = mount::normalize_path(path);
     if let Some(rel) = norm.strip_prefix(b"/proc/") {
         return proc::read(rel, out);
@@ -73,12 +80,41 @@ fn render_virtual(path: &[u8], caps: Caps, out: &mut TextBuf<1024>) -> u8 {
     if let Some(rel) = norm.strip_prefix(b"/dev/") {
         return dev::read(rel, caps.dev, out);
     }
-    if matches!(norm, b"/" | b"/proc" | b"/sys" | b"/dev" | b"/sys/sentinel") {
+    if is_virtual_dir(norm) {
         out.append(b"sysd: is a directory\n");
         return fs_abi::STATUS_ERR;
     }
     out.append(b"sysd: no such file\n");
     fs_abi::STATUS_NOENT
+}
+
+fn handle_stat(
+    path: &[u8],
+    mounts: &MountTable,
+    caps: Caps,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    if let Some((ep, rel)) = mounts.resolve(path) {
+        mount::forward_stat(ep, rel, response);
+        return;
+    }
+    let norm = mount::normalize_path(path);
+    if is_virtual_dir(norm) {
+        response.push(fs_abi::STATUS_OK);
+        response.append(&0u32.to_le_bytes());
+        response.push(fs_abi::KIND_DIR);
+        return;
+    }
+    let (status, bytes) = cache.render_or_reuse(0, path, caps);
+    if status != fs_abi::STATUS_OK {
+        response.push(status);
+        response.append(bytes);
+        return;
+    }
+    response.push(fs_abi::STATUS_OK);
+    response.append(&(bytes.len() as u32).to_le_bytes());
+    response.push(fs_abi::KIND_FILE);
 }
 
 fn handle_read(
@@ -104,6 +140,49 @@ fn handle_read(
     }
     let end = (offset + (abi::IPC_BYTES - 1)).min(bytes.len());
     response.append(&bytes[offset..end]);
+}
+
+fn handle_read_bulk(
+    pending_token: u32,
+    offset: usize,
+    max_len: usize,
+    path: &[u8],
+    mounts: &MountTable,
+    caps: Caps,
+    cache: &mut SnapshotCache,
+    response: &mut Buffer,
+) {
+    if let Some((ep, rel)) = mounts.resolve(path) {
+        mount::forward_read_bulk(
+            ep,
+            pending_token,
+            offset as u32,
+            max_len as u32,
+            rel,
+            response,
+        );
+        return;
+    }
+    let (status, bytes) = cache.render_or_reuse(offset, path, caps);
+    if status != fs_abi::STATUS_OK {
+        response.push(status);
+        response.append(bytes);
+        return;
+    }
+    if offset >= bytes.len() || max_len == 0 {
+        response.push(fs_abi::STATUS_OK);
+        response.append(&0u32.to_le_bytes());
+        return;
+    }
+    let end = (offset + max_len).min(bytes.len());
+    let slice = &bytes[offset..end];
+    if usys::ipc_bulk_write(pending_token, 0, slice).is_err() {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: bulk write failed\n");
+        return;
+    }
+    response.push(fs_abi::STATUS_OK);
+    response.append(&(slice.len() as u32).to_le_bytes());
 }
 
 fn handle_list(cursor: u32, path: &[u8], mounts: &MountTable, response: &mut Buffer) {
@@ -156,6 +235,7 @@ fn handle_write(
 }
 
 fn handle_request(
+    pending_token: u32,
     request: &Buffer,
     mounts: &MountTable,
     caps: Caps,
@@ -168,6 +248,23 @@ fn handle_request(
         [fs_abi::OP_READ, a, b, c, d, path @ ..] if !path.is_empty() => {
             let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
             handle_read(offset, path, mounts, caps, cache, response);
+        }
+        [fs_abi::OP_READ_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+            let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
+            let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
+            handle_read_bulk(
+                pending_token,
+                offset,
+                max_len,
+                path,
+                mounts,
+                caps,
+                cache,
+                response,
+            );
+        }
+        [fs_abi::OP_STAT, path @ ..] if !path.is_empty() => {
+            handle_stat(path, mounts, caps, cache, response);
         }
         [fs_abi::OP_LIST, a, b, c, d, path @ ..] if !path.is_empty() => {
             let cursor = u32::from_le_bytes([*a, *b, *c, *d]);
@@ -212,7 +309,8 @@ fn main(
     if ext4_handle != 0 {
         let _ = mounts.mount(b"/sd", ext4_handle);
     }
-    let mut cache = SnapshotCache::new();
+    // SAFETY: single-threaded service, `CACHE` is never aliased.
+    let cache = unsafe { &mut *core::ptr::addr_of_mut!(CACHE) };
     let mut request = Buffer::new();
     let mut response = Buffer::new();
     let mut pending_token = 0u32;
@@ -229,6 +327,6 @@ fn main(
         if pending_token == 0 {
             continue;
         }
-        handle_request(&request, &mounts, caps, &mut cache, &mut response);
+        handle_request(pending_token, &request, &mounts, caps, cache, &mut response);
     }
 }

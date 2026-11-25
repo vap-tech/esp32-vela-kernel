@@ -108,15 +108,23 @@ impl Runtime {
             }
         }
 
-        // No concurrently running writer can access either source while the
-        // lock is held. Snapshot both before allocating the child.
-        let mut snapshot = [0; syscall::SPAWN_IMAGE_MAX];
-        copy_from_user(self.memory(), ptr, &mut snapshot[..len])?;
+        // Verify the image slice is wholly mapped readable in the caller's address
+        // space. Because KERNEL_LOCK is held with MIE=0, no sibling thread is running,
+        // and `check_private_spawn_input` rejected any foreign writable alias, the
+        // image cannot mutate while `load_elf_in` parses and copies it into a newly
+        // allocated child PSRAM region.
+        if !self.readable(ptr, len) {
+            return Err(Errno::Efault);
+        }
         let mut argument = [0; syscall::SPAWN_ARG_MAX];
         if arg_len != 0 {
             copy_from_user(self.memory(), arg_ptr, &mut argument[..arg_len])?;
         }
-        let (loaded, _, _) = self.load_elf_in(&snapshot[..len], MemoryClass::Psram, false)?;
+        // SAFETY: `ptr..ptr+len` is a single contiguous readable mapping in SRAM or
+        // mapped PSRAM with no concurrent writer; `load_elf_in` allocates disjoint
+        // memory for the child and does not retain the slice.
+        let image_bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        let (loaded, _, _) = self.load_elf_in(image_bytes, MemoryClass::Psram, false)?;
         let result = (|| {
             let mut handles = [0u32; syscall::SPAWN_CAPS_MAX];
             for (dst, cap_opt) in handles.iter_mut().zip(inherited) {

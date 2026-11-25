@@ -1,10 +1,173 @@
 //! Client for Vela's unified file-service IPC protocol (`sysd`, `ext4fs`, `/dev/*`).
-use crate::{Buffer, sys};
+use crate::{Buffer, arena::Arena, sys};
 use vela_abi::{fs, syscall as abi};
 
 pub use vela_abi::fs::{
-    DIR_HEADER, OP_LIST, OP_READ, OP_WRITE, STATUS_ERR, STATUS_NOENT, STATUS_OK,
+    DIR_HEADER, KIND_DIR, KIND_FILE, OP_LIST, OP_READ, OP_READ_BULK, OP_STAT, OP_WRITE, STATUS_ERR,
+    STATUS_NOENT, STATUS_OK,
 };
+
+const BULK_CHUNK_MAX: usize = 64 * 1024;
+
+/// Query `(size, kind)` for `path` without printing diagnostics.
+pub fn fs_stat_raw(handle: u32, path: &[u8], response: &mut Buffer) -> Result<(u32, u8), u8> {
+    response.clear();
+    if path.is_empty() || path.len() > abi::IPC_BYTES - fs::STAT_HEADER || !path.starts_with(b"/") {
+        response.push(STATUS_ERR);
+        response.append(b"invalid file path\n");
+        return Err(STATUS_ERR);
+    }
+    let mut request = Buffer::new();
+    request.push(OP_STAT);
+    request.append(path);
+    let count = sys::call6(
+        abi::IPC_CALL,
+        handle,
+        request.ptr() as u32,
+        request.len() as u32,
+        response.mut_ptr() as u32,
+        abi::IPC_BYTES as u32,
+        500,
+    )
+    .0 as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.push(STATUS_ERR);
+        response.append(b"file service unavailable\n");
+        return Err(STATUS_ERR);
+    }
+    response.set_len(count);
+    let status = response.get(0);
+    if status != STATUS_OK {
+        return Err(status);
+    }
+    let s = response.as_slice();
+    if s.len() < fs::STAT_REPLY_BYTES {
+        response.clear();
+        response.push(STATUS_ERR);
+        response.append(b"invalid stat reply\n");
+        return Err(STATUS_ERR);
+    }
+    let size = u32::from_le_bytes([s[1], s[2], s[3], s[4]]);
+    let kind = s[5];
+    Ok((size, kind))
+}
+
+/// Bulk-read up to `dst.len()` bytes from `path` starting at `offset` directly into `dst`.
+/// Returns `Ok(bytes_read)` (`0` on EOF).
+pub fn fs_read_bulk(
+    handle: u32,
+    path: &[u8],
+    offset: u32,
+    dst: &mut [u8],
+    response: &mut Buffer,
+) -> Result<usize, u8> {
+    response.clear();
+    if dst.is_empty() {
+        return Ok(0);
+    }
+    if path.is_empty() || path.len() > fs::MAX_BULK_PATH || !path.starts_with(b"/") {
+        response.push(STATUS_ERR);
+        response.append(b"invalid file path\n");
+        return Err(STATUS_ERR);
+    }
+    let want = dst.len().min(abi::IPC_BULK_MAX) as u32;
+    let mut request = Buffer::new();
+    request.push(OP_READ_BULK);
+    request.append(&offset.to_le_bytes());
+    request.append(&want.to_le_bytes());
+    request.append(path);
+    let desc = abi::IpcBulkCall {
+        req_ptr: request.ptr() as u32,
+        req_len: request.len() as u32,
+        reply_ptr: response.mut_ptr() as u32,
+        reply_cap: abi::IPC_BYTES as u32,
+        timeout: 1500,
+        bulk_ptr: dst.as_mut_ptr() as u32,
+        bulk_len: want,
+        bulk_flags: abi::IPC_BULK_WRITE,
+        forward_token: 0,
+    };
+    let count = sys::ipc_call_bulk(handle, &desc) as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.push(STATUS_ERR);
+        response.append(b"file service unavailable\n");
+        return Err(STATUS_ERR);
+    }
+    response.set_len(count);
+    let status = response.get(0);
+    if status != STATUS_OK {
+        return Err(status);
+    }
+    let s = response.as_slice();
+    if s.len() < fs::BULK_READ_REPLY_BYTES {
+        response.clear();
+        response.push(STATUS_ERR);
+        response.append(b"invalid bulk read reply\n");
+        return Err(STATUS_ERR);
+    }
+    let read = u32::from_le_bytes([s[1], s[2], s[3], s[4]]) as usize;
+    if read > dst.len() {
+        response.clear();
+        response.push(STATUS_ERR);
+        response.append(b"invalid bulk read length\n");
+        return Err(STATUS_ERR);
+    }
+    Ok(read)
+}
+
+/// Load a whole file into a newly allocated PSRAM (or SRAM fallback) `Arena`
+/// using `OP_STAT` + `OP_READ_BULK`.
+#[inline(never)]
+pub fn fs_load_arena(
+    handle: u32,
+    path: &[u8],
+    max_bytes: usize,
+    response: &mut Buffer,
+) -> Result<(Arena, usize), u8> {
+    let (size_u32, kind) = fs_stat_raw(handle, path, response)?;
+    let size = size_u32 as usize;
+    if kind != KIND_FILE || size == 0 || size > max_bytes {
+        response.clear();
+        response.push(STATUS_ERR);
+        if kind != KIND_FILE {
+            response.append(b"not a regular file\n");
+        } else if size == 0 {
+            response.append(b"empty file\n");
+        } else {
+            response.append(b"file exceeds size limit\n");
+        }
+        return Err(STATUS_ERR);
+    }
+    let Ok(mut arena) = Arena::new_psram(size).or_else(|_| Arena::new(size)) else {
+        response.clear();
+        response.push(STATUS_ERR);
+        response.append(b"out of memory\n");
+        return Err(STATUS_ERR);
+    };
+    let mut loaded = 0usize;
+    while loaded < size {
+        let step = (size - loaded).min(BULK_CHUNK_MAX);
+        // SAFETY: `arena` is privately owned and `loaded + step <= size <= arena.capacity()`.
+        let dst =
+            unsafe { core::slice::from_raw_parts_mut((arena.base() + loaded) as *mut u8, step) };
+        match fs_read_bulk(handle, path, loaded as u32, dst, response) {
+            Ok(0) => break,
+            Ok(n) => loaded += n,
+            Err(status) => {
+                let _ = arena.release();
+                return Err(status);
+            }
+        }
+    }
+    if loaded == 0 {
+        let _ = arena.release();
+        response.clear();
+        response.push(STATUS_ERR);
+        response.append(b"empty file\n");
+        return Err(STATUS_ERR);
+    }
+    Ok((arena, loaded))
+}
 
 /// Read a chunk from `path` at `offset` without printing error diagnostics.
 /// On `Err(status)`, `response.as_slice()[1..]` holds any server message when `status != 0`.
@@ -152,12 +315,21 @@ fn fs_pos_request(
 
 pub fn cat(handle: u32, path: &[u8]) {
     let mut response = Buffer::new();
-    let mut offset = 0;
-    while let Ok(count) = fs_read(handle, path, offset, &mut response) {
-        if count == 0 {
-            break;
+    let mut chunk = [0u8; 2048];
+    let mut offset = 0u32;
+    loop {
+        match fs_read_bulk(handle, path, offset, &mut chunk, &mut response) {
+            Ok(0) => break,
+            Ok(count) => {
+                sys::write(&chunk[..count]);
+                offset = offset.saturating_add(count as u32);
+            }
+            Err(_) => {
+                if response.len() > 1 {
+                    sys::write(&response.as_slice()[1..]);
+                }
+                break;
+            }
         }
-        sys::write(&response.as_slice()[1..]);
-        offset += count as u32;
     }
 }

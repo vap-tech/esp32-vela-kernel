@@ -10,8 +10,8 @@ cargo build --locked --release -p vela-user --target "$target" --target-dir "$ca
 mkdir -p target/sd/bin
 for name in uptime cat ls sdexport shell; do
     image="$cargo_dir/$target/release/vela-$name"
-    if (( $(stat -c %s "$image") > 8192 )); then
-        echo "Tool $name exceeds the 8 KiB SPAWN_IMAGE limit" >&2
+    if (( $(stat -c %s "$image") > 1048576 )); then
+        echo "Tool $name exceeds the 1 MiB SPAWN_IMAGE limit" >&2
         exit 1
     fi
     install -m 0644 "$image" "target/sd/bin/$name.elf"

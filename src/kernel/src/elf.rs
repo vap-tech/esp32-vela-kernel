@@ -197,7 +197,7 @@ impl<'a> Image<'a> {
         }
         let (address, size) = match (rela, length, stride) {
             (None, None, None) => return Ok(()),
-            (Some(a), Some(n), Some(12)) if n % 12 == 0 && n <= 12 * 256 => (a, n),
+            (Some(a), Some(n), Some(12)) if n % 12 == 0 && n <= 12 * 4096 => (a, n),
             _ => return Err(Error::Unsupported),
         };
         let start = self.file_range(address, size)?;

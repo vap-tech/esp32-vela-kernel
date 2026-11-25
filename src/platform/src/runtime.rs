@@ -519,22 +519,32 @@ impl Runtime {
         let owner = self.processes.slot(process).id;
         let result = (|| {
             let mut space = AddressSpace::EMPTY;
-            let bias = if image.pic {
-                let end = image
-                    .segments()
-                    .iter()
-                    .map(|s| s.region.base + s.region.size)
-                    .max()
-                    .ok_or(Errno::Enoexec)?;
+            let (bias, backing_end) = if image.pic {
+                let mut end = 0usize;
+                for s in image.segments() {
+                    let pmp_size = s
+                        .region
+                        .size
+                        .max(128)
+                        .checked_next_power_of_two()
+                        .ok_or(Errno::Enoexec)?;
+                    let seg_end = s.region.base.checked_add(pmp_size).ok_or(Errno::Enoexec)?;
+                    if seg_end > end {
+                        end = seg_end;
+                    }
+                }
+                if end == 0 {
+                    return Err(Errno::Enoexec);
+                }
                 let backing = self.allocator.allocate_in(code_class, owner, end)?;
                 if code_class == MemoryClass::Psram
                     && !self.display.set_psram_region_mapped(backing, true)
                 {
                     return Err(Errno::Eio);
                 }
-                backing.base
+                (backing.base, backing.base + backing.size)
             } else {
-                0
+                (0, usize::MAX)
             };
             for (i, segment) in image.segments().iter().enumerate() {
                 let region = if image.pic {
@@ -547,10 +557,11 @@ impl Runtime {
                     if segment.region.base % size != 0 {
                         return Err(Errno::Enoexec);
                     }
-                    Region {
-                        base: bias + segment.region.base,
-                        size,
+                    let base = bias + segment.region.base;
+                    if base.checked_add(size).is_none_or(|e| e > backing_end) {
+                        return Err(Errno::Enoexec);
                     }
+                    Region { base, size }
                 } else {
                     self.allocator
                         .reserve(owner, segment.region.base, segment.region.size)?
@@ -583,7 +594,22 @@ impl Runtime {
                 })
                 .map_err(|_| Errno::Enoexec)?;
             let entry = bias + image.entry;
-            let stack = self.allocator.allocate(owner, 4096)?;
+            let stack = if code_class == MemoryClass::Psram {
+                match self.allocator.allocate(owner, 8192) {
+                    Ok(region) => region,
+                    Err(_) => {
+                        let region =
+                            self.allocator
+                                .allocate_in(MemoryClass::Psram, owner, 65536)?;
+                        if !self.display.set_psram_region_mapped(region, true) {
+                            return Err(Errno::Eio);
+                        }
+                        region
+                    }
+                }
+            } else {
+                self.allocator.allocate(owner, 4096)?
+            };
             space.insert(stack, READ | WRITE)?;
             let (arg0, arg1) = if dma_driver {
                 let dma_obj = self.dma.acquire(DMA_CH_GDMA_AHB_CH1, owner)?;

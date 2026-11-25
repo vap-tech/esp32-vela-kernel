@@ -79,6 +79,44 @@ pub fn irq_ack(handle: u32) -> u32 {
     call(abi::IRQ_ACK, handle, 0, 0, 0)
 }
 
+pub fn ipc_call_bulk(endpoint: u32, desc: &abi::IpcBulkCall) -> i32 {
+    call(abi::IPC_CALL_BULK, endpoint, desc as *const _ as u32, 0, 0) as i32
+}
+
+pub fn ipc_bulk_write(token: u32, client_offset: usize, src: &[u8]) -> Result<usize, i32> {
+    if src.is_empty() {
+        return Ok(0);
+    }
+    let rc = call6(
+        abi::IPC_BULK_IO,
+        token,
+        client_offset as u32,
+        src.as_ptr() as u32,
+        src.len() as u32,
+        abi::IPC_BULK_DIR_WRITE,
+        0,
+    )
+    .0 as i32;
+    if rc < 0 { Err(rc) } else { Ok(rc as usize) }
+}
+
+pub fn ipc_bulk_read(token: u32, client_offset: usize, dst: &mut [u8]) -> Result<usize, i32> {
+    if dst.is_empty() {
+        return Ok(0);
+    }
+    let rc = call6(
+        abi::IPC_BULK_IO,
+        token,
+        client_offset as u32,
+        dst.as_mut_ptr() as u32,
+        dst.len() as u32,
+        abi::IPC_BULK_DIR_READ,
+        0,
+    )
+    .0 as i32;
+    if rc < 0 { Err(rc) } else { Ok(rc as usize) }
+}
+
 pub fn irq_bind(irq_ctl_handle: u32, slot: u32) -> u32 {
     call(abi::IRQ_BIND, irq_ctl_handle, slot, 0, 0)
 }

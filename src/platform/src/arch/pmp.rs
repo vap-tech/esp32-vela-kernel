@@ -1,11 +1,13 @@
 //! P4 rev1.3: 16 entries, minimum 128B, no NA4. Never lock dynamic mappings.
-//! Entries 0..5 hold the active process's up to 6 regions; entries 6..14 stay 0;
-//! entry 15 holds the permanent full-address-space U-mode deny-all catch-all.
+//! Entries 0..7 hold the active process's up to 8 regions (`pmpcfg0..1`);
+//! entries 8..14 stay 0; entry 15 holds the permanent full-address-space
+//! U-mode deny-all catch-all.
 use vela_kernel::{
     errno::Errno,
     process::{AddressSpace, REGIONS},
 };
 
+const _: () = assert!(REGIONS == 8);
 const DENY_ALL_ADDR: usize = 0x1fff_ffff;
 const DENY_ALL_CFG3: usize = 0x1800_0000;
 
@@ -55,8 +57,8 @@ impl Prepared {
                 "csrw pmpaddr3, {a3}",
                 "csrw pmpaddr4, {a4}",
                 "csrw pmpaddr5, {a5}",
-                "csrw pmpaddr6, zero",
-                "csrw pmpaddr7, zero",
+                "csrw pmpaddr6, {a6}",
+                "csrw pmpaddr7, {a7}",
                 "csrw pmpaddr8, zero",
                 "csrw pmpaddr9, zero",
                 "csrw pmpaddr10, zero",
@@ -76,6 +78,8 @@ impl Prepared {
                 a3 = in(reg) self.address[3],
                 a4 = in(reg) self.address[4],
                 a5 = in(reg) self.address[5],
+                a6 = in(reg) self.address[6],
+                a7 = in(reg) self.address[7],
                 a15 = in(reg) DENY_ALL_ADDR,
                 c0 = in(reg) self.config[0],
                 c1 = in(reg) self.config[1],
@@ -112,7 +116,7 @@ impl Prepared {
             && observed_cfg[3] == DENY_ALL_CFG3
     }
 
-    /// Switch dynamic process entries `0..5` while keeping entry 15 deny-all active.
+    /// Switch dynamic process entries `0..7` while keeping entry 15 deny-all active.
     /// When `verify` is true (first activation of a new revision), reads back CSRs
     /// to confirm hardware acceptance and intact catch-all protection.
     ///
@@ -130,6 +134,8 @@ impl Prepared {
                 "csrw pmpaddr3, {a3}",
                 "csrw pmpaddr4, {a4}",
                 "csrw pmpaddr5, {a5}",
+                "csrw pmpaddr6, {a6}",
+                "csrw pmpaddr7, {a7}",
                 "csrw pmpcfg0, {c0}",
                 "csrw pmpcfg1, {c1}",
                 a0 = in(reg) self.address[0],
@@ -138,6 +144,8 @@ impl Prepared {
                 a3 = in(reg) self.address[3],
                 a4 = in(reg) self.address[4],
                 a5 = in(reg) self.address[5],
+                a6 = in(reg) self.address[6],
+                a7 = in(reg) self.address[7],
                 c0 = in(reg) self.config[0],
                 c1 = in(reg) self.config[1],
                 options(nostack)
@@ -153,6 +161,8 @@ impl Prepared {
             core::arch::asm!("csrr {}, pmpaddr3", out(reg) observed_addr[3], options(nostack));
             core::arch::asm!("csrr {}, pmpaddr4", out(reg) observed_addr[4], options(nostack));
             core::arch::asm!("csrr {}, pmpaddr5", out(reg) observed_addr[5], options(nostack));
+            core::arch::asm!("csrr {}, pmpaddr6", out(reg) observed_addr[6], options(nostack));
+            core::arch::asm!("csrr {}, pmpaddr7", out(reg) observed_addr[7], options(nostack));
             core::arch::asm!("csrr {}, pmpcfg0", out(reg) c0, options(nostack));
             core::arch::asm!("csrr {}, pmpcfg1", out(reg) c1, options(nostack));
             core::arch::asm!("csrr {}, pmpaddr15", out(reg) a15, options(nostack));
