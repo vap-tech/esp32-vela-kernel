@@ -3,8 +3,8 @@ use crate::{Buffer, arena::Arena, io, sys};
 use vela_abi::{fs, syscall as abi};
 
 pub use vela_abi::fs::{
-    DIR_HEADER, KIND_DIR, KIND_FILE, OP_LIST, OP_MOUNT, OP_READ, OP_READ_BULK, OP_STAT, OP_UNMOUNT,
-    OP_WRITE, OP_WRITE_BULK, STATUS_ERR, STATUS_NOENT, STATUS_OK,
+    DIR_HEADER, KIND_DIR, KIND_FILE, OP_LIST, OP_MKDIR, OP_MOUNT, OP_READ, OP_READ_BULK, OP_STAT,
+    OP_UNLINK, OP_UNMOUNT, OP_WRITE, OP_WRITE_BULK, STATUS_ERR, STATUS_NOENT, STATUS_OK,
 };
 
 const BULK_CHUNK_MAX: usize = 64 * 1024;
@@ -51,6 +51,49 @@ pub fn fs_mount(
         return Err(status);
     }
     Ok(())
+}
+
+fn fs_path_op(vfs_handle: u32, op: u8, path: &[u8], response: &mut Buffer) -> Result<(), u8> {
+    response.clear();
+    if path.len() < 2 || path.len() > abi::IPC_BYTES - 1 || !path.starts_with(b"/") {
+        response.push(STATUS_ERR);
+        response.append(b"invalid file path\n");
+        return Err(STATUS_ERR);
+    }
+    let mut request = Buffer::new();
+    request.push(op);
+    request.append(path);
+    let count = sys::call6(
+        abi::IPC_CALL,
+        vfs_handle,
+        request.ptr() as u32,
+        request.len() as u32,
+        response.mut_ptr() as u32,
+        abi::IPC_BYTES as u32,
+        500,
+    )
+    .0 as usize;
+    if !(1..=abi::IPC_BYTES).contains(&count) {
+        response.push(STATUS_ERR);
+        response.append(b"file service unavailable\n");
+        return Err(STATUS_ERR);
+    }
+    response.set_len(count);
+    let status = response.get(0);
+    if status != STATUS_OK {
+        return Err(status);
+    }
+    Ok(())
+}
+
+/// Remove a regular file or empty directory at `path`.
+pub fn fs_unlink(vfs_handle: u32, path: &[u8], response: &mut Buffer) -> Result<(), u8> {
+    fs_path_op(vfs_handle, OP_UNLINK, path, response)
+}
+
+/// Create a directory at `path` inside an existing parent directory.
+pub fn fs_mkdir(vfs_handle: u32, path: &[u8], response: &mut Buffer) -> Result<(), u8> {
+    fs_path_op(vfs_handle, OP_MKDIR, path, response)
 }
 
 /// Unmount `prefix` in `sysd`. Requires `CAP_ADMIN` on `vfs_handle`.

@@ -11,6 +11,8 @@ pub enum Error {
     NotFile,
     NotDirectory,
     NoSpace,
+    AlreadyExists,
+    NotEmpty,
 }
 
 pub trait BlockRead {
@@ -613,6 +615,23 @@ impl<B: BlockWrite> Ext4<B> {
         }
     }
 
+    fn desc_used_dirs(&self, desc: &[u8; 64]) -> u32 {
+        let lo = u32::from(le16(desc, 0x10));
+        let hi = if self.desc_size == 64 {
+            u32::from(le16(desc, 0x30))
+        } else {
+            0
+        };
+        lo | (hi << 16)
+    }
+
+    fn set_desc_used_dirs(&self, desc: &mut [u8; 64], val: u32) {
+        put_le16(desc, 0x10, val as u16);
+        if self.desc_size == 64 {
+            put_le16(desc, 0x30, (val >> 16) as u16);
+        }
+    }
+
     fn adjust_sb_free_blocks(&mut self, delta: i64) -> Result<(), Error> {
         let mut lo_buf = [0u8; 4];
         self.read_bytes(1024 + 0x0c, &mut lo_buf)?;
@@ -890,6 +909,59 @@ impl<B: BlockWrite> Ext4<B> {
         self.write_bytes(addr + 40, &inode.extents)?;
         self.write_bytes(addr + 108, &0u32.to_le_bytes())?;
         Ok(())
+    }
+
+    fn free_inode(&mut self, id: u32) -> Result<(), Error> {
+        if id < self.first_ino || id > self.inodes {
+            return Err(Error::Corrupt);
+        }
+        let group = (id - 1) / self.per_group;
+        let index = (id - 1) % self.per_group;
+        let mut desc = self.read_desc(group)?;
+        if le16(&desc, 0x12) & 0x1 != 0 {
+            return Err(Error::Corrupt);
+        }
+        let bitmap = self.block_address(le32(&desc, 0x04))?;
+        let byte_addr = bitmap + u64::from(index / 8);
+        let mut b = [0u8; 1];
+        self.read_bytes(byte_addr, &mut b)?;
+        let mask = 1u8 << (index % 8);
+        if b[0] & mask == 0 {
+            return Err(Error::Corrupt);
+        }
+        b[0] &= !mask;
+        self.write_bytes(byte_addr, &b)?;
+        let free = self.desc_free_inodes(&desc);
+        self.set_desc_free_inodes(&mut desc, free + 1);
+        self.write_desc(group, &desc)?;
+        self.adjust_sb_free_inodes(1)?;
+        Ok(())
+    }
+
+    fn adjust_group_used_dirs(&mut self, id: u32, delta: i32) -> Result<(), Error> {
+        let group = (id - 1) / self.per_group;
+        let mut desc = self.read_desc(group)?;
+        let cur = self.desc_used_dirs(&desc);
+        let next = if delta >= 0 {
+            cur.checked_add(delta as u32).ok_or(Error::Corrupt)?
+        } else {
+            cur.checked_sub(delta.unsigned_abs())
+                .ok_or(Error::Corrupt)?
+        };
+        self.set_desc_used_dirs(&mut desc, next);
+        self.write_desc(group, &desc)
+    }
+
+    fn read_inode_links(&mut self, id: u32) -> Result<u16, Error> {
+        let addr = self.inode_addr(id)?;
+        let mut buf = [0u8; 2];
+        self.read_bytes(addr + 26, &mut buf)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    fn write_inode_links(&mut self, id: u32, links: u16) -> Result<(), Error> {
+        let addr = self.inode_addr(id)?;
+        self.write_bytes(addr + 26, &links.to_le_bytes())
     }
 
     fn init_regular_inode(&mut self, id: u32) -> Result<Inode, Error> {
@@ -1170,6 +1242,188 @@ impl<B: BlockWrite> Ext4<B> {
         self.flush_inode(&inode, total)?;
         Ok(done)
     }
+
+    /// Create a new empty directory at `path` inside an existing parent directory.
+    pub fn mkdir(&mut self, path: &[u8]) -> Result<(), Error> {
+        let path = if path.len() > 1 {
+            path.strip_suffix(b"/").unwrap_or(path)
+        } else {
+            path
+        };
+        let (mut parent, name) = self.resolve_parent(path)?;
+        match self.lookup(&parent, name) {
+            Ok(_) => return Err(Error::AlreadyExists),
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        let parent_links = self.read_inode_links(parent.id)?;
+        if parent_links >= 65000 {
+            return Err(Error::NoSpace);
+        }
+        let id = self.alloc_inode()?;
+        let block = match self.alloc_block(None) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = self.free_inode(id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.zero_block(block) {
+            let _ = self.free_block(block);
+            let _ = self.free_inode(id);
+            return Err(e);
+        }
+        // Populate `.` and `..` directory entries in the new directory block.
+        let base = self.block_address(block)?;
+        let mut dot = [0u8; 12];
+        put_le32(&mut dot, 0, id);
+        put_le16(&mut dot, 4, 12);
+        dot[6] = 1;
+        dot[7] = 2; // EXT4_FT_DIR
+        dot[8] = b'.';
+        let mut dotdot = [0u8; 12];
+        put_le32(&mut dotdot, 0, parent.id);
+        put_le16(&mut dotdot, 4, (self.block_size - 12) as u16);
+        dotdot[6] = 2;
+        dotdot[7] = 2; // EXT4_FT_DIR
+        dotdot[8] = b'.';
+        dotdot[9] = b'.';
+        self.write_bytes(base, &dot)?;
+        self.write_bytes(base + 12, &dotdot)?;
+
+        // Write the directory inode.
+        let mut list = [LeafExtent::default(); 4];
+        list[0] = LeafExtent {
+            logical: 0,
+            len: 1,
+            start: block,
+        };
+        let extents = Self::encode_leaf_extents(&list, 1);
+        let addr = self.inode_addr(id)?;
+        let mut raw = [0u8; 128];
+        put_le16(&mut raw, 0, 0x41ed); // S_IFDIR | 0755
+        put_le32(&mut raw, 4, self.block_size);
+        put_le16(&mut raw, 26, 2); // `.` + parent entry
+        put_le32(&mut raw, 28, self.block_size / SECTOR as u32);
+        put_le32(&mut raw, 32, 0x80000); // EXT4_EXTENTS_FL
+        raw[40..100].copy_from_slice(&extents);
+        self.write_bytes(addr, &raw)?;
+        if self.inode_size > 128 {
+            self.write_bytes(addr + 128, &self.extra_isize.to_le_bytes())?;
+        }
+
+        if let Err(e) = self.add_dir_entry(&mut parent, name, id, 2) {
+            let _ = self.zero_bytes(addr, usize::from(self.inode_size));
+            let _ = self.free_block(block);
+            let _ = self.free_inode(id);
+            return Err(e);
+        }
+        self.write_inode_links(parent.id, parent_links + 1)?;
+        self.adjust_group_used_dirs(id, 1)?;
+        Ok(())
+    }
+
+    fn is_dir_empty(&mut self, dir: &Inode) -> Result<bool, Error> {
+        self.check_directory(dir)?;
+        let mut offset = 0u32;
+        let mut buf = [0u8; 2];
+        while offset < dir.size {
+            let entry = self.dir_entry(dir, offset)?;
+            if entry.id != 0 {
+                if entry.name_len > 2 {
+                    return Ok(false);
+                }
+                self.read_bytes(entry.name_at, &mut buf[..entry.name_len])?;
+                if !matches!(&buf[..entry.name_len], b"." | b"..") {
+                    return Ok(false);
+                }
+            }
+            offset = entry.next;
+        }
+        Ok(true)
+    }
+
+    /// Remove a regular file or an empty directory at `path`.
+    pub fn unlink(&mut self, path: &[u8]) -> Result<(), Error> {
+        let path = if path.len() > 1 {
+            path.strip_suffix(b"/").unwrap_or(path)
+        } else {
+            path
+        };
+        let (parent, name) = self.resolve_parent(path)?;
+        let mut offset = 0u32;
+        let mut prev_offset: Option<u32> = None;
+        let mut buf = [0u8; 255];
+        let mut found = None;
+        while offset < parent.size {
+            if offset % self.block_size == 0 {
+                prev_offset = None;
+            }
+            let entry = self.dir_entry(&parent, offset)?;
+            if entry.id != 0 && entry.name_len == name.len() {
+                self.read_bytes(entry.name_at, &mut buf[..name.len()])?;
+                if &buf[..name.len()] == name {
+                    found = Some((prev_offset, offset, entry.next - offset, entry.id));
+                    break;
+                }
+            }
+            prev_offset = Some(offset);
+            offset = entry.next;
+        }
+        let Some((prev_off, cur_off, cur_rec_len, target_id)) = found else {
+            return Err(Error::NotFound);
+        };
+        if target_id == 2 {
+            return Err(Error::NotEmpty);
+        }
+        let target = self.inode(target_id)?;
+        let is_dir = target.kind == 0x4000;
+        if is_dir && !self.is_dir_empty(&target)? {
+            return Err(Error::NotEmpty);
+        }
+        // Validate extent tree before mutating parent directory.
+        let (mut list, mut count) = self.parse_leaf_extents(&target.extents)?;
+
+        // Unlink directory entry from parent.
+        let block_base = self
+            .data_block(&parent, cur_off / self.block_size)?
+            .ok_or(Error::Corrupt)?;
+        if let Some(prev) = prev_off {
+            let prev_addr = block_base + u64::from(prev % self.block_size);
+            let mut prev_len_buf = [0u8; 2];
+            self.read_bytes(prev_addr + 4, &mut prev_len_buf)?;
+            let new_len = u16::from_le_bytes(prev_len_buf)
+                .checked_add(cur_rec_len as u16)
+                .ok_or(Error::Corrupt)?;
+            self.write_bytes(prev_addr + 4, &new_len.to_le_bytes())?;
+        } else {
+            let cur_addr = block_base + u64::from(cur_off % self.block_size);
+            self.write_bytes(cur_addr, &0u32.to_le_bytes())?;
+        }
+
+        let links = self.read_inode_links(target_id)?;
+        let drop_inode = if is_dir {
+            let parent_links = self.read_inode_links(parent.id)?;
+            if parent_links > 2 {
+                self.write_inode_links(parent.id, parent_links - 1)?;
+            }
+            self.adjust_group_used_dirs(target_id, -1)?;
+            true
+        } else if links > 1 {
+            self.write_inode_links(target_id, links - 1)?;
+            false
+        } else {
+            true
+        };
+
+        if drop_inode {
+            self.truncate_extents(&mut list, &mut count, 0)?;
+            let addr = self.inode_addr(target_id)?;
+            self.zero_bytes(addr, usize::from(self.inode_size))?;
+            self.free_inode(target_id)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct File(Inode);
@@ -1282,6 +1536,22 @@ mod tests {
             assert_eq!(fs_img.write(b"/nope/a.txt", 0, b"x"), Err(Error::NotFound));
             assert_eq!(fs_img.write(b"/etc", 0, b"x"), Err(Error::NotFile));
 
+            // 6. mkdir + nested subdir + file creation + unlink + empty-dir removal.
+            assert_eq!(fs_img.mkdir(b"/tmp"), Ok(()));
+            assert_eq!(fs_img.mkdir(b"/tmp"), Err(Error::AlreadyExists));
+            assert_eq!(fs_img.mkdir(b"/tmp/sub"), Ok(()));
+            assert_eq!(fs_img.write(b"/tmp/sub/note.txt", 0, b"nested\n"), Ok(7));
+            assert_eq!(fs_img.write(b"/tmp/drop_me.txt", 0, b"bye"), Ok(3));
+            // Non-empty directory cannot be unlinked.
+            assert_eq!(fs_img.unlink(b"/tmp/sub"), Err(Error::NotEmpty));
+            assert_eq!(fs_img.unlink(b"/tmp/drop_me.txt"), Ok(()));
+            assert_eq!(fs_img.unlink(b"/tmp/drop_me.txt"), Err(Error::NotFound));
+            assert_eq!(fs_img.unlink(b"/tmp/sub/note.txt"), Ok(()));
+            // Now /tmp/sub is empty and can be unlinked cleanly.
+            assert_eq!(fs_img.unlink(b"/tmp/sub"), Ok(()));
+            // Also keep one newly created dir + file to verify e2fsck on persisted dirs.
+            assert_eq!(fs_img.write(b"/tmp/keep.txt", 0, b"kept"), Ok(4));
+
             // Re-mount cleanly from written bytes and verify contents!
             let written_bytes = fs_img.device.0;
             fs::write(&path, &written_bytes).unwrap();
@@ -1307,6 +1577,13 @@ mod tests {
             assert_eq!(&buf[..n3], b"short");
 
             assert_eq!(check.stat(b"/empty.txt"), Ok((0, false)));
+            assert_eq!(
+                check.stat(b"/tmp"),
+                Ok((block.parse::<u32>().unwrap(), true))
+            );
+            assert_eq!(check.stat(b"/tmp/keep.txt"), Ok((4, false)));
+            assert_eq!(check.stat(b"/tmp/sub"), Err(Error::NotFound));
+            assert_eq!(check.stat(b"/tmp/drop_me.txt"), Err(Error::NotFound));
 
             // Run e2fsck -fn to prove 100% on-disk ext4 metadata consistency!
             let fsck = Command::new("e2fsck")

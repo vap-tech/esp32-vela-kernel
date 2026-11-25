@@ -461,6 +461,16 @@ fn handle_request(
         [fs_abi::OP_UNMOUNT, prefix @ ..] if !prefix.is_empty() => {
             handle_unmount(pending_token, prefix, mounts, cache, response);
         }
+        [op @ (fs_abi::OP_UNLINK | fs_abi::OP_MKDIR), path @ ..] if !path.is_empty() => {
+            cache.invalidate();
+            if let Some((ep, rel)) = mounts.resolve(path) {
+                let alive = mount::forward_path_op(ep, *op, rel, response);
+                prune_if_dead(alive, ep, mounts, cache);
+            } else {
+                response.push(fs_abi::STATUS_ERR);
+                response.append(b"sysd: read-only filesystem\n");
+            }
+        }
         _ => {
             response.push(fs_abi::STATUS_ERR);
             response.append(b"sysd: bad request\n");

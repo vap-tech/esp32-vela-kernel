@@ -16,6 +16,8 @@
 //!                   (requires `CAP_ADMIN` on the `sysd` VFS handle) -> `[STATUS_OK]`
 //! - `OP_WRITE_BULK`: `[7, offset: u32 LE, len: u32 LE, path..]` via `IPC_CALL_BULK`
 //!                   (`IPC_BULK_READ`) -> `[STATUS_OK, bytes_written: u32 LE]`
+//! - `OP_UNLINK`:    `[8, path..]` via `IPC_CALL` -> `[STATUS_OK]` (file or empty dir)
+//! - `OP_MKDIR`:     `[9, path..]` via `IPC_CALL` -> `[STATUS_OK]`
 //!
 //! Any reply with `status != STATUS_OK` carries a human-readable diagnostic in `reply[1..]`.
 
@@ -29,6 +31,8 @@ pub const OP_READ_BULK: u8 = 4;
 pub const OP_MOUNT: u8 = 5;
 pub const OP_UNMOUNT: u8 = 6;
 pub const OP_WRITE_BULK: u8 = 7;
+pub const OP_UNLINK: u8 = 8;
+pub const OP_MKDIR: u8 = 9;
 
 /// Reply status codes.
 pub const STATUS_OK: u8 = 0;

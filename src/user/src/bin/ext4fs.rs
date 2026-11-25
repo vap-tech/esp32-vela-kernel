@@ -92,6 +92,8 @@ fn main(endpoint: u32, storage: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> 
                     | fs_abi::OP_STAT
                     | fs_abi::OP_READ_BULK
                     | fs_abi::OP_WRITE_BULK
+                    | fs_abi::OP_UNLINK
+                    | fs_abi::OP_MKDIR
             ) {
                 return Err((fs_abi::STATUS_ERR, b"unsupported request"));
             }
@@ -255,6 +257,20 @@ fn main(endpoint: u32, storage: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> 
                     response.append(&(done as u32).to_le_bytes());
                     Ok(())
                 }
+                [fs_abi::OP_UNLINK, path @ ..] if !path.is_empty() => {
+                    opened = None;
+                    directory = None;
+                    fs.unlink(path).map_err(err_reply)?;
+                    response.push(fs_abi::STATUS_OK);
+                    Ok(())
+                }
+                [fs_abi::OP_MKDIR, path @ ..] if !path.is_empty() => {
+                    opened = None;
+                    directory = None;
+                    fs.mkdir(path).map_err(err_reply)?;
+                    response.push(fs_abi::STATUS_OK);
+                    Ok(())
+                }
                 _ => Err((fs_abi::STATUS_ERR, b"invalid request")),
             }
         })();
@@ -289,5 +305,7 @@ fn message(error: Error) -> &'static [u8] {
         Error::NotFile => b"not a regular file",
         Error::NotDirectory => b"not a directory",
         Error::NoSpace => b"no space left on device",
+        Error::AlreadyExists => b"file or directory already exists",
+        Error::NotEmpty => b"directory not empty",
     }
 }

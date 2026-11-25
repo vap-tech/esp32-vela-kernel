@@ -301,13 +301,20 @@ pub fn forward_write(
     forward_raw(endpoint, &fwd, 0, response)
 }
 
+/// Forward a single-path operation (`OP_STAT`, `OP_UNLINK`, `OP_MKDIR`) to a
+/// mounted service endpoint with the mount prefix stripped.
+/// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
+pub fn forward_path_op(endpoint: u32, op: u8, rel_path: &[u8], response: &mut Buffer) -> bool {
+    let mut fwd = Buffer::new();
+    fwd.push(op);
+    fwd.append(rel_path);
+    forward_raw(endpoint, &fwd, 500, response)
+}
+
 /// Forward `OP_STAT` to a mounted service endpoint with the mount prefix stripped.
 /// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
 pub fn forward_stat(endpoint: u32, rel_path: &[u8], response: &mut Buffer) -> bool {
-    let mut fwd = Buffer::new();
-    fwd.push(fs_abi::OP_STAT);
-    fwd.append(rel_path);
-    forward_raw(endpoint, &fwd, 500, response)
+    forward_path_op(endpoint, fs_abi::OP_STAT, rel_path, response)
 }
 
 /// Forward `OP_READ_BULK` to a mounted service endpoint, transitively forwarding

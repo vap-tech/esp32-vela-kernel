@@ -4,7 +4,7 @@
 use vela_abi::syscall::{self as abi, SpawnCap, SpawnCaps};
 use vela_user::{
     Buffer, TextBuf,
-    file::{STATUS_NOENT, fs_load_arena, fs_unmount, fs_write, fs_write_bulk},
+    file::{STATUS_NOENT, fs_load_arena, fs_mkdir, fs_unlink, fs_unmount, fs_write, fs_write_bulk},
     io, sys,
     term::EscapeFilter,
 };
@@ -189,6 +189,30 @@ fn echo_to_pipe(text: &[u8], pipe: u32) -> bool {
 }
 
 #[inline(never)]
+fn rm_command(path: &[u8], vfs: u32) {
+    if !path.starts_with(b"/") {
+        sys::write(b"usage: rm </path>\n");
+        return;
+    }
+    let mut response = Buffer::new();
+    if fs_unlink(vfs, path, &mut response).is_err() && response.len() > 1 {
+        sys::write(&response.as_slice()[1..]);
+    }
+}
+
+#[inline(never)]
+fn mkdir_command(path: &[u8], vfs: u32) {
+    if !path.starts_with(b"/") {
+        sys::write(b"usage: mkdir </path>\n");
+        return;
+    }
+    let mut response = Buffer::new();
+    if fs_mkdir(vfs, path, &mut response).is_err() && response.len() > 1 {
+        sys::write(&response.as_slice()[1..]);
+    }
+}
+
+#[inline(never)]
 fn umount_command(prefix: &[u8], vfs: u32) {
     if !prefix.starts_with(b"/") {
         sys::write(b"usage: umount </mount/prefix>\n");
@@ -302,7 +326,7 @@ fn run_single(stage: &[u8], out_path: Option<&[u8]>, caps: Caps) {
     match cmd {
         b"help" => {
             sys::write(
-                b"\x1b[96mhelp\x1b[0m | \x1b[96mls\x1b[0m [path] | \x1b[96mcat\x1b[0m [path] | \x1b[96mwc\x1b[0m [path] | \x1b[96mecho\x1b[0m <val> | \x1b[96mrun\x1b[0m <elf> [arg]\n\x1b[96mstart\x1b[0m <drv.elf> [arg] | \x1b[96mumount\x1b[0m <path> | \x1b[96msdexport\x1b[0m [s|rw] | \x1b[96mexit\x1b[0m\nStreams: <cmd1> | <cmd2> [> <path>]   <cmd> > <path>   (writable /sd, /dev, /mnt)\n",
+                b"\x1b[96mhelp\x1b[0m | \x1b[96mls\x1b[0m [path] | \x1b[96mcat\x1b[0m [path] | \x1b[96mwc\x1b[0m [path] | \x1b[96mecho\x1b[0m <val> | \x1b[96mmkdir\x1b[0m <path> | \x1b[96mrm\x1b[0m <path>\n\x1b[96mrun\x1b[0m <elf> [arg] | \x1b[96mstart\x1b[0m <drv.elf> [arg] | \x1b[96mumount\x1b[0m <path> | \x1b[96msdexport\x1b[0m [s|rw] | \x1b[96mexit\x1b[0m\nStreams: <cmd1> | <cmd2> [> <path>]   <cmd> > <path>   (writable /sd, /dev, /mnt)\n",
             );
         }
         b"echo" => {
@@ -313,6 +337,8 @@ fn run_single(stage: &[u8], out_path: Option<&[u8]>, caps: Caps) {
                 sys::write(b"\n");
             }
         }
+        b"rm" => rm_command(arg, caps.vfs),
+        b"mkdir" => mkdir_command(arg, caps.vfs),
         b"umount" => umount_command(arg, caps.vfs),
         b"exit" => sys::process_exit(),
         b"start" => {
