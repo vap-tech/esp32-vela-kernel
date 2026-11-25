@@ -64,6 +64,7 @@ pub struct Runtime {
     pub ext_contexts: [arch::ExtendedContext; TASKS],
     pub processes: Processes,
     pub fbcon_pid: Option<Pid>,
+    pub kbd_pid: Option<Pid>,
     pub harts: [HartState; HARTS],
     /// Per-process prepared PMP CSR image `(revision, prepared, verified_hart_mask)`.
     pub pmp_images: [Option<(u32, pmp::Prepared, u8)>; vela_kernel::process::PROCESSES],
@@ -455,6 +456,9 @@ impl Runtime {
             if unbound {
                 self.mask_irq_slot(index);
             }
+        }
+        if self.kbd_pid == Some(reaped.pid) {
+            self.kbd_pid = None;
         }
         if self.fbcon_pid == Some(reaped.pid) {
             self.fbcon_pid = None;

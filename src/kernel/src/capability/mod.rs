@@ -23,6 +23,8 @@ pub const ADMIN: u16 = 1024;
 pub enum Authority {
     ProcessSpawn,
     FbconSupervisor,
+    /// Boot-only authority; the handle names the terminal endpoint owned by init.
+    KeyboardSupervisor(Handle),
     Display,
     Sentinel,
     IrqControl,

@@ -86,13 +86,25 @@ extern "C" fn supervise_fbcon(handle: u32) -> ! {
     }
 }
 
-fn main(vfs: u32, input: u32, spawn: u32, display: u32, supervisor: u32, _a5: u32) -> ! {
+extern "C" fn supervise_kbd(handle: u32) -> ! {
+    loop {
+        let rc = sys::call(abi::KBD_SUPERVISE, handle, 0, 0, 0);
+        sys::write(if (rc as i32) < 0 {
+            b"[init] keyboard start failed, retrying\n"
+        } else {
+            b"[init] keyboard exited, restarting\n"
+        });
+        sys::sleep_ticks(100);
+    }
+}
+
+fn start_supervisor(entry: extern "C" fn(u32) -> !, supervisor: u32) {
     if supervisor != 0 {
         loop {
             if let Ok(mut stack) = vela_user::arena::Arena::new(4096) {
                 let (tid, _) = sys::call6(
                     abi::THREAD_CREATE,
-                    supervise_fbcon as *const () as u32,
+                    entry as *const () as u32,
                     stack.base() as u32,
                     stack.size() as u32,
                     supervisor,
@@ -104,10 +116,15 @@ fn main(vfs: u32, input: u32, spawn: u32, display: u32, supervisor: u32, _a5: u3
                 }
                 let _ = stack.release();
             }
-            sys::write(b"[init] fbcon supervisor thread unavailable\n");
+            sys::write(b"[init] supervisor thread unavailable\n");
             sys::sleep_ticks(100);
         }
     }
+}
+
+fn main(vfs: u32, input: u32, spawn: u32, display: u32, supervisor: u32, keyboard: u32) -> ! {
+    start_supervisor(supervise_fbcon, supervisor);
+    start_supervisor(supervise_kbd, keyboard);
     let caps = Caps {
         vfs,
         input,

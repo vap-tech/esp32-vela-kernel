@@ -26,7 +26,7 @@ const EXT4FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ext4fs.elf")
 const SYSD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sysd.elf"));
 const INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 const CONSOLE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/console.elf"));
-const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
+pub(crate) const KBD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
 pub(crate) const FBCON_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fbcon.elf"));
 
 unsafe extern "C" {
@@ -132,6 +132,7 @@ extern "C" fn rust_main() -> ! {
             tickless_enter_16m: 0,
             tickless_period_16m: soc::timer::PERIOD_10MS_16M,
             fbcon_pid: None,
+            kbd_pid: None,
             logs: BootLogs::EMPTY,
         })
     };
@@ -142,7 +143,6 @@ extern "C" fn rust_main() -> ! {
         .load_elf_in(INIT_ELF, MemoryClass::Psram, false)
         .expect("init ELF");
     let (console_proc, _, _) = runtime.load_elf(CONSOLE_ELF, false).expect("console ELF");
-    let (kbd_proc, _, _) = runtime.load_elf(KBD_ELF, false).expect("kbd ELF");
     let (ext4fs, _, _) = runtime
         .load_elf_in(EXT4FS_ELF, MemoryClass::Psram, false)
         .expect("ext4fs ELF");
@@ -214,24 +214,6 @@ extern "C" fn rust_main() -> ! {
         cap::SEND,
     )
     .unwrap();
-    // The Tab5 Keyboard service feeds the same terminal input endpoint as the USB console.
-    let kbd_input = grant(
-        &mut runtime.processes,
-        init_proc.slot,
-        input_owner,
-        kbd_proc.slot,
-        cap::SEND,
-    )
-    .unwrap();
-    let kbd_i2c_cap = runtime
-        .processes
-        .slot_mut(kbd_proc.slot)
-        .capabilities
-        .install(Capability {
-            object: Object::Authority(Authority::I2c(crate::syscall::I2C_BUS_EXT1)),
-            rights: cap::READ | cap::WRITE,
-        })
-        .unwrap();
     let rx_event = bind_event(
         &mut runtime.events,
         &mut runtime.processes,
@@ -241,16 +223,6 @@ extern "C" fn rust_main() -> ! {
         cap::READ | cap::WAIT | cap::ACK | cap::GRANT | cap::CONTROL,
     )
     .unwrap();
-    let kbd_event = bind_event(
-        &mut runtime.events,
-        &mut runtime.processes,
-        &mut runtime.scheduler,
-        kbd_proc.slot,
-        IRQ_SLOT_KBD,
-        cap::READ | cap::WAIT | cap::ACK,
-    )
-    .unwrap();
-
     let sysd_caps = &mut runtime.processes.slot_mut(sysd.slot).capabilities;
     let sysd_i2c_system = sysd_caps
         .install(Capability {
@@ -281,6 +253,12 @@ extern "C" fn rust_main() -> ! {
     let supervisor = init_caps
         .install(Capability {
             object: Object::Authority(Authority::FbconSupervisor),
+            rights: cap::CONTROL,
+        })
+        .unwrap();
+    let kbd_supervisor = init_caps
+        .install(Capability {
+            object: Object::Authority(Authority::KeyboardSupervisor(input_owner)),
             rights: cap::CONTROL,
         })
         .unwrap();
@@ -321,7 +299,7 @@ extern "C" fn rust_main() -> ! {
                 spawn_cap.raw(),
                 display_cap.raw(),
                 supervisor.raw(),
-                0,
+                kbd_supervisor.raw(),
             ],
             1,
             1,
@@ -331,14 +309,6 @@ extern "C" fn rust_main() -> ! {
         .start_loaded(
             console_proc,
             [console_input.raw(), rx_event.raw(), 0, 0, 0, 0],
-            2,
-            2,
-        )
-        .unwrap();
-    runtime
-        .start_loaded(
-            kbd_proc,
-            [kbd_input.raw(), kbd_i2c_cap.raw(), kbd_event.raw(), 0, 0, 0],
             2,
             2,
         )
@@ -356,7 +326,7 @@ extern "C" fn rust_main() -> ! {
 
     let _ = writeln!(
         runtime.console,
-        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] sysd started (/proc /sys /dev /sd)\n[task] init started\n[task] console started (USB RX event)\n[task] kbd started (Ext.Port1 I2C)\n[sched] preemptive scheduler online"
+        "[mm] PMP initialized\n[ipc] endpoints initialized\n[task] sysd started (/proc /sys /dev /sd)\n[task] init started\n[task] console started (USB RX event)\n[sched] preemptive scheduler online"
     );
 
     unsafe {

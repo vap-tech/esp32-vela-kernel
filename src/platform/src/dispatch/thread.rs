@@ -30,6 +30,58 @@ const _: () = {
 };
 
 impl Runtime {
+    pub(super) fn sys_kbd_supervise(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+        switch: &mut bool,
+    ) -> Result<u32, Errno> {
+        let supervisor = self
+            .processes
+            .slot(current)
+            .capabilities
+            .get(Handle(args.a0), cap::CONTROL)?;
+        let Object::Authority(Authority::KeyboardSupervisor(input)) = supervisor.object else {
+            return Err(Errno::Ebadf);
+        };
+        let pid = if let Some(pid) = self.kbd_pid {
+            pid
+        } else {
+            let (child, _, _) = self.load_elf(crate::boot::KBD_ELF, false)?;
+            let result = (|| {
+                let sender =
+                    lifecycle::grant(&mut self.processes, current, input, child.slot, cap::SEND)?;
+                let bus = self
+                    .processes
+                    .slot_mut(child.slot)
+                    .capabilities
+                    .install(Capability {
+                        object: Object::Authority(Authority::I2c(syscall::I2C_BUS_EXT1)),
+                        rights: cap::READ | cap::WRITE,
+                    })?;
+                let irq = lifecycle::bind_event(
+                    &mut self.events,
+                    &mut self.processes,
+                    &mut self.scheduler,
+                    child.slot,
+                    IRQ_SLOT_KBD,
+                    cap::READ | cap::WAIT | cap::ACK,
+                )?;
+                self.start_loaded(child, [sender.raw(), bus.raw(), irq.raw(), 0, 0, 0], 2, 2)
+            })();
+            if let Err(error) = result {
+                self.events.remove_process(child.slot, &mut self.scheduler);
+                self.abort_loaded(child);
+                return Err(error);
+            }
+            self.kbd_pid = Some(child.pid);
+            child.pid
+        };
+        self.scheduler.block(Wait::ProcessExit { pid });
+        *switch = true;
+        Ok(0)
+    }
+
     pub(super) fn sys_fbcon_supervise(
         &mut self,
         current: ProcSlot,

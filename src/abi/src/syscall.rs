@@ -236,6 +236,8 @@ pub const IPC_CALL_CAP: u32 = 51;
 pub const IPC_ACCEPT_CAP: u32 = 52;
 /// Start the bundled framebuffer console or join the existing instance; wait for exit.
 pub const FBCON_SUPERVISE: u32 = 53;
+/// Start or join the bundled keyboard driver and wait for its process to exit.
+pub const KBD_SUPERVISE: u32 = 54;
 pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
 
 #[repr(C)]
