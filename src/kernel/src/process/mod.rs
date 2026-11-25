@@ -1,6 +1,6 @@
 //! Process-owned address spaces. Slot indices never cross the user ABI.
 use crate::{
-    capability::Table,
+    capability::{Object, Table},
     errno::Errno,
     id::{Pid, ProcSlot},
     task::Region,
@@ -117,7 +117,18 @@ impl Process {
         priority_ceiling: 1,
     };
 }
+/// Opaque names attached to send-only endpoint references retained for a service restart.
+pub const RECOVERY_SLOTS: usize = 7;
+pub const RECOVERY_KEY_BYTES: usize = 32;
+
+#[derive(Clone, Copy)]
+pub struct RecoveryEntry {
+    pub key: [u8; RECOVERY_KEY_BYTES],
+    pub endpoint: Object,
+}
+
 pub struct Processes {
+    recovery: [Option<RecoveryEntry>; RECOVERY_SLOTS],
     pub slots: [Process; PROCESSES],
     next_id: Pid,
 }
@@ -131,8 +142,44 @@ impl Processes {
         Self {
             slots: [Process::EMPTY; PROCESSES],
             next_id: Pid(1),
+            recovery: [None; RECOVERY_SLOTS],
         }
     }
+    pub fn recovery_entry(&self, slot: usize) -> Option<RecoveryEntry> {
+        self.recovery.get(slot).copied().flatten()
+    }
+
+    pub fn update_recovery(
+        &mut self,
+        key: [u8; RECOVERY_KEY_BYTES],
+        endpoint: Option<Object>,
+    ) -> Result<(), Errno> {
+        let existing = self
+            .recovery
+            .iter()
+            .position(|entry| entry.is_some_and(|e| e.key == key));
+        if let Some(endpoint) = endpoint {
+            if !matches!(endpoint, Object::Endpoint { .. }) {
+                return Err(Errno::Ebadf);
+            }
+            let slot = existing
+                .or_else(|| self.recovery.iter().position(Option::is_none))
+                .ok_or(Errno::Enospc)?;
+            self.recovery[slot] = Some(RecoveryEntry { key, endpoint });
+        } else if let Some(slot) = existing {
+            self.recovery[slot] = None;
+        }
+        Ok(())
+    }
+
+    pub fn revoke_recovery(&mut self, object: Object) {
+        for entry in &mut self.recovery {
+            if entry.is_some_and(|e| e.endpoint == object) {
+                *entry = None;
+            }
+        }
+    }
+
     pub fn slot(&self, slot: ProcSlot) -> &Process {
         &self.slots[slot.index()]
     }
@@ -167,6 +214,35 @@ impl Processes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_replaces_by_name_and_revoke_clears_all_matching_generations() {
+        let mut processes = Processes::new();
+        let old = Object::Endpoint {
+            index: 2,
+            generation: 3,
+        };
+        let new = Object::Endpoint {
+            index: 2,
+            generation: 4,
+        };
+        let keys: [[u8; RECOVERY_KEY_BYTES]; RECOVERY_SLOTS] =
+            core::array::from_fn(|i| [i as u8 + 1; RECOVERY_KEY_BYTES]);
+        for key in keys {
+            processes.update_recovery(key, Some(old)).unwrap();
+        }
+        let extra = [99; RECOVERY_KEY_BYTES];
+        assert_eq!(
+            processes.update_recovery(extra, Some(new)),
+            Err(Errno::Enospc)
+        );
+        processes.update_recovery(keys[0], Some(new)).unwrap();
+        processes.revoke_recovery(old);
+        assert_eq!(processes.recovery_entry(0).unwrap().endpoint, new);
+        assert!((1..RECOVERY_SLOTS).all(|i| processes.recovery_entry(i).is_none()));
+        processes.update_recovery(keys[0], None).unwrap();
+        assert!(processes.recovery_entry(0).is_none());
+    }
 
     #[test]
     fn address_space_enforces_wx_alignment_overlap_and_bounds() {

@@ -38,6 +38,9 @@ impl Runtime {
         let args = Args::from_frame(frame);
         let current = self.scheduler.current().process;
         let result = match args.number {
+            syscall::SYSD_SAVE_ENDPOINT | syscall::SYSD_LOAD_ENDPOINT => {
+                self.sys_recovery_endpoint(current, args)
+            }
             syscall::KBD_SUPERVISE => self.sys_kbd_supervise(current, args, switch),
             syscall::SYSD_SUPERVISE | syscall::FBCON_SUPERVISE | syscall::EXT4_SUPERVISE => {
                 self.sys_service_supervise(current, args, switch)

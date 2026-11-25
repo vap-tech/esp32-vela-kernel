@@ -18,6 +18,65 @@ use crate::{
 };
 
 impl Runtime {
+    pub(super) fn sys_recovery_endpoint(
+        &mut self,
+        current: ProcSlot,
+        args: Args,
+    ) -> Result<u32, Errno> {
+        use vela_kernel::{
+            capability::SEND,
+            process::{RECOVERY_KEY_BYTES, RECOVERY_SLOTS},
+        };
+        const _: () = assert!(
+            RECOVERY_KEY_BYTES == syscall::SYSD_KEY_BYTES
+                && RECOVERY_SLOTS == syscall::SYSD_RECOVERY_SLOTS
+        );
+        if self.sysd_pid != Some(self.processes.slot(current).id) {
+            return Err(Errno::Eperm);
+        }
+        if args.number == syscall::SYSD_LOAD_ENDPOINT {
+            if args.a0 as usize >= RECOVERY_SLOTS {
+                return Err(Errno::Einval);
+            }
+            let Some(entry) = self.processes.recovery_entry(args.a0 as usize) else {
+                return Ok(0);
+            };
+            self.ipc.resolve(entry.endpoint)?;
+            copy_to_user_within(
+                self.memory(),
+                args.a1 as usize,
+                RECOVERY_KEY_BYTES,
+                &entry.key,
+            )?;
+            return self
+                .processes
+                .slot_mut(current)
+                .capabilities
+                .install(Capability {
+                    object: entry.endpoint,
+                    rights: SEND,
+                })
+                .map(Handle::raw);
+        }
+        let mut key = [0; RECOVERY_KEY_BYTES];
+        let len = args.a2 as usize;
+        if len == 0 || len > key.len() {
+            return Err(Errno::Einval);
+        }
+        copy_from_user(self.memory(), args.a1 as usize, &mut key[..len])?;
+        if key[..len].contains(&0) {
+            return Err(Errno::Einval);
+        }
+        let object = if args.a0 == 0 {
+            None
+        } else {
+            let ep = self.endpoint(current, Handle(args.a0), SEND)?;
+            Some(self.ipc.object(ep))
+        };
+        self.processes.update_recovery(key, object)?;
+        Ok(0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn do_ipc_call(
         &mut self,

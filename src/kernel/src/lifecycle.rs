@@ -400,6 +400,7 @@ pub fn invalidate_object<C: Context>(
     object: Object,
     keep_owner: Option<ProcSlot>,
 ) {
+    processes.revoke_recovery(object);
     for idx in 0..processes.slots.len() {
         let process = ProcSlot(idx);
         if Some(process) == keep_owner {

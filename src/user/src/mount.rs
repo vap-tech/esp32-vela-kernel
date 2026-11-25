@@ -91,6 +91,13 @@ impl MountTable {
         None
     }
 
+    pub fn prefix_for_endpoint(&self, endpoint: u32) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|entry| endpoint != 0 && entry.endpoint == endpoint)
+            .map(MountEntry::prefix)
+    }
+
     /// Remove any mount backed by `endpoint` (used to auto-prune dead driver endpoints).
     pub fn remove_endpoint(&mut self, endpoint: u32) -> bool {
         if endpoint == 0 {

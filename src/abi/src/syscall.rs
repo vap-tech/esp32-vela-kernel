@@ -243,6 +243,12 @@ pub const KBD_SUPERVISE: u32 = 54;
 pub const EXT4_SUPERVISE: u32 = 55;
 /// Wait for sysd and restart it on the retained namespace endpoint.
 pub const SYSD_SUPERVISE: u32 = 56;
+/// sysd only: atomically retain (or forget for handle zero) a named SEND endpoint.
+pub const SYSD_SAVE_ENDPOINT: u32 = 57; // a0=handle, a1=key, a2=length
+/// sysd only: recover a fresh SEND handle and copy its zero-padded key to a1.
+pub const SYSD_LOAD_ENDPOINT: u32 = 58; // a0=slot, zero result means empty
+pub const SYSD_RECOVERY_SLOTS: usize = 7;
+pub const SYSD_KEY_BYTES: usize = 32;
 pub const IPC_ACCEPT_CAP_QUERY: u32 = 1;
 
 #[repr(C)]

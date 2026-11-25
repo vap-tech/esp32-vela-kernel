@@ -100,9 +100,50 @@ fn render_virtual(path: &[u8], mounts: &MountTable, caps: Caps, out: &mut TextBu
     fs_abi::STATUS_NOENT
 }
 
+fn save_dynamic(prefix: &[u8], endpoint: u32) -> bool {
+    let key = mount::normalize_path(prefix);
+    usys::call(
+        abi::SYSD_SAVE_ENDPOINT,
+        endpoint,
+        key.as_ptr() as u32,
+        key.len() as u32,
+        0,
+    ) == 0
+}
+
+fn restore_dynamic(mounts: &mut MountTable) {
+    const _: () = assert!(
+        mount::MAX_PREFIX == abi::SYSD_KEY_BYTES
+            && mount::MAX_MOUNTS == abi::SYSD_RECOVERY_SLOTS + 1
+    );
+    for slot in 0..abi::SYSD_RECOVERY_SLOTS {
+        let mut key = [0; abi::SYSD_KEY_BYTES];
+        let ep = usys::call(
+            abi::SYSD_LOAD_ENDPOINT,
+            slot as u32,
+            key.as_mut_ptr() as u32,
+            0,
+            0,
+        );
+        if ep == 0 {
+            continue;
+        }
+        if (ep as i32) < 0 {
+            usys::exit();
+        }
+        let len = key.iter().position(|&b| b == 0).unwrap_or(key.len());
+        if mounts.mount(&key[..len], ep).is_err() {
+            usys::exit();
+        }
+    }
+}
+
 fn prune_if_dead(alive: bool, ep: u32, mounts: &mut MountTable, cache: &mut SnapshotCache) {
     // Keep the reserved slot available for replacement even when all dynamic mounts are used.
     if !alive && !mounts.resolve(b"/sd").is_some_and(|(sd, _)| sd == ep) {
+        if let Some(prefix) = mounts.prefix_for_endpoint(ep) {
+            save_dynamic(prefix, 0);
+        }
         mounts.remove_endpoint(ep);
         let _ = usys::endpoint_close(ep);
         cache.invalidate();
@@ -342,22 +383,28 @@ fn handle_mount(
         response.append(b"sysd: cannot accept mount endpoint\n");
         return;
     };
-    match mounts.mount(prefix, new_ep) {
-        Ok(Some(old_ep)) => {
-            let _ = usys::endpoint_close(old_ep);
-            cache.invalidate();
-            response.push(fs_abi::STATUS_OK);
+    let Ok(previous) = mounts.mount(prefix, new_ep) else {
+        let _ = usys::endpoint_close(new_ep);
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: mount table full\n");
+        return;
+    };
+    if prefix != b"/sd" && !save_dynamic(prefix, new_ep) {
+        if let Some(old_ep) = previous {
+            let _ = mounts.mount(prefix, old_ep);
+        } else {
+            mounts.unmount(prefix);
         }
-        Ok(None) => {
-            cache.invalidate();
-            response.push(fs_abi::STATUS_OK);
-        }
-        Err(()) => {
-            let _ = usys::endpoint_close(new_ep);
-            response.push(fs_abi::STATUS_ERR);
-            response.append(b"sysd: mount table full\n");
-        }
+        let _ = usys::endpoint_close(new_ep);
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"sysd: cannot retain mount\n");
+        return;
     }
+    if let Some(old_ep) = previous {
+        let _ = usys::endpoint_close(old_ep);
+    }
+    cache.invalidate();
+    response.push(fs_abi::STATUS_OK);
 }
 
 fn handle_unmount(
@@ -380,6 +427,10 @@ fn handle_unmount(
     if !mount::is_valid_dynamic_prefix(prefix) {
         response.push(fs_abi::STATUS_ERR);
         response.append(b"sysd: invalid mount prefix\n");
+        return;
+    }
+    if !save_dynamic(prefix, 0) {
+        response.push(fs_abi::STATUS_ERR);
         return;
     }
     if let Some(old_ep) = mounts.unmount(prefix) {
@@ -497,6 +548,7 @@ fn main(
     if ext4_handle != 0 {
         let _ = mounts.mount(b"/sd", ext4_handle);
     }
+    restore_dynamic(&mut mounts);
     // SAFETY: single-threaded service, `CACHE` is never aliased.
     let cache = unsafe { &mut *core::ptr::addr_of_mut!(CACHE) };
     let mut request = Buffer::new();
