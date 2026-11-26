@@ -133,6 +133,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vela-sdk"
+version = "0.3.0"
+dependencies = [
+ "vela-abi",
+ "vela-user",
+]
+
+[[package]]
 name = "vela-user"
 version = "0.3.0"
 dependencies = [

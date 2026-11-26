@@ -1,0 +1,10 @@
+[package]
+name = "vela-sdk"
+version = "0.3.0"
+edition = "2024"
+description = "Application API for the Vela microkernel"
+license = "MIT"
+
+[dependencies]
+vela-user = { path = "../user" }
+vela-abi = { path = "../abi" }

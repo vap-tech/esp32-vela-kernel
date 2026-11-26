@@ -8,6 +8,10 @@ Dual-core HP0+HP1 SMP M-mode kernel; PMP-isolated U-mode `sysd`, `init`, `consol
 LP Sentinel independently observes HP heartbeats, keeps a diagnostic journal
 and delivers one-shot timer events through the hardware mailbox.
 
+Application development is documented in [the SDK guide](docs/sdk.md).
+`./scripts/build-app.sh` builds an independent `no_std` Rust example using only
+`vela-sdk`, ready to copy to microSD and run through shell, pipes or redirection.
+
 ## Build and run
 
 The build requires Rustup, Clang with RISC-V support, `espflash`

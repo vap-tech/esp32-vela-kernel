@@ -6,6 +6,7 @@ members = [
     "src/lp",
     "src/platform",
     "src/user",
+    "src/sdk",
 ]
 default-members = ["src/platform"]
 

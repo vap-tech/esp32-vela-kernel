@@ -1,0 +1,17 @@
+[package]
+name = "vela-upper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately independent from the kernel workspace.
+[workspace]
+
+[dependencies]
+vela-sdk = { path = "../../src/sdk" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
