@@ -71,3 +71,33 @@ HP1 increased from 1,888 bytes in the first snapshot to 2,332 after the commands
 and display startup reported 40 frames without underrun. This short read-only
 workload is a baseline. It does not cover every filesystem, driver recovery or
 exception path, and the scan itself contributes to stack use.
+
+## Framebuffer console placement
+
+Keep the bundled `fbcon` image (about 24 KiB of loadable segment address space,
+rounded to a 32 KiB allocation) and its 8 KiB stack reservation (4 KiB usable,
+4 KiB PMP-denied guard) in SRAM. The text grid and font are part of that image.
+The 2 MiB scanout framebuffer remains in PSRAM. Keeping only the stack in SRAM
+did not improve the observed redraw time while the renderer image stayed in PSRAM.
+
+The four mostly blocked `init` supervisor threads each use a 64 KiB PSRAM
+allocation with a 32 KiB usable stack and a 32 KiB guard. This trades 256 KiB
+of external memory for 32 KiB of freed internal SRAM, allowing `fbcon` and the
+keyboard service to run together. Guarded THREAD_CREATE and process isolation
+remain enabled. Firmware boot requires enough SRAM for this service policy.
+
+The first-render log uses system ticks (10 ms each), including scheduling delays.
+Per-hart cycle subtraction is unsuitable when the renderer migrates between HP
+harts. Compare similar cell counts and workloads, and include all services in the
+check: a fast render alone does not establish sufficient memory for the keyboard
+and supervisors.
+
+On Tab5, 2026-11-26, the same first render of 618 cells at 180 MHz took
+254 ticks (2.54 s) with the image in PSRAM, including when only its stack was
+moved to SRAM. With the image and stack in SRAM, and supervisor stacks moved
+to PSRAM, it took 8 ticks (80 ms), about 32 times faster. Both builds retained
+the kernel trap checks. The pre-guard `e45a0bf` build also took 254 ticks with
+its PSRAM image, so the regression predates the kernel stack checks.
+The final boot had all four supervisors, keyboard, shell and display running,
+`last_fault=none`, and intact HP boundary markers. These figures measure startup
+redraw, not a separate worst-case full-screen scrolling benchmark.

@@ -188,8 +188,9 @@ impl Runtime {
             self.ext4_pid = Some(child.pid);
             child.pid
         } else {
-            let (child, _, _) =
-                self.load_elf_in(crate::boot::FBCON_ELF, MemoryClass::Psram, false)?;
+            // Rendering executes tight pixel loops. Keep the small service image
+            // and guarded stack in SRAM, while its framebuffer remains in PSRAM.
+            let (child, _, _) = self.load_elf(crate::boot::FBCON_ELF, false)?;
             let result = (|| {
                 let caps = &mut self.processes.slot_mut(child.slot).capabilities;
                 let display = caps.install(Capability {

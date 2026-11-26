@@ -167,18 +167,18 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
             cursor = next;
             active = true;
         }
-        let start = sys::rdcycle64();
+        let start = now();
         // SAFETY: `fb` is the 2 MiB PSRAM region we own, at least `FB_WORDS` words long.
         let drawn = unsafe { console.render(fb) };
         if !measured && drawn > 100 {
             measured = true;
-            let kcycles = ((sys::rdcycle64() - start) / 1000) as u32;
+            let ticks = now().wrapping_sub(start);
             let mut line = TextBuf::<96>::new();
             line.append(b"[fbcon] first render ");
             line.decimal(drawn as u32);
             line.append(b" cells, ");
-            line.decimal(kcycles);
-            line.append(b" kcycles, fb words ");
+            line.decimal(ticks);
+            line.append(b" ticks (10 ms), fb words ");
             line.decimal(FB_WORDS as u32);
             line.push(b'\n');
             sys::write(line.as_slice());

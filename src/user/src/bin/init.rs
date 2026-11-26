@@ -125,7 +125,9 @@ extern "C" fn supervise_sysd(handle: u32) -> ! {
 fn start_supervisor(entry: extern "C" fn(u32) -> !, supervisor: u32) {
     if supervisor != 0 {
         loop {
-            if let Ok(mut stack) = vela_user::arena::Arena::new(8192) {
+            // Supervisors mostly wait. Preserve scarce SRAM for pixel rendering
+            // and IRQ drivers, keeping a PMP-denied lower half on each stack.
+            if let Ok(mut stack) = vela_user::arena::Arena::new_psram(65536) {
                 let (tid, _) = sys::call6(
                     abi::THREAD_CREATE,
                     entry as *const () as u32,
