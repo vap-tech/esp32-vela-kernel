@@ -304,6 +304,22 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     ctx_ptr
 }
 
+/// Fatal path uses a private emergency stack and never borrows Runtime or its lock.
+#[unsafe(no_mangle)]
+extern "C" fn rust_kernel_stack_fault(hart: usize, sp: usize, pc: usize, reason: usize) -> ! {
+    let mut console = unsafe { soc::console::Console::new() };
+    let reason = if reason == 1 {
+        "sp-out-of-bounds"
+    } else {
+        "guard-corrupted"
+    };
+    let _ = writeln!(
+        console,
+        "[kernel stack fault] hart={hart} reason={reason} sp={sp:#010x} pc={pc:#010x}"
+    );
+    arch::halt()
+}
+
 fn fatal(frame: &arch::TrapFrame) -> ! {
     // SAFETY: fatal takeover never resumes an interrupted console owner.
     unsafe {

@@ -45,6 +45,15 @@ SECTIONS {
  ASSERT(_bss_end <= _dma_page, "Runtime overlaps DMA arena")
  _boot_stack_top = ORIGIN(BOOT_STACK) + LENGTH(BOOT_STACK);
  _stack_bottom = ORIGIN(STACK);
+ _hp1_stack_guard = ORIGIN(STACK);
+ _hp0_stack_guard = ORIGIN(STACK) + LENGTH(STACK) / 2;
+ _kernel_guard_bytes = 256;
+ /* Two independent emergency stacks in the gap below the boot stack. */
+ _hp0_emergency_top = ORIGIN(BOOT_STACK) - 4096;
+ _hp1_emergency_top = ORIGIN(BOOT_STACK);
+ ASSERT(ORIGIN(DISPLAY) + LENGTH(DISPLAY) <= ORIGIN(BOOT_STACK) - 8192,
+        "Display overlaps emergency stacks")
+ ASSERT(LENGTH(STACK) / 2 > _kernel_guard_bytes + 4096, "Kernel stack too small")
  _hp1_stack_top = ORIGIN(STACK) + LENGTH(STACK) / 2;
  _stack_top = ORIGIN(STACK) + LENGTH(STACK);
  ASSERT(SIZEOF(.entry) <= 8192, "SPM entry exceeds 8KiB")

@@ -17,7 +17,7 @@ use crate::{
     arch, board,
     display::DisplayControl,
     dma::{DMA_CH_DW_GDMA_SCANOUT, DMA_CH_GDMA_AHB_CH1},
-    runtime::{BootLogs, HartState, IRQ_SLOT_CONSOLE_RX, IRQ_SLOT_KBD, RUNTIME, Runtime},
+    runtime::{BootLogs, HartState, IRQ_SLOT_CONSOLE_RX, IRQ_SLOT_KBD, RUNTIME},
     sentinel::SentinelClient,
     soc,
 };
@@ -84,61 +84,63 @@ extern "C" fn rust_main() -> ! {
 
     // SAFETY: once-only initialization on hart0 with IRQs masked.
     let runtime = unsafe {
-        (*RUNTIME.0.get()).write(Runtime {
-            scheduler: Scheduler::empty(idle0),
-            ext_contexts: [arch::ExtendedContext::ZERO; vela_kernel::sched::TASKS],
-            processes: Processes::new(),
-            harts: [
-                HartState {
-                    active_space: None,
-                    idle_frame: idle0,
-                    in_idle: false,
-                    cycles: CycleAccounting::new(),
-                    ipi_interrupts: 0,
-                    pmp_shootdowns: 0,
-                },
-                HartState {
-                    active_space: None,
-                    idle_frame: idle1,
-                    in_idle: true,
-                    cycles: CycleAccounting::new(),
-                    ipi_interrupts: 0,
-                    pmp_shootdowns: 0,
-                },
-            ],
-            pmp_images: [None; PROCESSES],
-            allocator: RegionAllocator::new(
-                core::ptr::addr_of!(_bss_end) as usize,
-                core::ptr::addr_of!(_dma_page) as usize,
-            ),
-            console,
-            ipc: Ipc::new(),
-            calls: CallTable::new(),
-            events,
-            dma,
-            sentinel: SentinelClient::new(),
-            display: DisplayControl::new(),
-            usb_storage: soc::usb_storage::UsbStorage::new(),
-            sd_export_buffer: None,
-            sd_export_owner: None,
-            sd_export_interrupted: false,
-            sd_epoch: 1,
-            sd_partition: None,
-            dma_interrupts: 0,
-            sentinel_interrupts: 0,
-            freq_mode: FreqMode::Auto,
-            active_high_180mhz: false,
-            tickless_armed: false,
-            tickless_enter_16m: 0,
-            tickless_period_16m: soc::timer::PERIOD_10MS_16M,
-            sysd_pid: None,
-            sd_endpoint: None,
-            ext4_pid: None,
-            fbcon_pid: None,
-            kbd_pid: None,
-            logs: BootLogs::EMPTY,
-            last_fault: crate::trap::FaultReport::EMPTY,
-        })
+        let ptr = (*RUNTIME.0.get()).as_mut_ptr();
+        // Initialize fields in place to avoid a Runtime-sized boot stack temporary.
+        core::ptr::addr_of_mut!((*ptr).scheduler).write(Scheduler::empty(idle0));
+        core::ptr::addr_of_mut!((*ptr).ext_contexts)
+            .write([arch::ExtendedContext::ZERO; vela_kernel::sched::TASKS]);
+        core::ptr::addr_of_mut!((*ptr).processes).write(Processes::new());
+        core::ptr::addr_of_mut!((*ptr).harts).write([
+            HartState {
+                active_space: None,
+                idle_frame: idle0,
+                in_idle: false,
+                cycles: CycleAccounting::new(),
+                ipi_interrupts: 0,
+                pmp_shootdowns: 0,
+            },
+            HartState {
+                active_space: None,
+                idle_frame: idle1,
+                in_idle: true,
+                cycles: CycleAccounting::new(),
+                ipi_interrupts: 0,
+                pmp_shootdowns: 0,
+            },
+        ]);
+        core::ptr::addr_of_mut!((*ptr).pmp_images).write([None; PROCESSES]);
+        core::ptr::addr_of_mut!((*ptr).allocator).write(RegionAllocator::new(
+            core::ptr::addr_of!(_bss_end) as usize,
+            core::ptr::addr_of!(_dma_page) as usize,
+        ));
+        core::ptr::addr_of_mut!((*ptr).console).write(console);
+        core::ptr::addr_of_mut!((*ptr).ipc).write(Ipc::new());
+        core::ptr::addr_of_mut!((*ptr).calls).write(CallTable::new());
+        core::ptr::addr_of_mut!((*ptr).events).write(events);
+        core::ptr::addr_of_mut!((*ptr).dma).write(dma);
+        core::ptr::addr_of_mut!((*ptr).sentinel).write(SentinelClient::new());
+        core::ptr::addr_of_mut!((*ptr).display).write(DisplayControl::new());
+        core::ptr::addr_of_mut!((*ptr).usb_storage).write(soc::usb_storage::UsbStorage::new());
+        core::ptr::addr_of_mut!((*ptr).sd_export_buffer).write(None);
+        core::ptr::addr_of_mut!((*ptr).sd_export_owner).write(None);
+        core::ptr::addr_of_mut!((*ptr).sd_export_interrupted).write(false);
+        core::ptr::addr_of_mut!((*ptr).sd_epoch).write(1);
+        core::ptr::addr_of_mut!((*ptr).sd_partition).write(None);
+        core::ptr::addr_of_mut!((*ptr).dma_interrupts).write(0);
+        core::ptr::addr_of_mut!((*ptr).sentinel_interrupts).write(0);
+        core::ptr::addr_of_mut!((*ptr).freq_mode).write(FreqMode::Auto);
+        core::ptr::addr_of_mut!((*ptr).active_high_180mhz).write(false);
+        core::ptr::addr_of_mut!((*ptr).tickless_armed).write(false);
+        core::ptr::addr_of_mut!((*ptr).tickless_enter_16m).write(0);
+        core::ptr::addr_of_mut!((*ptr).tickless_period_16m).write(soc::timer::PERIOD_10MS_16M);
+        core::ptr::addr_of_mut!((*ptr).sysd_pid).write(None);
+        core::ptr::addr_of_mut!((*ptr).sd_endpoint).write(None);
+        core::ptr::addr_of_mut!((*ptr).ext4_pid).write(None);
+        core::ptr::addr_of_mut!((*ptr).fbcon_pid).write(None);
+        core::ptr::addr_of_mut!((*ptr).kbd_pid).write(None);
+        core::ptr::addr_of_mut!((*ptr).logs).write(BootLogs::EMPTY);
+        core::ptr::addr_of_mut!((*ptr).last_fault).write(crate::trap::FaultReport::EMPTY);
+        &mut *ptr
     };
 
     // Keep room in SRAM for service stacks and DMA by placing init in PSRAM.

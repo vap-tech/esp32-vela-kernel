@@ -48,12 +48,27 @@ _start:
     j 1b
 2:
     call boot_enable_icache0
+    /* Initialize both stack boundaries before either HP hart enters Rust. */
+    la t0, _hp0_stack_guard
+    call boot_stack_guard
+    la t0, _hp1_stack_guard
+    call boot_stack_guard
     la sp, _stack_top
     la t0, vela_trap_entry
     csrw mtvec, t0
     csrw mie, zero
     call rust_main
 3:  j 3b
+/* t0=guard base. Keep the marker shared with the assembly trap checks. */
+boot_stack_guard:
+    li t1, 64
+    li t2, 0x56454c41
+.Lguard_fill:
+    sw t2, 0(t0)
+    addi t0, t0, 4
+    addi t1, t1, -1
+    bnez t1, .Lguard_fill
+    ret
 .balign 4
 _boot_trap:
     li a0, 84 /* T: trap before runtime loaded */

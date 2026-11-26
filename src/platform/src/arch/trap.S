@@ -1,3 +1,28 @@
+# Called only after the complete integer frame is saved. a0 is preserved.
+# Check all 256 boundary bytes before entering Rust and before trap return.
+.macro check_kernel_stack
+    csrr t0, mhartid
+    beqz t0, .Lguard_hp0_\@
+    la t0, _hp1_stack_guard
+    la t1, _hp1_stack_top
+    j .Lguard_bounds_\@
+.Lguard_hp0_\@:
+    la t0, _hp0_stack_guard
+    la t1, _stack_top
+.Lguard_bounds_\@:
+    bltu t1, sp, .Lkernel_stack_bounds
+    addi t1, t0, 256
+    bltu sp, t1, .Lkernel_stack_bounds
+    li t1, 64
+.Lguard_scan_\@:
+    lw t2, 0(t0)
+    li t3, 0x56454c41
+    bne t2, t3, .Lkernel_stack_canary
+    addi t0, t0, 4
+    addi t1, t1, -1
+    bnez t1, .Lguard_scan_\@
+.endm
+
 .section .text.vela_trap,"ax"
 .balign 64
 .global vela_trap_entry
@@ -6,6 +31,24 @@ vela_trap_entry:
     bnez sp, .Lfrom_user
     # Kernel trap: restore original stack, report fatally; never return.
     csrrw sp, mscratch, sp
+    # Preserve t0 in the now-empty scratch CSR while validating the M-mode SP.
+    # Do this before storing a trap frame through a potentially invalid stack.
+    csrw mscratch, t0
+    csrr t0, mhartid
+    beqz t0, .Lkernel_hp0_bounds
+    la t0, _hp1_stack_top
+    bltu t0, sp, .Lkernel_stack_bounds
+    la t0, _hp1_stack_guard
+    j .Lkernel_lower_bound
+.Lkernel_hp0_bounds:
+    la t0, _stack_top
+    bltu t0, sp, .Lkernel_stack_bounds
+    la t0, _hp0_stack_guard
+.Lkernel_lower_bound:
+    addi t0, t0, 400 # guard + 144-byte trap frame
+    bltu sp, t0, .Lkernel_stack_bounds
+    csrr t0, mscratch
+    csrw mscratch, zero
     addi sp, sp, -144
     sw t0, 12(sp)
     addi t0, sp, 144
@@ -55,8 +98,32 @@ vela_trap_entry:
     sw t0, 132(sp)
     csrr t0, mstatus
     sw t0, 136(sp)
+    check_kernel_stack
     mv a0, sp
     call rust_trap
+    check_kernel_stack
+    j vela_resume
+
+.Lkernel_stack_bounds:
+    li a3, 1
+    j .Lkernel_stack_fail
+.Lkernel_stack_canary:
+    li a3, 2
+.Lkernel_stack_fail:
+    csrci mstatus, 8
+    csrw mie, zero
+    csrw mscratch, zero
+    mv a1, sp
+    csrr a0, mhartid
+    csrr a2, mepc
+    beqz a0, .Lkernel_emergency_hp0
+    la sp, _hp1_emergency_top
+    j .Lkernel_emergency_ready
+.Lkernel_emergency_hp0:
+    la sp, _hp0_emergency_top
+.Lkernel_emergency_ready:
+    tail rust_kernel_stack_fault
+
 .global vela_resume
 vela_resume:
     # a0 points to a kernel-owned task frame. Drop trap call stack completely.
