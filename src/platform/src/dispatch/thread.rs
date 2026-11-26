@@ -456,17 +456,36 @@ impl Runtime {
             base: args.a1 as usize,
             size: args.a2 as usize,
         };
-        let tid = lifecycle::spawn_user_thread(
-            &self.processes,
-            &self.allocator,
-            &mut self.scheduler,
-            current,
-            args.a0 as usize,
-            stack,
-            args.a4,
-            args.a5,
-            |entry, sp| arch::TrapFrame::user(entry, sp, args.a3),
-        )?;
+        let guarded = args.a5 & syscall::THREAD_STACK_GUARD != 0;
+        let affinity = args.a5 & !syscall::THREAD_STACK_GUARD;
+        let tid = if guarded {
+            lifecycle::spawn_guarded_user_thread(
+                &mut self.processes,
+                &self.allocator,
+                &mut self.scheduler,
+                current,
+                args.a0 as usize,
+                stack,
+                args.a4,
+                affinity,
+                |entry, sp| arch::TrapFrame::user(entry, sp, args.a3),
+            )?
+        } else {
+            lifecycle::spawn_user_thread(
+                &self.processes,
+                &self.allocator,
+                &mut self.scheduler,
+                current,
+                args.a0 as usize,
+                stack,
+                args.a4,
+                affinity,
+                |entry, sp| arch::TrapFrame::user(entry, sp, args.a3),
+            )?
+        };
+        if guarded {
+            self.shootdown_stale_remote_pmp();
+        }
         if let Some(slot) = self.scheduler.find_by_id(tid) {
             self.ext_contexts[slot.index()] = arch::ExtendedContext::ZERO;
         }

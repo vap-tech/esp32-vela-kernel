@@ -125,7 +125,7 @@ extern "C" fn supervise_sysd(handle: u32) -> ! {
 fn start_supervisor(entry: extern "C" fn(u32) -> !, supervisor: u32) {
     if supervisor != 0 {
         loop {
-            if let Ok(mut stack) = vela_user::arena::Arena::new(4096) {
+            if let Ok(mut stack) = vela_user::arena::Arena::new(8192) {
                 let (tid, _) = sys::call6(
                     abi::THREAD_CREATE,
                     entry as *const () as u32,
@@ -133,7 +133,7 @@ fn start_supervisor(entry: extern "C" fn(u32) -> !, supervisor: u32) {
                     stack.size() as u32,
                     supervisor,
                     1,
-                    abi::AFFINITY_HP0,
+                    abi::AFFINITY_HP0 | abi::THREAD_STACK_GUARD,
                 );
                 if (tid as i32) > 0 {
                     break;

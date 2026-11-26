@@ -55,6 +55,9 @@ pub const IPC_BYTES: usize = 96;
 pub const NONBLOCK: u32 = 1;
 pub const EAGAIN: u32 = (-11i32) as u32;
 
+/// Optional a5 flag: the allocation's lower half becomes inaccessible; upper half is the stack.
+/// Pass the full MEM_ALLOC region and retain it for MEM_FREE after thread exit.
+pub const THREAD_STACK_GUARD: u32 = 1 << 8;
 pub const THREAD_CREATE: u32 = 12; // a0=entry, a1=stack base, a2=size, a3=arg, a4=priority, a5=affinity (1=HP0, 2=HP1, 3=any)
 pub const PROCESS_EXIT: u32 = 13;
 

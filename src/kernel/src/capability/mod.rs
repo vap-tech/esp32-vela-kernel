@@ -108,6 +108,16 @@ impl Table {
         let i = self.slot(handle)?;
         self.slots[i].cap.take().ok_or(Errno::Ebadf)
     }
+    pub fn restrict_object(&mut self, object: Object, rights: u16) {
+        for slot in &mut self.slots {
+            if let Some(cap) = &mut slot.cap
+                && cap.object == object
+            {
+                cap.rights &= rights;
+            }
+        }
+    }
+
     pub fn revoke(&mut self, object: Object) {
         for s in &mut self.slots {
             if s.cap.is_some_and(|c| c.object == object) {

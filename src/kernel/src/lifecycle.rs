@@ -413,9 +413,20 @@ pub fn invalidate_object<C: Context>(
                 .memory
                 .maps
                 .iter()
-                .any(|m| m.region == region && m.region.size != 0)
+                .any(|m| m.region.size != 0 && region.contains(m.region.base, m.region.size))
         {
-            processes.slot_mut(process).memory.remove(region).unwrap();
+            let contained = processes.slot(process).memory.maps;
+            for mapping in contained {
+                if mapping.region.size != 0
+                    && region.contains(mapping.region.base, mapping.region.size)
+                {
+                    processes
+                        .slot_mut(process)
+                        .memory
+                        .remove(mapping.region)
+                        .unwrap();
+                }
+            }
             for thread_idx in 0..TASKS {
                 let thread = ThreadSlot(thread_idx);
                 if scheduler.task(thread).process == process
@@ -1228,6 +1239,81 @@ pub fn spawn_user_thread<C: Copy>(
     )
 }
 
+/// Convert a private allocation into an upper-half stack only after thread creation succeeds.
+/// The root memory capability retains CONTROL for freeing the allocation after thread exit.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_guarded_user_thread<C: Copy>(
+    processes: &mut Processes,
+    allocator: &RegionAllocator,
+    scheduler: &mut Scheduler<C>,
+    current: ProcSlot,
+    entry: usize,
+    backing: Region,
+    priority: u32,
+    affinity: u32,
+    make_context: impl FnOnce(usize, usize) -> C,
+) -> Result<Tid, Errno> {
+    let owner = processes.slot(current).id;
+    let object = Object::Memory {
+        owner,
+        region: backing,
+    };
+    if !allocator.owns(owner, backing)
+        || backing.size < 512
+        || !backing.size.is_power_of_two()
+        || backing.base % backing.size != 0
+        || allocator.is_in_flight(backing)
+        || processes
+            .slot(current)
+            .capabilities
+            .find(object, cap::CONTROL)
+            .is_none()
+        || processes.slots.iter().enumerate().any(|(i, proc)| {
+            ProcSlot(i) != current
+                && (proc
+                    .capabilities
+                    .objects()
+                    .iter()
+                    .flatten()
+                    .any(|cap| cap.object == object)
+                    || proc.memory.maps.iter().any(|map| {
+                        map.region.size != 0
+                            && backing.base < map.region.base.saturating_add(map.region.size)
+                            && map.region.base < backing.base.saturating_add(backing.size)
+                    }))
+        })
+    {
+        return Err(Errno::Eperm);
+    }
+    let stack = Region {
+        base: backing.base + backing.size / 2,
+        size: backing.size / 2,
+    };
+    let mut space = processes.slot(current).memory;
+    space.remove(backing)?;
+    space.insert(stack, process::READ | process::WRITE)?;
+    // All validation and potentially failing mapping operations precede scheduler mutation.
+    let tid = spawn_user_thread(
+        processes,
+        allocator,
+        scheduler,
+        current,
+        entry,
+        backing,
+        priority,
+        affinity,
+        make_context,
+    )?;
+    let slot = scheduler.find_by_id(tid).expect("new thread exists");
+    scheduler.task_mut(slot).stack = stack;
+    processes.slot_mut(current).memory = space;
+    processes
+        .slot_mut(current)
+        .capabilities
+        .restrict_object(object, cap::CONTROL);
+    Ok(tid)
+}
+
 /// Terminate `scheduler.current`. If it was the last live thread of its process,
 /// reap all process-owned endpoints, event bindings, shared-memory grants,
 /// capabilities, and physical allocations, returning `Some(ReapedProcess)` for
@@ -1484,6 +1570,135 @@ mod tests {
         m.reply_token = token;
         m.data[..payload.len()].copy_from_slice(payload);
         m
+    }
+
+    #[test]
+    fn guarded_thread_stack_rolls_back_and_frees_only_after_thread_exit() {
+        let mut h = harness();
+        let owner = ProcSlot(0);
+        let backing = alloc_memory(&mut h.processes, &mut h.allocator, owner, 8192).unwrap();
+        let handle = memory_capability(&h.processes, owner, backing.base).unwrap();
+        let original = h.processes.slot(owner).memory;
+        assert_eq!(
+            spawn_guarded_user_thread(
+                &mut h.processes,
+                &h.allocator,
+                &mut h.scheduler,
+                owner,
+                CODE.base + 1,
+                backing,
+                1,
+                1,
+                |_, _| TestCtx::default()
+            ),
+            Err(Errno::Einval)
+        );
+        assert_eq!(h.processes.slot(owner).memory.revision, original.revision);
+        assert!(
+            h.processes
+                .slot(owner)
+                .capabilities
+                .get(handle, cap::GRANT)
+                .is_ok()
+        );
+        let peer = ProcSlot(1);
+        let peer_pid = h.processes.slot(peer).id;
+        grant_or_map(&mut h.processes, owner, handle, peer_pid, cap::READ, true).unwrap();
+        assert_eq!(
+            spawn_guarded_user_thread(
+                &mut h.processes,
+                &h.allocator,
+                &mut h.scheduler,
+                owner,
+                CODE.base,
+                backing,
+                1,
+                1,
+                |_, _| TestCtx::default()
+            ),
+            Err(Errno::Eperm)
+        );
+        revoke_capability(
+            &mut h.processes,
+            &mut h.ipc,
+            &mut h.calls,
+            &mut h.events,
+            &mut h.scheduler,
+            owner,
+            handle,
+            deliver_checked,
+        )
+        .unwrap();
+        let tid = spawn_guarded_user_thread(
+            &mut h.processes,
+            &h.allocator,
+            &mut h.scheduler,
+            owner,
+            CODE.base,
+            backing,
+            1,
+            1,
+            |_, sp| TestCtx {
+                a0: sp as u32,
+                a1: 0,
+            },
+        )
+        .unwrap();
+        let slot = h.scheduler.find_by_id(tid).unwrap();
+        let stack = h.scheduler.task(slot).stack;
+        assert_eq!(stack.base, backing.base + 4096);
+        assert_eq!(
+            h.scheduler.task(slot).context.a0 as usize,
+            backing.base + backing.size
+        );
+        assert!(
+            !h.processes
+                .slot(owner)
+                .memory
+                .permits(backing.base, 1, process::WRITE)
+        );
+        assert!(
+            h.processes
+                .slot(owner)
+                .memory
+                .permits(stack.base, stack.size, process::WRITE)
+        );
+        assert!(
+            h.processes
+                .slot(owner)
+                .capabilities
+                .get(handle, cap::GRANT)
+                .is_err()
+        );
+        assert_eq!(
+            free_memory(
+                &mut h.processes,
+                &mut h.allocator,
+                &mut h.scheduler,
+                owner,
+                backing,
+                |_| {}
+            ),
+            Err(Errno::Ebusy)
+        );
+        h.scheduler.task_mut(slot).state = State::Terminated;
+        free_memory(
+            &mut h.processes,
+            &mut h.allocator,
+            &mut h.scheduler,
+            owner,
+            backing,
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            !h.processes
+                .slot(owner)
+                .memory
+                .permits(stack.base, 1, process::READ)
+        );
+        assert!(!h.allocator.owns(h.processes.slot(owner).id, backing));
+        assert!(h.processes.slot(owner).capabilities.get(handle, 0).is_err());
     }
 
     #[test]
