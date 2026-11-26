@@ -166,8 +166,15 @@ pub unsafe fn display_step(
         } else {
             &images::BOOT
         };
-        let (sd_probe, res) =
-            unsafe { images::draw_rows(image, frame_direct_base, usize::from(stage - 3) * 32, 32) };
+        let (sd_probe, res) = unsafe {
+            images::draw_rows(
+                image,
+                frame_direct_base,
+                usize::from(stage - 3) * 32,
+                32,
+                mode == 9,
+            )
+        };
         return (sd_probe.map(Diagnostic::Sdcard), res.map(|()| 1));
     }
     let stage = if mode >= 4 && stage >= 43 {

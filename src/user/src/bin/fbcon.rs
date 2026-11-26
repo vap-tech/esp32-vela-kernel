@@ -52,10 +52,16 @@ fn log_number(prefix: &[u8], value: u32, suffix: &[u8]) {
 }
 
 /// Bring the panel up with a framebuffer we own. Returns its base address.
-fn bring_up(display: u32) -> Result<usize, u32> {
+fn bring_up(display: u32, splash: bool) -> Result<usize, u32> {
     let mut fb = None;
     let mut calls = 1;
-    let mut rc = sys::call(abi::DISPLAY_TEST, display, abi::DISPLAY_MODE_CONSOLE, 0, 0);
+    let mut rc = sys::call(
+        abi::DISPLAY_TEST,
+        display,
+        abi::DISPLAY_MODE_CONSOLE,
+        u32::from(splash),
+        0,
+    );
     while (rc as i32) > 0 {
         sys::sleep_ticks(rc);
         let mut fb_base = 0;
@@ -64,7 +70,7 @@ fn bring_up(display: u32) -> Result<usize, u32> {
             match Arena::new_psram(abi::DISPLAY_FB_BYTES) {
                 Ok(arena) => {
                     fb_base = arena.base() as u32;
-                    fb = Some(arena.base());
+                    fb = Some(arena);
                 }
                 Err(code) => {
                     let _ = sys::call(abi::DISPLAY_TEST, display, abi::DISPLAY_MODE_OFF, 0, 0);
@@ -82,8 +88,11 @@ fn bring_up(display: u32) -> Result<usize, u32> {
         calls += 1;
     }
     if rc == 0 {
-        fb.ok_or(abi::EINVAL)
+        fb.map(|arena| arena.base()).ok_or(abi::EINVAL)
     } else {
+        if let Some(mut arena) = fb {
+            let _ = arena.release();
+        }
         Err(rc)
     }
 }
@@ -114,7 +123,7 @@ unsafe fn render_export(fb: *mut u32, writable: bool) {
 }
 
 fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
-    let fb = match bring_up(display) {
+    let fb = match bring_up(display, true).or_else(|_| bring_up(display, false)) {
         Ok(fb) => fb as *mut u32,
         Err(code) => {
             log_number(
@@ -125,6 +134,7 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
             sys::process_exit();
         }
     };
+    let mut first_frame = true;
     log(b"[fbcon] console online 1280x720\n");
 
     // SAFETY: single-threaded service; this is the only reference to `CONSOLE`.
@@ -169,7 +179,12 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
         }
         let start = now();
         // SAFETY: `fb` is the 2 MiB PSRAM region we own, at least `FB_WORDS` words long.
-        let drawn = unsafe { console.render(fb) };
+        let drawn = if first_frame {
+            first_frame = false;
+            unsafe { console.replace_artwork(fb) }
+        } else {
+            unsafe { console.render(fb) }
+        };
         if !measured && drawn > 100 {
             measured = true;
             let ticks = now().wrapping_sub(start);

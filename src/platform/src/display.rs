@@ -21,6 +21,7 @@ pub struct DisplayControl {
     external_owner: Option<Pid>,
     /// The backlight was switched off with `DISPLAY_MODE_BACKLIGHT 0` (screen blanked).
     blanked: bool,
+    splash: bool,
     psram: soc::psram::Controller,
     scanout: soc::scanout::Scanout,
 }
@@ -41,6 +42,7 @@ impl DisplayControl {
             framebuffer: None,
             external_owner: None,
             blanked: false,
+            splash: false,
             psram: soc::psram::Controller::new(),
             scanout: soc::scanout::Scanout::new(),
         }
@@ -233,6 +235,7 @@ impl DisplayControl {
             self.active = false;
             self.blanked = false;
             self.scanout.set_mode(0);
+            self.splash = arg == syscall::DISPLAY_MODE_CONSOLE && arg2 == 1;
             self.mode = arg as u8;
             self.stage = 0;
         } else if arg != syscall::DISPLAY_MODE_STEP {
@@ -255,9 +258,16 @@ impl DisplayControl {
             self.framebuffer = Some(region);
             self.external_owner = Some(caller);
             // Skip the microSD image stages (3..43); resume at the DSI start stage.
-            self.stage = 43;
+            if !self.splash {
+                self.stage = 43;
+            }
         }
 
+        if let (Some(owner), Some(region)) = (self.external_owner, self.framebuffer)
+            && (caller != owner || !allocator.owns(owner, region))
+        {
+            return (None, Err(Errno::Einval));
+        }
         let fb_base = self.framebuffer.map_or(0, |r| r.base);
         let was_running = self.scanout.is_running();
         // SAFETY: DisplayControl owns the display/PSRAM/scanout hardware under MIE=0.

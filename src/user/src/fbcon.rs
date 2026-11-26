@@ -286,6 +286,54 @@ impl Console {
         self.tag_len = 0;
     }
 
+    /// Replace arbitrary artwork with the console in native scan order.
+    /// Each destination word receives its final value once.
+    ///
+    /// # Safety
+    /// `fb` must point to a writable full-size raster.
+    pub unsafe fn replace_artwork(&mut self, fb: *mut u32) -> usize {
+        let cursor = self.cursor();
+        let mut count = 0;
+        let mut line = [0u32; FB_W / 2];
+        for y in 0..FB_H {
+            line.fill(0);
+            let u = FB_H - 1 - y;
+            let col = u / CELL_W;
+            let bit = 15 - u % CELL_W;
+            for row in 0..ROWS {
+                let ch = self.cells[row][col];
+                let inverted = cursor == (col, row);
+                let visible = inverted || ch != b' ';
+                let color = if visible {
+                    self.colors[row][col]
+                } else {
+                    DEFAULT_COLOR
+                };
+                if u % CELL_W == 0 {
+                    self.drawn[row][col] =
+                        u16::from(ch) | u16::from(color) << 9 | if inverted { CURSOR } else { 0 };
+                    count += usize::from(visible);
+                }
+                if visible {
+                    let glyph = &font::GLYPHS[usize::from(ch - font::FIRST)];
+                    let rgb = PALETTE[usize::from(color)];
+                    let (fg, bg) = if inverted { (BG, rgb) } else { (rgb, BG) };
+                    for (dst, pair) in line[(TOP + row * CELL_H) / 2..]
+                        .iter_mut()
+                        .zip(glyph.chunks_exact(2))
+                    {
+                        *dst = u32::from(pixel(pair[0], bit, fg, bg))
+                            | u32::from(pixel(pair[1], bit, fg, bg)) << 16;
+                    }
+                }
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(line.as_ptr(), fb.add(y * line.len()), line.len())
+            };
+        }
+        count
+    }
+
     /// Draw every cell whose picture changed. Returns how many cells were drawn.
     ///
     /// # Safety
@@ -394,6 +442,18 @@ mod tests {
         console.framebuffer_cleared();
         assert_eq!(render(&mut console, &mut fb), count);
         assert_eq!(fb, original);
+    }
+
+    #[test]
+    fn first_frame_replaces_every_artwork_pixel_and_seeds_dirty_state() {
+        let mut console = Console::new();
+        console.write(b"Vela\n\x1b[31mred");
+        let mut expected = raster();
+        render(&mut console, &mut expected);
+        let mut painted = vec![0xaabbccdd; FB_WORDS];
+        unsafe { console.replace_artwork(painted.as_mut_ptr()) };
+        assert_eq!(expected, painted);
+        assert_eq!(render(&mut console, &mut painted), 0);
     }
 
     #[test]

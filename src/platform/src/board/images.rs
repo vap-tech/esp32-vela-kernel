@@ -221,7 +221,11 @@ unsafe fn provision_sd_from_flash() -> Result<(), u32> {
 
 /// Fetch one 32-bit RLE word at `cursor` within `asset` using the shared 4 KiB
 /// (`READ_CHUNK`, 8 × 512-byte sectors) microSD read buffer in BSS.
-unsafe fn fetch_rle_word(asset: &'static Asset, cursor: usize) -> Result<Option<u32>, u32> {
+unsafe fn fetch_rle_word(
+    asset: &'static Asset,
+    cursor: usize,
+    from_flash: bool,
+) -> Result<Option<u32>, u32> {
     if cursor == asset.length {
         return Ok(None);
     }
@@ -237,7 +241,14 @@ unsafe fn fetch_rle_word(asset: &'static Asset, cursor: usize) -> Result<Option<
                 .checked_sub(FLASH_BUNDLE_BASE)
                 .and_then(|off| off.checked_add(cursor as u32))
                 .ok_or(13u32)?;
-            read_sd_words(rel_offset, &mut READ_CHUNK.0[..loaded / 4])?;
+            if from_flash {
+                flash::read(
+                    asset.address + cursor as u32,
+                    &mut READ_CHUNK.0[..loaded / 4],
+                )?;
+            } else {
+                read_sd_words(rel_offset, &mut READ_CHUNK.0[..loaded / 4])?;
+            }
             CACHED_ASSET_ADDR = asset.address;
             CACHED_BASE = cursor;
             CACHED_LOADED = loaded;
@@ -253,7 +264,7 @@ unsafe fn verify_stream_on_sd(asset: &'static Asset) -> Result<(), u32> {
     let mut cursor = 0usize;
     let mut crc = u32::MAX;
     let mut pixels = 0usize;
-    while let Some(word) = unsafe { fetch_rle_word(asset, cursor)? } {
+    while let Some(word) = unsafe { fetch_rle_word(asset, cursor, false)? } {
         cursor += 4;
         let count = (word & 0xffff) as usize;
         if count == 0 {
@@ -343,6 +354,7 @@ pub unsafe fn draw_rows(
     frame_direct_base: usize,
     row: usize,
     rows: usize,
+    from_flash: bool,
 ) -> (Option<SdProbe>, Result<(), u32>) {
     if frame_direct_base < psram::POOL_START
         || frame_direct_base + psram::FRAME_BYTES > psram::POOL_END
@@ -362,9 +374,12 @@ pub unsafe fn draw_rows(
     let mut sd_probe = None;
     unsafe {
         if row == 0 {
-            match ensure_sd_asset_ready(asset) {
-                Ok(probe) => sd_probe = probe,
-                Err(code) => return (None, Err(code)),
+            reset_stream_cache();
+            if !from_flash {
+                match ensure_sd_asset_ready(asset) {
+                    Ok(probe) => sd_probe = probe,
+                    Err(code) => return (None, Err(code)),
+                }
             }
             STREAM_ASSET_ADDR = asset.address;
             STREAM_CURSOR = 0;
@@ -381,7 +396,7 @@ pub unsafe fn draw_rows(
 
         while STREAM_PIXEL_POS < end {
             if STREAM_RUN_REM == 0 {
-                let word = match fetch_rle_word(asset, STREAM_CURSOR) {
+                let word = match fetch_rle_word(asset, STREAM_CURSOR, from_flash) {
                     Ok(Some(w)) => w,
                     Ok(None) => return (sd_probe, Err(13)),
                     Err(code) => return (sd_probe, Err(code)),

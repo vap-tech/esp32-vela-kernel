@@ -415,6 +415,8 @@ A separate `init` thread supervises the Tab5 keyboard. After driver exit it wait
 
 An `init` thread starts the bundled framebuffer console and waits for its process to exit. On exit the kernel detaches its scanout before reclaiming PSRAM, and `init` retries after 100 ticks. The small `fbcon` image, text grid, font and guarded 4 KiB stack run in SRAM. Its 2 MiB framebuffer remains in PSRAM. Running the renderer image in uncached PSRAM made redraws much slower. Startup rendering is measured in 10 ms system ticks, which remain valid across HP migration.
 
+At startup the console requests the boot artwork from Flash in its own scanout buffer. After collecting the early console log it composes one native RGB565 row (1,440 bytes) at a time and copies each finished row over the artwork in scan order. The backlight stays on throughout the handoff. Scanout can still show a mixture of old and new rows during the transition. Later updates redraw changed cells.
+
 At boot, `vela-fbcon` allocates a 2 MiB framebuffer from `RegionAllocator`, initializes
 the ST7121 panel and MIPI-DSI video pipeline (`DW-GDMA CH0`, 4-frame descriptor ring
 reading the `0x48xx_xxxx` bus alias), and renders the 80×22 ANSI console. Writing
