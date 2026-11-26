@@ -44,6 +44,7 @@ Everything in userspace shares one File IPC protocol (`OP_READ`, `OP_LIST`, `OP_
 | `/proc/interrupts` | R | Interrupt and SMP counters (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`, `ipi_hp0`, `ipi_hp1`, `pmp_shootdowns`, `kbd_gpio50`). |
 | `/proc/cpuinfo` | R | Live HP0+HP1/APB/LP clocks, `rv32imafc_xesppie` ISA, DVFS policy/switch counts, tickless sleep counters, per-hart `mcycle` utilization, IPI/PMP shootdowns and SYSTIMER IRQ latency. |
 | `/proc/last_fault` | R | Most recent U-mode fault with PID/TID, decoded cause, PC, fault address, SP, stack bounds and guard-hit flag; retained across service restarts until reboot. |
+| `/proc/kernel_stacks` | R | HP0/HP1 usable stack bytes, deepest observed write since boot, untouched bytes and boundary marker status. See [measurement limits](docs/memory-map.md#kernel-stack-checks-and-measurement). |
 | `/proc/tasks` | R | Active threads with TID/PID, wait state, `base/effective` priority, `hart/aff`, migrations, ticks, `user_cycles`, preemptions and stack size. |
 | `/proc/streams`, `/proc/sdcard`, `/proc/i2c` | R | DW-GDMA/GDMA-AHB stream counters, microSD status/capacity/counters, and board I²C bus definitions. |
 | `/sys/power` | R | Live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |

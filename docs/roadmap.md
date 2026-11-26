@@ -73,3 +73,18 @@
 3. **Display wallpapers & graphics**: reuse the retained `vela_boot_and_display_assets/` pipeline for boot/background wallpapers alongside `fbcon`.
 4. **Cache, storage performance & connectivity**: evaluate cached `L1-DCache` mappings with explicit DMA cache maintenance, Flash XIP for larger images, and networking (ESP32-C6 co-processor or USB).
 5. **Portability**: board configs (`boards/<board>/init.conf`) and independently verified SoC boot/PAC/BSP backends for smaller RISC-V targets without SD cards (ESP32-C3, C5, C6, S31).
+
+## Optional — stronger kernel stack guarantees
+
+- **Hardware prevention for M-mode stack overflows.** Investigate an appropriate
+  PMP or SoC protection scheme for ESP32-P4 rev1.3 separately. Existing unlocked
+  PMP mappings isolate U-mode and do not guard ordinary M-mode writes. Verify
+  semantics, entry budget, permissions needed by both HP harts, DMA interaction
+  and reset/recovery before adopting locked PMP or any alternative. No hardware
+  prevention is claimed by the current marker checks.
+- **Whole-call-chain stack bounds.** Extend the current 24 KiB per-frame CFI build
+  gate with call-chain analysis where practical. Handle indirect calls, recursion,
+  handwritten assembly and emergency reporting explicitly. Record representative
+  `/proc/kernel_stacks` measurements after changes to loaders, IPC and drivers.
+  The current write watermark is an estimate and does not establish a worst-case
+  bound. Details and interpretation are in `docs/memory-map.md`.

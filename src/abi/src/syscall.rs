@@ -268,3 +268,7 @@ pub struct IpcCapCall {
     pub cap_handle: u32,
     pub cap_rights: u32,
 }
+
+/// Per HP hart: usable bytes, deepest observed write bytes, untouched bytes, guard intact.
+pub const STATS_KERNEL_STACKS: u32 = 9;
+pub const STATS_KERNEL_STACKS_BYTES: usize = 32;

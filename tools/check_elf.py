@@ -27,6 +27,13 @@ assert (
 )
 assert s["_stack_bottom"] == 0x4FFAC000 and s["_stack_top"] == 0x4FFC0000
 assert s["_boot_stack_top"] == 0x4FF28000
+assert s["_hp1_stack_guard"] == 0x4FFAC000
+assert s["_hp1_stack_top"] == s["_hp0_stack_guard"] == 0x4FFB6000
+assert s["_stack_top"] - s["_hp0_stack_guard"] == 40960
+assert s["_hp1_stack_top"] - s["_hp1_stack_guard"] == 40960
+assert s["_kernel_guard_bytes"] == 256
+assert s["_hp0_emergency_top"] == 0x4FF25000
+assert s["_hp1_emergency_top"] == 0x4FF26000
 assert s["vela_trap_entry"] % 64 == 0
 for name in ["_bss_start", "_bss_end", "_stack_top", "_boot_stack_top"]:
     assert s[name] % 16 == 0

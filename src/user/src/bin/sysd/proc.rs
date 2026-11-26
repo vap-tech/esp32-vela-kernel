@@ -10,6 +10,7 @@ pub const ENTRIES: &[&[u8]] = &[
     b"cpuinfo",
     b"tasks",
     b"last_fault",
+    b"kernel_stacks",
     b"mounts",
     b"streams",
     b"sdcard",
@@ -42,6 +43,7 @@ pub fn read(rel: &[u8], out: &mut TextBuf<2048>) -> u8 {
             }
             fs_abi::STATUS_OK
         }
+        b"kernel_stacks" => render_kernel_stacks(out),
         b"tasks" => render_tasks(out),
         b"streams" => render_streams(out),
         b"sdcard" => render_sdcard(out),
@@ -461,5 +463,29 @@ fn render_sdcard(out: &mut TextBuf<2048>) -> u8 {
     out.append(b"\nerrors ");
     out.decimal(errors);
     out.push(b'\n');
+    fs_abi::STATUS_OK
+}
+
+fn render_kernel_stacks(out: &mut TextBuf<2048>) -> u8 {
+    let mut bytes = [0; abi::STATS_KERNEL_STACKS_BYTES];
+    if sys::call(
+        abi::STATS,
+        bytes.as_mut_ptr() as u32,
+        bytes.len() as u32,
+        abi::STATS_KERNEL_STACKS,
+        0,
+    ) != 0
+    {
+        return fs_abi::STATUS_ERR;
+    }
+    out.append(b"hart usable written_peak untouched guard_ok\n");
+    for hart in 0..2 {
+        out.decimal(hart as u32);
+        for field in 0..4 {
+            out.append(b" ");
+            out.decimal(word_le(&bytes, hart * 16 + field * 4));
+        }
+        out.append(b"\n");
+    }
     fs_abi::STATUS_OK
 }

@@ -680,6 +680,12 @@ impl Runtime {
                 }
                 copy_to_user(self.memory(), ptr, &buffer)
             }
+            syscall::STATS_KERNEL_STACKS => {
+                if len != syscall::STATS_KERNEL_STACKS_BYTES {
+                    return Err(Errno::Einval);
+                }
+                copy_to_user(self.memory(), ptr, &crate::stacks::snapshot())
+            }
             syscall::STATS_LAST_FAULT => {
                 if len != syscall::STATS_LAST_FAULT_BYTES {
                     return Err(Errno::Einval);

@@ -15,6 +15,7 @@ mod pac;
 mod runtime;
 mod sentinel;
 mod soc;
+mod stacks;
 mod trap;
 mod usermem;
 

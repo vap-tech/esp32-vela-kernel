@@ -21,3 +21,53 @@ Linker assertions check `.entry`, `.display`, `.upper`, `.bss`, `_dma_page`, sta
 Boot initializes `Runtime` fields directly in static storage. This removes the oversized aggregate temporary from HP0’s stack. The current release `rust_main` frame is 17,088 bytes (previously 43,760 bytes, exceeding its 40 KiB stack reservation). These figures describe that function’s frame, not the maximum nested call depth.
 
 Flash offsets are `0x2000` ROM image, `0x40000` manifest, `0x40040` SRAM payload, and `0x100000` display asset bundle (`VELAIMG1` header + two RLE images, retained for artwork/wallpapers). Build output reports actual `.entry`, payload, `.bss`, and CRC32 values.
+
+## Kernel stack checks and measurement
+
+`scripts/build.sh` builds the kernel with `cargo rustc --emit=link,asm=target/kernel.s`.
+`tools/check_stack_sizes.py` reads CFI frame offsets from that same final LTO assembly.
+Every recorded function must fit the 24 KiB single-frame budget. Missing or incomplete
+CFI fails the build. The former 43,760-byte `rust_main` frame would fail this check.
+The 24 KiB budget leaves room within each 40 KiB reservation for callees and the
+256-byte marker, but does not prove that their combined usage fits. Handwritten
+assembly, recursive call depth and dynamic stack adjustments are outside this check.
+The ordinary early boot and emergency stacks are separate from this measurement.
+
+Before entering Rust, boot fills both HP stack reservations with `0x56454c41`.
+`cat /proc/kernel_stacks` reports one row per hart, in bytes:
+
+- `usable` is 40,704 bytes, excluding the 256-byte boundary marker.
+- `written_peak` is the distance from the top to the lowest changed word.
+- `untouched` is the contiguous marker-filled portion above the boundary.
+- `guard_ok` is 1 when all 64 boundary words retain the marker.
+
+The paint is never refreshed until reboot, so startup and prior workload writes
+remain visible. Read before and after representative workloads, including ELF
+loading, filesystem reads, pipelines and display activity. No periodic stack scan
+is installed. Each read scans at most 80 KiB, with other harts potentially active.
+Reads use assembly loads without forming Rust references to live stack memory.
+
+This is a sampled write high-water estimate, not an exact maximum SP measurement.
+Untouched reserved frame space and writes equal to the marker can be missed.
+Concurrent HP activity may change the result while reading. A healthy marker and
+large untouched count do not prove absence of overflow on every execution path.
+Likewise, software trap checks detect damage after it may have occurred. They do
+not prevent an M-mode write into adjacent memory. Hardware prevention remains an
+optional architecture project in the roadmap.
+
+### Tab5 measurement, 2026-11-26
+
+Release build, both HP harts online, framebuffer console active. After boot,
+`ls /sd/bin`, `cat /sd/bin/wc.elf | wc`, `cat /proc/tasks | wc` and
+`cat /proc/sdcard`, the final snapshot was:
+
+| Hart | Usable bytes | Written peak | Untouched bytes | Guard intact |
+|---|---:|---:|---:|---:|
+| HP0 | 40,704 | 20,056 | 20,648 | 1 |
+| HP1 | 40,704 | 2,332 | 38,372 | 1 |
+
+HP1 increased from 1,888 bytes in the first snapshot to 2,332 after the commands.
+`/proc/last_fault` reported `none`, SD errors and written sectors were zero,
+and display startup reported 40 frames without underrun. This short read-only
+workload is a baseline. It does not cover every filesystem, driver recovery or
+exception path, and the scan itself contributes to stack use.

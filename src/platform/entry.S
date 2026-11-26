@@ -48,7 +48,7 @@ _start:
     j 1b
 2:
     call boot_enable_icache0
-    /* Initialize both stack boundaries before either HP hart enters Rust. */
+    /* Paint both full stacks before Rust for persistent write high-water marks. */
     la t0, _hp0_stack_guard
     call boot_stack_guard
     la t0, _hp1_stack_guard
@@ -59,9 +59,9 @@ _start:
     csrw mie, zero
     call rust_main
 3:  j 3b
-/* t0=guard base. Keep the marker shared with the assembly trap checks. */
+/* t0=stack base. Each reservation is 40 KiB, including its lower guard. */
 boot_stack_guard:
-    li t1, 64
+    li t1, 10240
     li t2, 0x56454c41
 .Lguard_fill:
     sw t2, 0(t0)
