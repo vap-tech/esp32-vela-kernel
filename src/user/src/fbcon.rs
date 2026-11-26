@@ -328,7 +328,15 @@ impl Console {
                 }
             }
             unsafe {
-                core::ptr::copy_nonoverlapping(line.as_ptr(), fb.add(y * line.len()), line.len())
+                for (i, burst) in line.chunks(4).enumerate() {
+                    core::ptr::copy_nonoverlapping(
+                        burst.as_ptr(),
+                        fb.add(y * line.len() + i * 4),
+                        burst.len(),
+                    );
+                    #[cfg(target_arch = "riscv32")]
+                    core::arch::asm!("fence w,w", ".rept 200", "nop", ".endr", options(nostack));
+                }
             };
         }
         count

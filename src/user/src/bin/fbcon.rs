@@ -122,6 +122,24 @@ unsafe fn render_export(fb: *mut u32, writable: bool) {
     }
 }
 
+fn scan_counts() -> [u32; 3] {
+    let mut b = [0u8; abi::STATS_STREAMS_BYTES];
+    assert_eq!(
+        sys::call(
+            abi::STATS,
+            b.as_mut_ptr() as u32,
+            b.len() as u32,
+            abi::STATS_STREAMS,
+            0
+        ),
+        0
+    );
+    [
+        vela_user::word_le(&b, 4),
+        vela_user::word_le(&b, 8),
+        vela_user::word_le(&b, 12),
+    ]
+}
 fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
     let fb = match bring_up(display, true).or_else(|_| bring_up(display, false)) {
         Ok(fb) => fb as *mut u32,
@@ -181,7 +199,22 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
         // SAFETY: `fb` is the 2 MiB PSRAM region we own, at least `FB_WORDS` words long.
         let drawn = if first_frame {
             first_frame = false;
-            unsafe { console.replace_artwork(fb) }
+            {
+                let a = scan_counts();
+                let n = unsafe { console.replace_artwork(fb) };
+                let elapsed = now().wrapping_sub(start);
+                let b = scan_counts();
+                let mut l = TextBuf::<96>::new();
+                l.append(b"[handoff] ticks frames underruns dma_errors ");
+                l.decimal(elapsed);
+                for i in 0..3 {
+                    l.push(32);
+                    l.decimal(b[i].wrapping_sub(a[i]));
+                }
+                l.push(10);
+                sys::write(l.as_slice());
+                n
+            }
         } else {
             unsafe { console.render(fb) }
         };
