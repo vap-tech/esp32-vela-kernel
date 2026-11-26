@@ -32,6 +32,9 @@ pub const DISPLAY_FLAG_BLANKED: u32 = 1;
 pub const DISPLAY_FLAG_SD_EXPORT: u32 = 2;
 pub const DISPLAY_FLAG_SD_EXPORT_RW: u32 = 4;
 pub const STATS_DISPLAY_BYTES: usize = 4;
+/// Most recent U-mode fault since boot, zero-padded ASCII. All zero before the first fault.
+pub const STATS_LAST_FAULT: u32 = 8;
+pub const STATS_LAST_FAULT_BYTES: usize = 256;
 // Userspace-facing ABI values; the kernel itself encodes via `Errno::to_abi`.
 pub const EBADF: u32 = (-9i32) as u32;
 pub const EFAULT: u32 = (-14i32) as u32;

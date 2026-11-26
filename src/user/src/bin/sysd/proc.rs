@@ -9,6 +9,7 @@ pub const ENTRIES: &[&[u8]] = &[
     b"interrupts",
     b"cpuinfo",
     b"tasks",
+    b"last_fault",
     b"mounts",
     b"streams",
     b"sdcard",
@@ -21,6 +22,26 @@ pub fn read(rel: &[u8], out: &mut TextBuf<2048>) -> u8 {
         b"loadavg" => render_summary(true, out),
         b"interrupts" => render_interrupts(out),
         b"cpuinfo" => render_cpuinfo(out),
+        b"last_fault" => {
+            let mut bytes = [0; abi::STATS_LAST_FAULT_BYTES];
+            if sys::call(
+                abi::STATS,
+                bytes.as_mut_ptr() as u32,
+                bytes.len() as u32,
+                abi::STATS_LAST_FAULT,
+                0,
+            ) != 0
+            {
+                return fs_abi::STATUS_ERR;
+            }
+            let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            if len == 0 {
+                out.append(b"none\n");
+            } else {
+                out.append(&bytes[..len]);
+            }
+            fs_abi::STATUS_OK
+        }
         b"tasks" => render_tasks(out),
         b"streams" => render_streams(out),
         b"sdcard" => render_sdcard(out),

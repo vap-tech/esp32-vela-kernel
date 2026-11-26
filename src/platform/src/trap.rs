@@ -7,6 +7,45 @@ use vela_kernel::{
 
 use crate::{arch, dma::DMA_CH_GDMA_AHB_CH1, runtime::RUNTIME, soc};
 
+/// Render once under the kernel lock so a short USB write cannot truncate procfs.
+pub struct FaultReport {
+    pub bytes: [u8; crate::syscall::STATS_LAST_FAULT_BYTES],
+    len: usize,
+}
+
+impl FaultReport {
+    pub const EMPTY: Self = Self {
+        bytes: [0; crate::syscall::STATS_LAST_FAULT_BYTES],
+        len: 0,
+    };
+}
+
+impl core::fmt::Write for FaultReport {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len + s.len();
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(core::fmt::Error)?
+            .copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn exception_name(code: u32) -> &'static str {
+    match code {
+        0 => "instruction-address-misaligned",
+        1 => "instruction-access-fault",
+        2 => "illegal-instruction",
+        3 => "breakpoint",
+        4 => "load-address-misaligned",
+        5 => "load-access-fault",
+        6 => "store-address-misaligned",
+        7 => "store-access-fault",
+        _ => "unknown",
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     let hart = arch::hart_id();
@@ -152,15 +191,39 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
         frame.set_return(result);
         runtime.notify_remote_hart(false);
     } else if !interrupt && !from_idle {
+        let task = runtime.scheduler.current();
+        let pid = runtime.processes.slot(task.process).id;
+        let stack = task.stack;
+        let top = stack.base + stack.size;
+        // Only the ELF loader owns a double-size allocation ending at stack top.
+        let guard_hit = matches!(cause, 1 | 5 | 7)
+            && stack.base.checked_sub(stack.size).is_some_and(|base| {
+                let guard = vela_kernel::task::Region {
+                    base,
+                    size: stack.size,
+                };
+                let backing = vela_kernel::task::Region {
+                    base,
+                    size: 2 * stack.size,
+                };
+                guard.contains(frame.mtval as usize, 1) && runtime.allocator.owns(pid, backing)
+            });
+        runtime.last_fault = FaultReport::EMPTY;
         let _ = writeln!(
-            runtime.console,
-            "[fault] hart={} task={} cause={:#x} pc={:#x} value={:#x}",
-            hart,
-            runtime.scheduler.current().id.raw(),
-            frame.mcause,
+            runtime.last_fault,
+            "[fault] hart={hart} pid={} tid={} cause={}({cause}) pc={:#010x} mtval={:#010x} sp={:#010x} stack=[{:#010x},{top:#010x}) sp_in_bounds={} guard_hit={guard_hit}",
+            pid.raw(),
+            task.id.raw(),
+            exception_name(cause),
             frame.mepc,
-            frame.mtval
+            frame.mtval,
+            frame.sp,
+            stack.base,
+            stack.contains(frame.sp as usize, 0)
         );
+        runtime
+            .console
+            .write_bytes(&runtime.last_fault.bytes[..runtime.last_fault.len]);
         runtime.terminate();
         runtime.notify_remote_hart(false);
         switch = true;

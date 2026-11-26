@@ -43,6 +43,7 @@ Everything in userspace shares one File IPC protocol (`OP_READ`, `OP_LIST`, `OP_
 | `/proc/uptime`, `/proc/loadavg` | R | Elapsed time and 1/5/15 min sampled runnable demand. |
 | `/proc/interrupts` | R | Interrupt and SMP counters (`systimer0`, `usb_serial_jtag_rx`, `gdma_ahb_ch1`, `lp_sentinel`, `ipi_hp0`, `ipi_hp1`, `pmp_shootdowns`, `kbd_gpio50`). |
 | `/proc/cpuinfo` | R | Live HP0+HP1/APB/LP clocks, `rv32imafc_xesppie` ISA, DVFS policy/switch counts, tickless sleep counters, per-hart `mcycle` utilization, IPI/PMP shootdowns and SYSTIMER IRQ latency. |
+| `/proc/last_fault` | R | Most recent U-mode fault with PID/TID, decoded cause, PC, fault address, SP, stack bounds and guard-hit flag; retained across service restarts until reboot. |
 | `/proc/tasks` | R | Active threads with TID/PID, wait state, `base/effective` priority, `hart/aff`, migrations, ticks, `user_cycles`, preemptions and stack size. |
 | `/proc/streams`, `/proc/sdcard`, `/proc/i2c` | R | DW-GDMA/GDMA-AHB stream counters, microSD status/capacity/counters, and board I²C bus definitions. |
 | `/sys/power` | R | Live Tab5 `INA226` (`0x41`, `5 mΩ` shunt on `GPIO31`/`GPIO32`) 2S battery-rail voltage, shunt voltage, current, power and USB/battery supply state. |
@@ -494,3 +495,5 @@ framebuffer console when Vela takes the card back.
 USB-C switches from Serial/JTAG to Full-Speed USB OTG during export. Reopen
 the console when it reconnects. The `ttyACM` number can change, so use the
 Tab5's symlink under `/dev/serial/by-id`.
+
+ELF initial stacks reserve a double-size aligned allocation. PMP exposes the upper half and leaves the lower half inaccessible as a guard. PSRAM programs normally use a 64 KiB PSRAM allocation with a 32 KiB usable stack. SRAM programs retain 4 KiB usable stacks with a 4 KiB guard. Additional THREAD_CREATE stacks and kernel stacks still require guard support.

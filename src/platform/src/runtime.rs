@@ -93,6 +93,7 @@ pub struct Runtime {
     pub tickless_enter_16m: u64,
     pub tickless_period_16m: u64,
     pub logs: BootLogs,
+    pub last_fault: crate::trap::FaultReport,
 }
 
 pub mod device_wait {
@@ -627,21 +628,24 @@ impl Runtime {
                 })
                 .map_err(|_| Errno::Enoexec)?;
             let entry = bias + image.entry;
-            let stack = if code_class == MemoryClass::Psram {
-                match self.allocator.allocate(owner, 8192) {
-                    Ok(region) => region,
-                    Err(_) => {
-                        let region =
-                            self.allocator
-                                .allocate_in(MemoryClass::Psram, owner, 65536)?;
+            // Reserve both halves. Only the upper NAPOT region enters the user PMP image.
+            let backing = if code_class == MemoryClass::Psram {
+                // Reserve one MMU page for the stack and its inaccessible lower half.
+                match self.allocator.allocate_in(MemoryClass::Psram, owner, 65536) {
+                    Ok(region) => {
                         if !self.display.set_psram_region_mapped(region, true) {
                             return Err(Errno::Eio);
                         }
                         region
                     }
+                    Err(_) => self.allocator.allocate(owner, 2 * 8192)?,
                 }
             } else {
-                self.allocator.allocate(owner, 4096)?
+                self.allocator.allocate(owner, 2 * 4096)?
+            };
+            let stack = Region {
+                base: backing.base + backing.size / 2,
+                size: backing.size / 2,
             };
             space.insert(stack, READ | WRITE)?;
             let (arg0, arg1) = if dma_driver {

@@ -137,6 +137,7 @@ extern "C" fn rust_main() -> ! {
             fbcon_pid: None,
             kbd_pid: None,
             logs: BootLogs::EMPTY,
+            last_fault: crate::trap::FaultReport::EMPTY,
         })
     };
 

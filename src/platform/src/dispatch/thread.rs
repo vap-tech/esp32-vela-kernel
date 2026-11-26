@@ -661,6 +661,12 @@ impl Runtime {
                 }
                 copy_to_user(self.memory(), ptr, &buffer)
             }
+            syscall::STATS_LAST_FAULT => {
+                if len != syscall::STATS_LAST_FAULT_BYTES {
+                    return Err(Errno::Einval);
+                }
+                copy_to_user(self.memory(), ptr, &self.last_fault.bytes)
+            }
             syscall::STATS_DISPLAY => {
                 if len != syscall::STATS_DISPLAY_BYTES {
                     return Err(Errno::Einval);
