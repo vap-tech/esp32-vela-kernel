@@ -287,6 +287,12 @@ pub const STATS_IRQ_WINDOW: u32 = 10;
 pub const STATS_IRQ_WINDOW_BYTES: usize = 20;
 
 /// Cumulative u64 read-path counters: SD driver ticks, SD-to-user copy ticks,
-/// bulk-copy ticks (all 16 MHz), SD read calls, bulk-copy calls.
+/// IPC_BULK_IO copy ticks (all 16 MHz), SD read calls, IPC_BULK_IO copy calls.
 pub const STATS_READ_PROFILE: u32 = 11;
 pub const STATS_READ_PROFILE_BYTES: usize = 40;
+
+/// SD_PARTITION a3: copy partition sectors from the private DMA buffer into a
+/// delegated writable bulk window. a2=live server reply token, a4=1..=4096
+/// bytes, a5=window byte offset, a1=first partition-relative sector.
+/// Reads ceil(a4/512) sectors but copies exactly a4 bytes. Requires SD READ.
+pub const SD_PARTITION_READ_BULK: u32 = 4;

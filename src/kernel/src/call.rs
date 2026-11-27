@@ -510,12 +510,45 @@ mod tests {
             calls.prepare_bulk_io(tok1, ThreadSlot(2), 4000, 100, true),
             Err(Errno::Einval)
         );
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(1), 0, 123, true),
+            Err(Errno::Eperm)
+        );
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), usize::MAX, 123, true),
+            Err(Errno::Einval)
+        );
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), 4096 - 123, 123, true),
+            Ok((ProcSlot(0), 0x8800_0000 + 4096 - 123))
+        );
 
         // If root client's RPC times out or exits, the forwarded window fails with EPIPE.
         calls.deactivate(ThreadSlot(0));
         assert_eq!(
             calls.prepare_bulk_io(tok1, ThreadSlot(2), 0, 16, true),
             Err(Errno::Epipe)
+        );
+        // A new RPC reusing the root slot must not revive the old delegation.
+        let (gen2, tok2) = calls.next_token(ThreadSlot(0)).unwrap();
+        calls.activate_with_bulk(
+            ThreadSlot(0),
+            gen2,
+            3,
+            Some(BulkWindow {
+                root_gen: gen2,
+                flags: BULK_READ,
+                ..root_bulk
+            }),
+        );
+        assert_eq!(
+            calls.prepare_bulk_io(tok1, ThreadSlot(2), 0, 123, true),
+            Err(Errno::Epipe)
+        );
+        calls.bind_reply(&mut s, tok2, ThreadSlot(3));
+        assert_eq!(
+            calls.prepare_bulk_io(tok2, ThreadSlot(3), 0, 123, true),
+            Err(Errno::Eperm)
         );
     }
 

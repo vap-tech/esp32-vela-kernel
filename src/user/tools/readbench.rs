@@ -2,7 +2,12 @@
 #![no_main]
 
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, arena::Arena, file::fs_read_bulk_mode, io, sys, word_le};
+use vela_user::{
+    Buffer, TextBuf,
+    arena::Arena,
+    file::{fs_read_bulk_mode, fs_read_bulk_staged},
+    io, sys, word_le,
+};
 
 vela_user::entry!(main);
 
@@ -74,7 +79,7 @@ fn report(label: &[u8], value: u64) {
 fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     io::init(stdin, stdout);
     if fs == 0 || arg == 0 || len == 0 || len as usize > abi::SPAWN_ARG_MAX {
-        io::ewrite(b"usage: readbench [verify] [single] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [verify] [single|staged] /sd/<file>\n");
         sys::process_exit();
     }
     // SAFETY: the loader reserves the argument above the initial stack.
@@ -83,12 +88,15 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         Some(path) => (true, path),
         None => (false, argument.strip_prefix(b"io ").unwrap_or(argument)),
     };
-    let (batch, path) = match argument.strip_prefix(b"single ") {
-        Some(path) => (false, path),
-        None => (true, argument),
+    let (batch, staged, path) = if let Some(path) = argument.strip_prefix(b"single ") {
+        (false, false, path)
+    } else if let Some(path) = argument.strip_prefix(b"staged ") {
+        (true, true, path)
+    } else {
+        (true, false, argument)
     };
     if !path.starts_with(b"/sd/") {
-        io::ewrite(b"usage: readbench [verify] [single] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [verify] [single|staged] /sd/<file>\n");
         sys::process_exit();
     }
     let Ok(mut arena) = Arena::new_psram(4096) else {
@@ -115,8 +123,22 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     let mut offset = 0u32;
     let mut hash = 2166136261u32;
     loop {
+        if hash_enabled {
+            chunk.fill(0xa5);
+        }
+        // Verification also exercises a grant ending inside a sector, then
+        // unaligned file offsets. The timed default retains 4 KiB requests.
+        let want = if hash_enabled && offset == 0 {
+            chunk.len() - 1
+        } else {
+            chunk.len()
+        };
         let rpc_at = sys::monotonic_16m();
-        let result = fs_read_bulk_mode(fs, path, offset, chunk, &mut response, batch);
+        let result = if staged {
+            fs_read_bulk_staged(fs, path, offset, &mut chunk[..want], &mut response)
+        } else {
+            fs_read_bulk_mode(fs, path, offset, &mut chunk[..want], &mut response, batch)
+        };
         rpc_ticks += sys::monotonic_16m() - rpc_at;
         if response.get(0) == 0 && response.len() == vela_abi::fs::BULK_READ_PROFILE_BYTES {
             ext4_ticks += wide(response.as_slice(), 5);
@@ -129,6 +151,13 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         samples += word_le(&observed, 4);
         max_delay = max_delay.max(word_le(&observed, 8));
         end = counter(&observed);
+        if let Ok(n) = result
+            && hash_enabled
+            && chunk[n..].iter().any(|&b| b != 0xa5)
+        {
+            io::ewrite(b"readbench: data written past returned length\n");
+            sys::process_exit();
+        }
         match result {
             Ok(0) => break,
             Ok(n) => {
@@ -151,7 +180,13 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     let after = snapshot();
     let kernel_after = profile();
     let mut out = TextBuf::<256>::new();
-    out.append(if batch { b"batch " } else { b"single " });
+    out.append(if staged {
+        b"staged "
+    } else if batch {
+        b"direct "
+    } else {
+        b"single "
+    });
     for (label, value) in [
         (b"bytes=" as &[u8], offset),
         (b" us=", elapsed_us),

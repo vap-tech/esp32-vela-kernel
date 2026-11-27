@@ -36,6 +36,8 @@ pub const OP_MKDIR: u8 = 9;
 /// Read-only experiment: same bulk transport as OP_READ_BULK, ext4 data reads
 /// limited to single sectors. Explicit operation so older services reject it.
 pub const OP_READ_BULK_SINGLE: u8 = 10;
+/// Bulk-read control retaining the ext4 staging buffer and sector batching.
+pub const OP_READ_BULK_STAGED: u8 = 11;
 
 /// Reply status codes.
 pub const STATUS_OK: u8 = 0;

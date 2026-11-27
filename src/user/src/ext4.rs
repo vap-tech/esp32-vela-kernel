@@ -63,6 +63,13 @@ pub struct NameChunk {
     pub end_of_name: bool,
 }
 
+/// One file span within a filesystem block. Address is partition-relative bytes;
+/// None denotes a sparse/unwritten range which must be delivered as zeroes.
+pub struct FileChunk {
+    pub address: Option<u64>,
+    pub len: usize,
+}
+
 pub struct Ext4<B> {
     device: B,
     cached_sector: Option<u32>,
@@ -504,6 +511,27 @@ impl<B: BlockRead> Ext4<B> {
         Ok(None)
     }
 
+    /// Resolve a bounded span without reading its data. The result never
+    /// crosses a block/extent boundary or EOF and exposes no process pointers.
+    pub fn read_chunk(
+        &mut self,
+        file: &File,
+        offset: u32,
+        limit: usize,
+    ) -> Result<Option<FileChunk>, Error> {
+        let within = offset % self.block_size;
+        let len = limit
+            .min(file.0.size.saturating_sub(offset) as usize)
+            .min((self.block_size - within) as usize);
+        if len == 0 {
+            return Ok(None);
+        }
+        let address = self
+            .data_block(&file.0, offset / self.block_size)?
+            .map(|base| base + u64::from(within));
+        Ok(Some(FileChunk { address, len }))
+    }
+
     pub fn read(&mut self, file: &File, offset: u32, out: &mut [u8]) -> Result<usize, Error> {
         self.read_with_batch(file, offset, out, true)
     }
@@ -520,15 +548,16 @@ impl<B: BlockRead> Ext4<B> {
         let mut done = 0;
         while done < len {
             let pos = offset + done as u32;
-            let within = pos % self.block_size;
-            let count = (len - done).min((self.block_size - within) as usize);
-            let chunk = &mut out[done..done + count];
-            if let Some(base) = self.data_block(&file.0, pos / self.block_size)? {
-                self.read_bytes_limited(base + u64::from(within), chunk, batch)?;
+            let range = self
+                .read_chunk(file, pos, len - done)?
+                .ok_or(Error::Corrupt)?;
+            let chunk = &mut out[done..done + range.len];
+            if let Some(address) = range.address {
+                self.read_bytes_limited(address, chunk, batch)?;
             } else {
                 chunk.fill(0);
             }
-            done += count;
+            done += range.len;
         }
         Ok(done)
     }
@@ -1713,6 +1742,19 @@ mod tests {
             put_le16(extent, 28, blocks - 1);
             put_le16(extent, 30, 0);
             put_le32(extent, 32, physical + 1);
+            // Relocate the second extent, so span consumers must honor a real
+            // physical discontinuity, not just a split extent header.
+            let block_bytes = image.block_size as usize;
+            let relocated = image.blocks - 32;
+            let mut fragmented_bytes = bytes.clone();
+            let from = (physical as usize + 1) * block_bytes;
+            fragmented_bytes.copy_within(
+                from..from + (blocks as usize - 1) * block_bytes,
+                relocated as usize * block_bytes,
+            );
+            let mut fragmented = Ext4::mount(Image(fragmented_bytes)).unwrap();
+            let mut relocated_file = File(split.0);
+            put_le32(&mut relocated_file.0.extents, 32, relocated);
             let mut bulk = [0; 4096];
             for offset in [0, 1, 511, 512, 1023, 4095, 4096, 12000, 13999, 14000] {
                 let count = image.read(&file, offset, &mut bulk).unwrap();
@@ -1724,6 +1766,29 @@ mod tests {
                 let split_count = image.read(&split, offset, &mut bulk).unwrap();
                 assert_eq!(split_count, count);
                 assert_eq!(&bulk[..count], &content[start..start + count]);
+                // Consume the offset-only API into a separate destination.
+                let mut delivered = [0xa5; 4096];
+                let mut done = 0;
+                while let Some(range) = fragmented
+                    .read_chunk(
+                        &relocated_file,
+                        offset + done as u32,
+                        delivered.len() - done,
+                    )
+                    .unwrap()
+                {
+                    assert!(range.len > 0);
+                    assert!(range.len <= block_bytes - (offset as usize + done) % block_bytes);
+                    let destination = &mut delivered[done..done + range.len];
+                    match range.address {
+                        Some(address) => fragmented.read_bytes(address, destination).unwrap(),
+                        None => destination.fill(0),
+                    }
+                    done += range.len;
+                }
+                assert_eq!(done, count);
+                assert_eq!(&delivered[..done], &content[start..start + done]);
+                assert!(delivered[done..].iter().all(|&b| b == 0xa5));
                 let single_count = image
                     .read_with_batch(&split, offset, &mut bulk, false)
                     .unwrap();
@@ -1740,6 +1805,11 @@ mod tests {
             }
             assert_eq!(image.read(&file, content.len() as u32, &mut buffer), Ok(0));
             let sparse = image.open(b"/sparse").unwrap();
+            let hole = image.read_chunk(&sparse, 511, 4096).unwrap().unwrap();
+            assert_eq!(hole.address, None);
+            assert_eq!(hole.len, block_bytes - 511);
+            assert!(image.read_chunk(&sparse, 8192, 4096).unwrap().is_none());
+            assert!(image.read_chunk(&file, 0, 0).unwrap().is_none());
             assert_eq!(image.read(&sparse, 4064, &mut buffer), Ok(95));
             assert_eq!(buffer, [0; 95]);
             let dir = image.open_dir(b"/bin/").unwrap();

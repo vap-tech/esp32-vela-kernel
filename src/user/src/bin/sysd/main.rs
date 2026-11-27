@@ -472,7 +472,7 @@ fn handle_request(
             handle_read(offset, path, mounts, caps, cache, response);
         }
         [
-            op @ (fs_abi::OP_READ_BULK | fs_abi::OP_READ_BULK_SINGLE),
+            op @ (fs_abi::OP_READ_BULK | fs_abi::OP_READ_BULK_SINGLE | fs_abi::OP_READ_BULK_STAGED),
             a,
             b,
             c,

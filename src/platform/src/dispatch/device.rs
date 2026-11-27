@@ -144,6 +144,54 @@ impl Runtime {
             return Ok(partition.1);
         }
         let (start, count) = self.sd_partition.ok_or(Errno::Einval)?;
+        if args.a3 == syscall::SD_PARTITION_READ_BULK {
+            let bytes = args.a4 as usize;
+            if !(1..=4096).contains(&bytes) {
+                return Err(Errno::Einval);
+            }
+            let sectors = bytes.div_ceil(512) as u32;
+            if args.a1.checked_add(sectors).is_none_or(|end| end > count) {
+                return Err(Errno::Einval);
+            }
+            // The token is bound to this server and to an active root RPC.
+            // Its writable grant, offset and exact byte length authorize the
+            // destination. No PID or foreign pointer is supplied by the driver.
+            let (owner, destination) = self.calls.prepare_bulk_io(
+                args.a2,
+                self.scheduler.current,
+                args.a5 as usize,
+                bytes,
+                true,
+            )?;
+            if !self.processes.slot(owner).memory.permits(
+                destination,
+                bytes,
+                vela_kernel::process::WRITE,
+            ) {
+                return Err(Errno::Efault);
+            }
+            let started = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+            let data = unsafe {
+                soc::sdcard::read_sectors_dma_with(start + args.a1, sectors as usize, &mut || {
+                    self.display.tick()
+                })
+            }
+            .map_err(|_| {
+                self.sd_partition = None;
+                Errno::Eio
+            })?;
+            let completed = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+            self.read_profile.sd_ticks += completed - started;
+            self.read_profile.sd_calls += 1;
+            // SAFETY: DMA initialized ceil(bytes/512) sectors. KERNEL_LOCK
+            // prevents buffer reuse, call cancellation, teardown and unmapping
+            // until this exact-length copy has completed. DMA never targets U-mode.
+            let data = unsafe { core::slice::from_raw_parts(data, bytes) };
+            copy_to_user_within(&self.processes.slot(owner).memory, destination, bytes, data)?;
+            self.read_profile.sd_copy_ticks +=
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+            return Ok(0);
+        }
         if args.a3 == syscall::SD_PARTITION_READ_BATCH {
             let sectors = args.a4;
             if !(1..=8).contains(&sectors)

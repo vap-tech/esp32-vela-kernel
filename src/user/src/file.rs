@@ -197,6 +197,39 @@ pub fn fs_read_bulk_mode(
     response: &mut Buffer,
     batch: bool,
 ) -> Result<usize, u8> {
+    fs_read_bulk_request(
+        handle,
+        path,
+        offset,
+        dst,
+        response,
+        if batch {
+            OP_READ_BULK
+        } else {
+            fs::OP_READ_BULK_SINGLE
+        },
+    )
+}
+
+/// Comparison path retaining the service staging buffer with batched SD reads.
+pub fn fs_read_bulk_staged(
+    handle: u32,
+    path: &[u8],
+    offset: u32,
+    dst: &mut [u8],
+    response: &mut Buffer,
+) -> Result<usize, u8> {
+    fs_read_bulk_request(handle, path, offset, dst, response, fs::OP_READ_BULK_STAGED)
+}
+
+fn fs_read_bulk_request(
+    handle: u32,
+    path: &[u8],
+    offset: u32,
+    dst: &mut [u8],
+    response: &mut Buffer,
+    operation: u8,
+) -> Result<usize, u8> {
     response.clear();
     if dst.is_empty() {
         return Ok(0);
@@ -208,11 +241,7 @@ pub fn fs_read_bulk_mode(
     }
     let want = dst.len().min(abi::IPC_BULK_MAX) as u32;
     let mut request = Buffer::new();
-    request.push(if batch {
-        OP_READ_BULK
-    } else {
-        fs::OP_READ_BULK_SINGLE
-    });
+    request.push(operation);
     request.append(&offset.to_le_bytes());
     request.append(&want.to_le_bytes());
     request.append(path);

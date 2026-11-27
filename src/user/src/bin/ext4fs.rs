@@ -121,6 +121,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     | fs_abi::OP_STAT
                     | fs_abi::OP_READ_BULK
                     | fs_abi::OP_READ_BULK_SINGLE
+                    | fs_abi::OP_READ_BULK_STAGED
                     | fs_abi::OP_WRITE_BULK
                     | fs_abi::OP_UNLINK
                     | fs_abi::OP_MKDIR
@@ -210,7 +211,9 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     Ok(())
                 }
                 [
-                    op @ (fs_abi::OP_READ_BULK | fs_abi::OP_READ_BULK_SINGLE),
+                    op @ (fs_abi::OP_READ_BULK
+                    | fs_abi::OP_READ_BULK_SINGLE
+                    | fs_abi::OP_READ_BULK_STAGED),
                     a,
                     b,
                     c,
@@ -241,14 +244,50 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     let mut read_ticks = sys::monotonic_16m() - opened_at;
                     let mut copy_ticks = 0u64;
                     while written < max_len {
-                        let want = (max_len - written).min(buf.len());
+                        let mut want = (max_len - written).min(buf.len());
                         let read_at = sys::monotonic_16m();
+                        if *op == fs_abi::OP_READ_BULK {
+                            let Some(range) =
+                                fs.read_chunk(file, offset, want).map_err(err_reply)?
+                            else {
+                                read_ticks += sys::monotonic_16m() - read_at;
+                                break;
+                            };
+                            want = range.len;
+                            if let Some(address) = range.address {
+                                if address.is_multiple_of(SECTOR as u64) {
+                                    let sector = u32::try_from(address / SECTOR as u64)
+                                        .map_err(|_| err_reply(Error::Corrupt))?;
+                                    if sys::call6(
+                                        abi::SD_PARTITION,
+                                        storage,
+                                        sector,
+                                        pending,
+                                        abi::SD_PARTITION_READ_BULK,
+                                        want as u32,
+                                        written as u32,
+                                    )
+                                    .0 != 0
+                                    {
+                                        return Err(err_reply(Error::Io));
+                                    }
+                                    read_ticks += sys::monotonic_16m() - read_at;
+                                    written += want;
+                                    offset += want as u32;
+                                    continue;
+                                }
+                                // Stage only the unaligned leading bytes; the next
+                                // iteration can use the delegated window directly.
+                                want = want.min(SECTOR - (address % SECTOR as u64) as usize);
+                            }
+                            // Sparse ranges are zero-filled through the staged path.
+                        }
                         let n = fs
                             .read_with_batch(
                                 &file,
                                 offset,
                                 &mut buf[..want],
-                                *op == fs_abi::OP_READ_BULK,
+                                *op != fs_abi::OP_READ_BULK_SINGLE,
                             )
                             .map_err(err_reply)?;
                         read_ticks += sys::monotonic_16m() - read_at;
