@@ -513,3 +513,18 @@ the console when it reconnects. The `ttyACM` number can change, so use the
 Tab5's symlink under `/dev/serial/by-id`.
 
 ELF initial stacks reserve a double-size aligned allocation. PMP exposes the upper half and leaves the lower half inaccessible as a guard. PSRAM programs normally use a 64 KiB PSRAM allocation with a 32 KiB usable stack. SRAM programs retain 4 KiB usable stacks with a 4 KiB guard. THREAD_CREATE accepts THREAD_STACK_GUARD in a5 along with affinity. Pass the full private MEM_ALLOC allocation, twice the desired usable stack size. The kernel closes its lower half, restricts the memory capability to CONTROL, and retains the original allocation for MEM_FREE after thread exit. The four init supervisor threads use this mode with 64 KiB PSRAM allocations (32 KiB usable and 32 KiB guard each), preserving SRAM for the framebuffer console and IRQ services. Each HP kernel stack has a 256-byte boundary marker checked at trap entry and return, with SP validation before a kernel-origin trap frame is stored. Failed checks switch to an independent emergency stack for a fatal hart/SP/PC report. Detection occurs at trap boundaries, so a kernel write beyond the stack can damage memory before detection.
+
+
+### Batched ext4 reads
+
+Aligned file reads now submit up to eight sectors per SD command within the
+current ext4 block. Unaligned bytes and tails retain the sector-cache path.
+The partition syscall validates the complete destination and sector range.
+Devices without batch support use the `BlockRead` single-sector fallback.
+
+Build and install `target/sd/bin/readbench.elf`, then run
+`run /sd/bin/readbench.elf /sd/bin/shell.elf` to report bytes, elapsed 10 ms
+ticks, sector/command deltas and FNV-1a without printing file contents.
+On Tab5, the existing 10,552-byte shell required 12 commands versus 29 before,
+with identical checksums. Timing and limitations are recorded in
+[the roadmap](docs/roadmap.md).

@@ -25,6 +25,8 @@ pub const STATS_TASKS_BYTES: usize = STATS_TASKS_SLOTS * STATS_TASK_WORDS * 4;
 pub const STATS_SDCARD: u32 = 5; // state/flags, ocr, sectors, asset_lba, asset_bytes, read_sectors, written_sectors, errors (+ clk_khz, bench_write_kib_s, bench_read_kib_s)
 pub const STATS_SDCARD_BYTES: usize = 32;
 pub const STATS_SDCARD_EXT_BYTES: usize = 44;
+/// Extended SD telemetry, appending attempted filesystem read commands at offset 44.
+pub const STATS_SDCARD_IO_BYTES: usize = 48;
 pub const STATS_RANDOM: u32 = 6; // hardware TRNG (0x5011_01a4 / 0x5011_01c0): cfg, last_raw, samples_lo, samples_hi, 8 random words
 pub const STATS_RANDOM_BYTES: usize = 48;
 pub const STATS_DISPLAY: u32 = 7; // u32 display and storage export flags
@@ -274,3 +276,6 @@ pub struct IpcCapCall {
 /// Per HP hart: usable bytes, deepest observed write bytes, untouched bytes, guard intact.
 pub const STATS_KERNEL_STACKS: u32 = 9;
 pub const STATS_KERNEL_STACKS_BYTES: usize = 32;
+
+/// SD_PARTITION a3: read a4 sectors (1..=8) into a2, partition-relative a1.
+pub const SD_PARTITION_READ_BATCH: u32 = 3;

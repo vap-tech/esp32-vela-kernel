@@ -88,3 +88,9 @@ name = "vela-wc"
 path = "tools/wc.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "vela-readbench"
+path = "tools/readbench.rs"
+test = false
+bench = false

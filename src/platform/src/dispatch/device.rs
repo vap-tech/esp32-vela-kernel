@@ -144,6 +144,31 @@ impl Runtime {
             return Ok(partition.1);
         }
         let (start, count) = self.sd_partition.ok_or(Errno::Einval)?;
+        if args.a3 == syscall::SD_PARTITION_READ_BATCH {
+            let sectors = args.a4;
+            if !(1..=8).contains(&sectors)
+                || args.a1.checked_add(sectors).is_none_or(|end| end > count)
+                || !self.writable(args.a2 as usize, sectors as usize * 512)
+            {
+                return Err(Errno::Einval);
+            }
+            // KERNEL_LOCK serializes DMA and excludes changes to the validated
+            // address space until the private driver buffer has been copied.
+            let data = unsafe {
+                soc::sdcard::read_sectors_dma_with(start + args.a1, sectors as usize, &mut || {
+                    self.display.tick()
+                })
+            }
+            .map_err(|_| {
+                self.sd_partition = None;
+                Errno::Eio
+            })?;
+            // SAFETY: completed DMA initialized this many bytes; no other SD
+            // operation can reuse its buffer while KERNEL_LOCK is held.
+            let data = unsafe { core::slice::from_raw_parts(data, sectors as usize * 512) };
+            copy_to_user_within(self.memory(), args.a2 as usize, data.len(), data)?;
+            return Ok(0);
+        }
         let mut sector = [0; 512];
         if args.a1 >= count {
             return Err(Errno::Einval);

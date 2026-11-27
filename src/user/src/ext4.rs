@@ -18,6 +18,22 @@ pub enum Error {
 pub trait BlockRead {
     fn sectors(&self) -> u32;
     fn read_sector(&mut self, sector: u32, data: &mut [u8; SECTOR]) -> Result<(), Error>;
+
+    /// Read whole consecutive sectors. Devices may retain the single-sector fallback.
+    fn read_sectors(&mut self, sector: u32, data: &mut [u8]) -> Result<(), Error> {
+        if data.is_empty()
+            || !data.len().is_multiple_of(SECTOR)
+            || sector
+                .checked_add((data.len() / SECTOR) as u32)
+                .is_none_or(|end| end > self.sectors())
+        {
+            return Err(Error::Io);
+        }
+        for (i, chunk) in data.chunks_exact_mut(SECTOR).enumerate() {
+            self.read_sector(sector + i as u32, chunk.try_into().unwrap())?;
+        }
+        Ok(())
+    }
 }
 
 pub trait BlockWrite: BlockRead {
@@ -188,6 +204,13 @@ impl<B: BlockRead> Ext4<B> {
         while !out.is_empty() {
             let sector = (offset / SECTOR as u64) as u32;
             let start = offset as usize % SECTOR;
+            if start == 0 && out.len() >= 2 * SECTOR {
+                let count = (out.len() / SECTOR).min(8) * SECTOR;
+                self.device.read_sectors(sector, &mut out[..count])?;
+                out = &mut out[count..];
+                offset += count as u64;
+                continue;
+            }
             if self.cached_sector != Some(sector) {
                 self.cached_sector = None;
                 self.device.read_sector(sector, &mut self.cache)?;
@@ -1445,6 +1468,13 @@ mod tests {
             out.copy_from_slice(self.0.get(start..start + SECTOR).ok_or(Error::Io)?);
             Ok(())
         }
+
+        fn read_sectors(&mut self, sector: u32, out: &mut [u8]) -> Result<(), Error> {
+            assert!(!out.is_empty() && out.len() <= 4096 && out.len().is_multiple_of(SECTOR));
+            let start = sector as usize * SECTOR;
+            out.copy_from_slice(self.0.get(start..start + out.len()).ok_or(Error::Io)?);
+            Ok(())
+        }
     }
 
     impl BlockWrite for Image {
@@ -1649,6 +1679,32 @@ mod tests {
             let mut bytes = fs::read(&path).unwrap();
             let mut image = Ext4::mount(Image(bytes.clone())).unwrap();
             let file = image.open(b"/bin/large").unwrap();
+            // Split a contiguous extent into two records. Reads must resolve
+            // the second extent even when the caller spans their boundary.
+            let mut split = File(file.0);
+            let extent = &mut split.0.extents;
+            assert_eq!(le16(extent, 2), 1);
+            let blocks = le16(extent, 16);
+            assert!(blocks > 1 && blocks < 32768);
+            let physical = le32(extent, 20);
+            put_le16(extent, 2, 2);
+            put_le16(extent, 16, 1);
+            put_le32(extent, 24, 1);
+            put_le16(extent, 28, blocks - 1);
+            put_le16(extent, 30, 0);
+            put_le32(extent, 32, physical + 1);
+            let mut bulk = [0; 4096];
+            for offset in [0, 1, 511, 512, 1023, 4095, 4096, 12000, 13999, 14000] {
+                let count = image.read(&file, offset, &mut bulk).unwrap();
+                let start = offset as usize;
+                assert_eq!(
+                    &bulk[..count],
+                    &content[start..(start + 4096).min(content.len())]
+                );
+                let split_count = image.read(&split, offset, &mut bulk).unwrap();
+                assert_eq!(split_count, count);
+                assert_eq!(&bulk[..count], &content[start..start + count]);
+            }
             assert_eq!(image.open(b"/bin/missing").err(), Some(Error::NotFound));
             let mut buffer = [0; 95];
             for (i, chunk) in content.chunks(buffer.len()).enumerate() {

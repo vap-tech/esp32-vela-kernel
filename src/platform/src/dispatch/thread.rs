@@ -48,7 +48,14 @@ impl Runtime {
         let pid = if let Some(pid) = self.kbd_pid {
             pid
         } else {
-            let (child, _, _) = self.load_elf(crate::boot::KBD_ELF, false)?;
+            // Preserve scarce SRAM for scanout and DMA. A larger kernel may
+            // leave too little aligned space for the keyboard image.
+            let (child, _, _) = match self.load_elf(crate::boot::KBD_ELF, false) {
+                Err(Errno::Enomem) => {
+                    self.load_elf_in(crate::boot::KBD_ELF, MemoryClass::Psram, false)?
+                }
+                result => result?,
+            };
             let result = (|| {
                 let sender =
                     lifecycle::grant(&mut self.processes, current, input, child.slot, cap::SEND)?;
@@ -758,7 +765,9 @@ impl Runtime {
             syscall::STATS_SDCARD => {
                 if !matches!(
                     len,
-                    syscall::STATS_SDCARD_BYTES | syscall::STATS_SDCARD_EXT_BYTES
+                    syscall::STATS_SDCARD_BYTES
+                        | syscall::STATS_SDCARD_EXT_BYTES
+                        | syscall::STATS_SDCARD_IO_BYTES
                 ) {
                     return Err(Errno::Einval);
                 }
@@ -783,8 +792,9 @@ impl Runtime {
                     sd.clk_khz,
                     sd.bench_write_kib_s,
                     sd.bench_read_kib_s,
+                    sd.read_commands,
                 ];
-                let mut buffer = [0u8; syscall::STATS_SDCARD_EXT_BYTES];
+                let mut buffer = [0u8; syscall::STATS_SDCARD_IO_BYTES];
                 for (i, word) in words[..len / 4].iter().enumerate() {
                     buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }

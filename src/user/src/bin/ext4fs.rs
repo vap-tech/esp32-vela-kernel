@@ -23,6 +23,27 @@ impl BlockRead for Partition {
         self.sectors
     }
 
+    fn read_sectors(&mut self, sector: u32, out: &mut [u8]) -> Result<(), Error> {
+        if out.is_empty() || !out.len().is_multiple_of(SECTOR) || out.len() > 8 * SECTOR {
+            return Err(Error::Io);
+        }
+        if sys::call6(
+            abi::SD_PARTITION,
+            self.handle,
+            sector,
+            out.as_mut_ptr() as u32,
+            abi::SD_PARTITION_READ_BATCH,
+            (out.len() / SECTOR) as u32,
+            0,
+        )
+        .0 == 0
+        {
+            Ok(())
+        } else {
+            Err(Error::Io)
+        }
+    }
+
     fn read_sector(&mut self, sector: u32, out: &mut [u8; SECTOR]) -> Result<(), Error> {
         if sys::call(
             abi::SD_PARTITION,

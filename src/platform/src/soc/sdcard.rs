@@ -257,6 +257,7 @@ pub struct Telemetry {
     pub ocr: u32,
     pub sectors: u32,
     pub read_sectors: u32,
+    pub read_commands: u32,
     pub written_sectors: u32,
     pub errors: u32,
     pub bench_write_kib_s: u32,
@@ -273,6 +274,7 @@ struct State {
     ocr: u32,
     sectors: u32,
     read_sectors: u32,
+    read_commands: u32,
     written_sectors: u32,
     errors: u32,
     bench_write_kib_s: u32,
@@ -291,6 +293,7 @@ static mut STATE: State = State {
     ocr: 0,
     sectors: 0,
     read_sectors: 0,
+    read_commands: 0,
     written_sectors: 0,
     errors: 0,
     bench_write_kib_s: 0,
@@ -321,6 +324,7 @@ pub unsafe fn telemetry() -> Telemetry {
             ocr: STATE.ocr,
             sectors: STATE.sectors,
             read_sectors: STATE.read_sectors,
+            read_commands: STATE.read_commands,
             written_sectors: STATE.written_sectors,
             errors: STATE.errors,
             bench_write_kib_s: STATE.bench_write_kib_s,
@@ -1440,7 +1444,23 @@ pub unsafe fn read_sectors_dma(lba: u32, count: usize) -> Result<*const u8, u32>
     if unsafe { EXPORTED } {
         return Err(ERR_SD_READ);
     }
-    unsafe { read_sectors(lba, count, &mut || {}) }
+    unsafe { read_sectors_dma_with(lba, count, &mut || {}) }
+}
+
+/// Service unrelated hardware during DMA waits.
+///
+/// # Safety
+/// Same ownership as read_sectors_dma. The callback must not access SD.
+/// The returned buffer is valid only until the next SD operation.
+pub unsafe fn read_sectors_dma_with(
+    lba: u32,
+    count: usize,
+    service: &mut impl FnMut(),
+) -> Result<*const u8, u32> {
+    if unsafe { EXPORTED } {
+        return Err(ERR_SD_READ);
+    }
+    unsafe { read_sectors(lba, count, service) }
 }
 
 unsafe fn read_sectors(
@@ -1470,6 +1490,7 @@ unsafe fn read_sectors(
         let dma_ptr = dma_buf_direct_ptr();
         if STATE.sdmmc_4bit {
             let cmd = if count == 1 { 17 } else { 18 };
+            STATE.read_commands = STATE.read_commands.saturating_add(1);
             let res = sdmmc_transfer_idma(
                 cmd,
                 arg,
@@ -1548,6 +1569,7 @@ unsafe fn write_sectors(lba: u32, count: usize, service: &mut impl FnMut()) -> R
 }
 
 unsafe fn read_sector_spi(lba: u32, out: &mut [u8; SECTOR_BYTES]) -> Result<(), u32> {
+    unsafe { STATE.read_commands = STATE.read_commands.saturating_add(1) };
     unsafe {
         let arg = if STATE.sdhc {
             lba
