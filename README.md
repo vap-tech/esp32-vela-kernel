@@ -12,6 +12,11 @@ Application development is documented in [the SDK guide](docs/sdk.md).
 `./scripts/build-app.sh` builds an independent `no_std` Rust example using only
 `vela-sdk`, ready to copy to microSD and run through shell, pipes or redirection.
 
+The next performance experiment is sequential ext4 reading on Tab5. File IPC
+already supports bulk transfers, while the partition interface used by `ext4fs`
+reads one 512-byte sector per call. The [roadmap](docs/roadmap.md) starts with
+the baseline, proposed eight-sector read, and on-board acceptance checks.
+
 ## Build and run
 
 The build requires Rustup, Clang with RISC-V support, `espflash`
@@ -417,6 +422,13 @@ An `init` thread starts the bundled framebuffer console and waits for its proces
 
 At startup the console requests the boot artwork from Flash in its own scanout buffer. After collecting the early console log it composes one native RGB565 row (1,440 bytes) at a time and copies each finished row over the artwork in scan order. The backlight stays on throughout the handoff. Scanout can still show a mixture of old and new rows during the transition. During the handoff on Tab5 at 180 MHz, writes use 16-byte bursts separated by a write fence and 200 NOPs. Three measured boots each took 350 ms with zero observed underruns, versus 290 ms and six underruns with whole-row copies. Later updates redraw changed cells.
 
+The experimental console wallpaper uses a dimmed 320×180 sample of the boot
+image (115,200 bytes of RGB565 data in PSRAM). Switch it with
+`echo wallpaper > /sys/display` or `echo black > /sys/display`.
+Idle log polls skip the 80×22 grid scan. Incremental rendering skips unchanged pixel pairs when replacing glyphs.
+On Tab5, four scrolls of a filled console with 70 characters per line took
+460 ms with wallpaper and 240 ms on black (previously 980 and 800 ms).
+
 At boot, `vela-fbcon` allocates a 2 MiB framebuffer from `RegionAllocator`, initializes
 the ST7121 panel and MIPI-DSI video pipeline (`DW-GDMA CH0`, 4-frame descriptor ring
 reading the `0x48xx_xxxx` bus alias), and renders the 80×22 ANSI console. Writing
@@ -467,10 +479,7 @@ the shell, respawning it if it exits.
 
 The ext4 reader supports 1–4 KiB blocks, regular files, extent trees and linear
 directories up to 1 MiB. It rejects volumes needing journal recovery,
-unsupported feature flags, symlinks and indexed directories. Vela does not
-write ext4 or support card hot swapping. File IPC reads at a byte offset, with
-up to 95 bytes per reply. The kernel copies the ELF into a private snapshot
-before validating it. `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` can pass a bounded
+unsupported feature flags, symlinks and indexed directories. Vela supports file creation, writes, directory creation and removal on the mounted ext4 partition. File IPC supports offset-based inline reads (up to 95 payload bytes) and bulk transfers, including ELF loading from microSD. `SPAWN_IMAGE` / `SPAWN_IMAGE_WAIT` can pass a bounded
 argument and up to 4 explicit capability handles (each attenuated to its
 declared rights mask) so child utilities have zero ambient privileges.
 

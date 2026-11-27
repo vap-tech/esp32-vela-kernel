@@ -132,7 +132,11 @@ impl CycleSnapshot {
         if denom == 0 {
             return 0;
         }
-        ((busy.saturating_mul(10_000) + denom / 2) / denom) as u32
+        if busy <= (u64::MAX - denom / 2) / 10_000 {
+            ((busy * 10_000 + denom / 2) / denom) as u32
+        } else {
+            ((busy as u128 * 10_000 + (denom / 2) as u128) / denom as u128) as u32
+        }
     }
 }
 
@@ -309,6 +313,18 @@ impl CycleAccounting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utilization_remains_accurate_after_long_uptime() {
+        let mut sample = CycleSnapshot {
+            capacity_cycles: u64::MAX,
+            user_cycles: u64::MAX / 2,
+            ..Default::default()
+        };
+        assert_eq!(sample.utilization_bps(), 5000);
+        sample.user_cycles = u64::MAX;
+        assert_eq!(sample.utilization_bps(), 10000);
+    }
 
     #[test]
     fn cycle_accounting_splits_user_kernel_idle_and_tracks_irq_latency_watermarks() {

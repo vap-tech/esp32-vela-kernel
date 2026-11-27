@@ -140,7 +140,9 @@ fn render_display(out: &mut TextBuf<2048>) -> u8 {
         return fs_abi::STATUS_ERR;
     }
     let flags = word_le(&snap, 0);
-    out.append(b"blanked=");
+    out.append(b"wallpaper=");
+    out.decimal(u32::from(flags & abi::DISPLAY_FLAG_WALLPAPER != 0));
+    out.append(b" blanked=");
     out.decimal(u32::from((flags & abi::DISPLAY_FLAG_BLANKED) != 0));
     out.append(b" sd_export=");
     out.decimal(u32::from((flags & abi::DISPLAY_FLAG_SD_EXPORT) != 0));
@@ -152,6 +154,20 @@ fn render_display(out: &mut TextBuf<2048>) -> u8 {
 
 #[inline(never)]
 fn write_display(text: &[u8], display_cap: u32, out: &mut TextBuf<2048>) -> u8 {
+    if matches!(text, b"wallpaper" | b"black") {
+        return if sys::call(
+            abi::DISPLAY_TEST,
+            display_cap,
+            abi::DISPLAY_MODE_WALLPAPER,
+            u32::from(text == b"wallpaper"),
+            0,
+        ) == 0
+        {
+            fs_abi::STATUS_OK
+        } else {
+            fs_abi::STATUS_ERR
+        };
+    }
     if text == b"off" {
         let rc = sys::call(abi::DISPLAY_TEST, display_cap, abi::DISPLAY_MODE_OFF, 0, 0);
         if rc == 0 {

@@ -1,6 +1,16 @@
 # Roadmap
 
-## Фундаментальные приоритеты ОС (взгляд без привязки к старому плану)
+## Ближайший эксперимент — пакетное чтение ext4 на Tab5
+
+Начать с пути приложения: `OP_READ_BULK` → `ext4fs` → `Ext4::read` → `BlockRead::read_sector` → `SD_PARTITION`. Запрос приложения уже передаётся через bulk IPC. На границе с ядром драйвер запрашивает по одному сектору (512 байт). Для 4 КиБ выровненных последовательных данных это восемь вызовов. Точки входа — [ext4fs.rs](../src/user/src/bin/ext4fs.rs) и [ext4.rs](../src/user/src/ext4.rs).
+
+1. Снять базовый замер на существующем файле microSD. Зафиксировать размер, частоту CPU и состояние дисплея. Измерить время чтения без вывода содержимого на экран, количество команд чтения SD и задержку системного тика. Счётчик прочитанных секторов и число команд учитывать отдельно.
+2. Добавить чтение до восьми последовательных секторов за команду для выровненной части файла. Ограничивать пакет границей непрерывного участка и раздела. Одиночный путь использовать для невыровненного начала, хвоста и устройств без пакетного чтения.
+3. Повторить на том же файле в тех же условиях. Сверить данные побайтно, включая неполный последний сектор, EOF и чтение через границу extent. Записать разницу во времени, количестве команд и задержке тика. Эффект на плате пока не измерен.
+
+**Что уже исправлено в рабочем дереве.** Пустой опрос журнала `fbcon` больше не запускает обход 80×22 ячеек. При периоде 20 мс это устраняет до 88 000 сравнений в секунду. Выигрыш в процентах CPU отдельно не измерен. В `CycleSnapshot::utilization_bps` исправлено переполнение при долгой работе и добавлен тест для границы `u64`. Показатель `/proc/cpuinfo` вычисляет своя функция `ratio_bps`. К планировщику вернуться, если профиль покажет заметную стоимость выбора потока или наследования приоритета.
+
+## Исходные архитектурные приоритеты (история проекта)
 
 ### 1. Потолок процессов и размера программ (главное узкое место прямо сейчас)
 Ядро поддерживает 16 процессов и 16 потоков. `init` и shell загружают с SD статические PIE ELF до 1 MiB с использованием bulk IPC.
@@ -70,6 +80,8 @@
 9. **Crash diagnostics, stack guards & userland SDK**: ELF initial stacks now have PMP-denied lower guard regions; U-mode fault reports include PID/TID, decoded cause, PC, fault address and stack bounds, retained in /proc/last_fault. THREAD_CREATE supports opt-in guarded stacks, used by init supervisor threads. HP kernel stacks have software boundary markers, pre-save SP checks and separate emergency stacks. M-mode overflow detection happens at trap boundaries. A minimal application SDK now lives in `src/sdk`, with an independent example workspace, path/cursor file API, stdin/stdout, owned PSRAM buffers and explicit-authority child launching. See `docs/sdk.md`. General child stream wiring, richer errors and independently versioned ABI compatibility remain future extensions.
 
 ## Next
+
+Сначала выполнить эксперимент с ext4 в начале документа. Ниже — последующие направления.
 
 1. **Display wallpapers & graphics**: keep the small `fbcon` image in SRAM and its framebuffer in PSRAM (618-cell startup render measured at 80 ms versus 2.54 s with the image in PSRAM). Supervisor stacks use guarded PSRAM allocations to preserve internal SRAM. Reuse the retained `vela_boot_and_display_assets/` pipeline for boot/background wallpapers alongside `fbcon`.
 2. **Cache, storage performance & connectivity**: evaluate cached `L1-DCache` mappings with explicit DMA cache maintenance, Flash XIP for larger images, and networking (ESP32-C6 co-processor or USB).

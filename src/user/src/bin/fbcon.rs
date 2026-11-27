@@ -152,6 +152,20 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
             sys::process_exit();
         }
     };
+    // Keep a quarter-resolution sample of the pristine splash in private PSRAM.
+    let samples = FB_WORDS * 2 / 16;
+    let background = Arena::new_psram(samples * 2).ok().map(|arena| unsafe {
+        let pixels = core::slice::from_raw_parts_mut(arena.base() as *mut u16, samples);
+        for (i, p) in pixels.iter_mut().enumerate() {
+            let source = fb
+                .cast::<u16>()
+                .add((i / 180) * 4 * 720 + (i % 180) * 4)
+                .read();
+            *p = (source >> 2) & 0x39e7;
+        }
+        &*pixels
+    });
+    let mut last_wallpaper = false;
     let mut first_frame = true;
     log(b"[fbcon] console online 1280x720\n");
 
@@ -179,9 +193,8 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
             continue;
         }
         if showing_export {
-            // SAFETY: clear the overlay, then let the saved console grid redraw.
-            unsafe { fb.write_bytes(0, FB_WORDS) };
-            console.framebuffer_cleared();
+            // Full composition replaces every overlay pixel.
+            first_frame = true;
             last_activity = now();
             showing_export = false;
         }
@@ -195,13 +208,17 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
             cursor = next;
             active = true;
         }
-        let start = now();
+        let wallpaper = background.is_some() && flags & abi::DISPLAY_FLAG_WALLPAPER != 0;
+        first_frame |= wallpaper != last_wallpaper;
+        last_wallpaper = wallpaper;
+        let image = background.filter(|_| wallpaper);
+        let start = if !measured || first_frame { now() } else { 0 };
         // SAFETY: `fb` is the 2 MiB PSRAM region we own, at least `FB_WORDS` words long.
         let drawn = if first_frame {
             first_frame = false;
             {
                 let a = scan_counts();
-                let n = unsafe { console.replace_artwork(fb) };
+                let n = unsafe { console.replace_with_background(fb, image) };
                 let elapsed = now().wrapping_sub(start);
                 let b = scan_counts();
                 let mut l = TextBuf::<96>::new();
@@ -215,8 +232,10 @@ fn main(display: u32, log_handle: u32, _a2: u32, _a3: u32, _a4: u32, _a5: u32) -
                 sys::write(l.as_slice());
                 n
             }
+        } else if active {
+            unsafe { console.render_background(fb, image) }
         } else {
-            unsafe { console.render(fb) }
+            0
         };
         if !measured && drawn > 100 {
             measured = true;

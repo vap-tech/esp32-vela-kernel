@@ -22,6 +22,7 @@ pub struct DisplayControl {
     /// The backlight was switched off with `DISPLAY_MODE_BACKLIGHT 0` (screen blanked).
     blanked: bool,
     splash: bool,
+    pub wallpaper: bool,
     psram: soc::psram::Controller,
     scanout: soc::scanout::Scanout,
 }
@@ -43,6 +44,7 @@ impl DisplayControl {
             external_owner: None,
             blanked: false,
             splash: false,
+            wallpaper: true,
             psram: soc::psram::Controller::new(),
             scanout: soc::scanout::Scanout::new(),
         }
@@ -201,6 +203,10 @@ impl DisplayControl {
                 Ok(v) => (diag, Ok(v)),
                 Err(code) => (diag, Ok(0u32.wrapping_sub(code))),
             };
+        }
+        if arg == syscall::DISPLAY_MODE_WALLPAPER {
+            self.wallpaper = arg2 != 0;
+            return (None, Ok(0));
         }
         if arg == syscall::DISPLAY_MODE_BACKLIGHT {
             if !self.active {

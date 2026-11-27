@@ -698,6 +698,9 @@ impl Runtime {
                     return Err(Errno::Einval);
                 }
                 let mut flags = 0;
+                if self.display.wallpaper {
+                    flags |= syscall::DISPLAY_FLAG_WALLPAPER;
+                }
                 if self.display.blanked() {
                     flags |= syscall::DISPLAY_FLAG_BLANKED;
                 }

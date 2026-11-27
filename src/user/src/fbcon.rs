@@ -292,11 +292,28 @@ impl Console {
     /// # Safety
     /// `fb` must point to a writable full-size raster.
     pub unsafe fn replace_artwork(&mut self, fb: *mut u32) -> usize {
+        unsafe { self.replace_with_background(fb, None) }
+    }
+    pub unsafe fn replace_with_background(
+        &mut self,
+        fb: *mut u32,
+        background: Option<&[u16]>,
+    ) -> usize {
         let cursor = self.cursor();
         let mut count = 0;
         let mut line = [0u32; FB_W / 2];
         for y in 0..FB_H {
-            line.fill(0);
+            if let Some(image) = background {
+                let start = y / 4 * (FB_W / 4);
+                for (dst, &pixel) in line
+                    .chunks_exact_mut(2)
+                    .zip(&image[start..start + FB_W / 4])
+                {
+                    dst.fill(u32::from(pixel) * 0x10001);
+                }
+            } else {
+                line.fill(0);
+            }
             let u = FB_H - 1 - y;
             let col = u / CELL_W;
             let bit = 15 - u % CELL_W;
@@ -322,8 +339,18 @@ impl Console {
                         .iter_mut()
                         .zip(glyph.chunks_exact(2))
                     {
-                        *dst = u32::from(pixel(pair[0], bit, fg, bg))
-                            | u32::from(pixel(pair[1], bit, fg, bg)) << 16;
+                        let base = *dst;
+                        *dst = u32::from(pixel(
+                            pair[0],
+                            bit,
+                            fg,
+                            if inverted { bg } else { base as u16 },
+                        )) | u32::from(pixel(
+                            pair[1],
+                            bit,
+                            fg,
+                            if inverted { bg } else { (base >> 16) as u16 },
+                        )) << 16;
                     }
                 }
             }
@@ -347,6 +374,9 @@ impl Console {
     /// # Safety
     /// `fb` must point to `FB_WORDS` writable `u32` words (a 720x1280 RGB565 raster).
     pub unsafe fn render(&mut self, fb: *mut u32) -> usize {
+        unsafe { self.render_background(fb, None) }
+    }
+    pub unsafe fn render_background(&mut self, fb: *mut u32, background: Option<&[u16]>) -> usize {
         let (cursor_col, cursor_row) = self.cursor();
         let mut count = 0;
         for row in 0..ROWS {
@@ -366,7 +396,21 @@ impl Console {
                 if self.drawn[row][col] != want {
                     let rgb = PALETTE[usize::from(color)];
                     // SAFETY: forwarded from the caller; the cell is inside the grid.
-                    unsafe { draw_cell(fb, col, row, want as u8, rgb, want & CURSOR != 0) };
+                    let old = self.drawn[row][col];
+                    let mut changed = [u16::MAX; CELL_H / 2];
+                    if !at_cursor && old & CURSOR == 0 {
+                        let before = &font::GLYPHS[usize::from((old as u8) - font::FIRST)];
+                        let after = &font::GLYPHS[usize::from(ch - font::FIRST)];
+                        for (i, mask) in changed.iter_mut().enumerate() {
+                            let j = i * 2;
+                            *mask = if old >> 9 == u16::from(color) {
+                                (before[j] ^ after[j]) | (before[j + 1] ^ after[j + 1])
+                            } else {
+                                before[j] | after[j] | before[j + 1] | after[j + 1]
+                            };
+                        }
+                    }
+                    unsafe { draw_bg(fb, col, row, ch, rgb, at_cursor, background, &changed) };
                     self.drawn[row][col] = want;
                     count += 1;
                 }
@@ -381,6 +425,30 @@ impl Console {
 /// # Safety
 /// `fb` must point to `FB_WORDS` writable `u32` words and `col < COLS`, `row < ROWS`.
 pub unsafe fn draw_cell(fb: *mut u32, col: usize, row: usize, ch: u8, color: u16, inverted: bool) {
+    unsafe {
+        draw_bg(
+            fb,
+            col,
+            row,
+            ch,
+            color,
+            inverted,
+            None,
+            &[u16::MAX; CELL_H / 2],
+        )
+    }
+}
+
+unsafe fn draw_bg(
+    fb: *mut u32,
+    col: usize,
+    row: usize,
+    ch: u8,
+    color: u16,
+    inverted: bool,
+    image: Option<&[u16]>,
+    changed: &[u16; CELL_H / 2],
+) {
     let index = if (font::FIRST..=font::LAST).contains(&ch) {
         usize::from(ch - font::FIRST)
     } else {
@@ -390,11 +458,23 @@ pub unsafe fn draw_cell(fb: *mut u32, col: usize, row: usize, ch: u8, color: u16
     let (fg, bg) = if inverted { (BG, color) } else { (color, BG) };
     let u0 = col * CELL_W;
     let v0 = TOP + row * CELL_H;
+    let mut tile = [bg; CELL_H / 4];
     for gx in 0..CELL_W {
         let y = FB_H - 1 - (u0 + gx);
+        if gx % 4 == 0
+            && !inverted
+            && let Some(image) = image
+        {
+            let start = y / 4 * (FB_W / 4) + v0 / 4;
+            tile.copy_from_slice(&image[start..start + CELL_H / 4]);
+        }
         let first_word = (y * FB_W + v0) / 2;
         let bit = 15 - gx;
         for pair in 0..CELL_H / 2 {
+            if changed[pair] & (1 << bit) == 0 {
+                continue;
+            }
+            let bg = tile[pair / 2];
             let lo = pixel(glyph[2 * pair], bit, fg, bg);
             let hi = pixel(glyph[2 * pair + 1], bit, fg, bg);
             // SAFETY: inside the raster by construction (u0 < 1280, v0 + 32 <= 720).
@@ -462,6 +542,49 @@ mod tests {
         unsafe { console.replace_artwork(painted.as_mut_ptr()) };
         assert_eq!(expected, painted);
         assert_eq!(render(&mut console, &mut painted), 0);
+    }
+
+    #[test]
+    fn cursor_and_erased_text_restore_the_wallpaper() {
+        let image: Vec<u16> = (0..FB_W * FB_H / 16).map(|i| i as u16).collect();
+        let mut fb = raster();
+        let mut c = Console::new();
+        unsafe {
+            c.replace_with_background(fb.as_mut_ptr(), Some(&image));
+        }
+        let original = fb.clone();
+        c.write(b"A");
+        unsafe {
+            c.render_background(fb.as_mut_ptr(), Some(&image));
+        }
+        c.write(b"\r \r");
+        unsafe {
+            c.render_background(fb.as_mut_ptr(), Some(&image));
+        }
+        assert_eq!(fb, original);
+    }
+
+    #[test]
+    fn incremental_scroll_and_recolour_match_full_composition() {
+        let image: Vec<u16> = (0..FB_WORDS / 8).map(|i| i as u16).collect();
+        let mut actual = raster();
+        let mut expected = raster();
+        let mut c = Console::new();
+        for row in 0..ROWS {
+            c.write(&[b'A' + row as u8; 35]);
+            c.write(b"\n");
+        }
+        unsafe {
+            c.replace_with_background(actual.as_mut_ptr(), Some(&image));
+        }
+        for input in [&b"abc\r\x1b[31mabc"[..], b"\nZ", b"\r \r"] {
+            c.write(input);
+            unsafe {
+                c.render_background(actual.as_mut_ptr(), Some(&image));
+                c.replace_with_background(expected.as_mut_ptr(), Some(&image));
+            }
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
