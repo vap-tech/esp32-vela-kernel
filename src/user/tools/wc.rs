@@ -1,9 +1,12 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
+#[cfg(not(test))]
 use vela_abi::syscall as abi;
-use vela_user::{Buffer, TextBuf, file::fs_read_bulk, io, sys};
+#[cfg(not(test))]
+use vela_user::{Buffer, TextBuf, arena::Arena, file::fs_read_bulk, io, sys};
 
+#[cfg(not(test))]
 vela_user::entry!(main);
 
 struct Counts {
@@ -24,12 +27,12 @@ impl Counts {
     }
 
     fn feed(&mut self, data: &[u8]) {
+        self.bytes = self.bytes.saturating_add(data.len() as u32);
         for &b in data {
-            self.bytes = self.bytes.saturating_add(1);
             if b == b'\n' {
                 self.lines = self.lines.saturating_add(1);
             }
-            if b.is_ascii_whitespace() {
+            if matches!(b, b' ' | b'\t'..=b'\r') {
                 self.in_word = false;
             } else if !self.in_word {
                 self.in_word = true;
@@ -39,6 +42,7 @@ impl Counts {
     }
 }
 
+#[cfg(not(test))]
 fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
     io::init(stdin, stdout);
     let mut counts = Counts::new();
@@ -48,13 +52,16 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
             false
         } else {
             let mut buf = [0u8; abi::IPC_BYTES];
-            while let Ok(n) = io::read(&mut buf) {
-                if n == 0 {
-                    break;
+            loop {
+                match io::read(&mut buf) {
+                    Ok(0) => break true,
+                    Ok(n) => counts.feed(&buf[..n]),
+                    Err(_) => {
+                        io::ewrite(b"wc: input stream failed\n");
+                        break false;
+                    }
                 }
-                counts.feed(&buf[..n]);
             }
-            true
         }
     } else if fs == 0 || arg == 0 || len as usize > abi::SPAWN_ARG_MAX {
         io::ewrite(b"usage: wc [</path>]\n");
@@ -67,11 +74,20 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
             false
         } else {
             let mut response = Buffer::new();
-            let mut chunk = [0u8; 1024];
+            let chunk_bytes = 64 * 1024;
+            let Ok(mut arena) = Arena::new_psram(chunk_bytes) else {
+                io::ewrite(b"wc: read buffer allocation failed\n");
+                io::close_stdout();
+                sys::process_exit();
+            };
+            // SAFETY: privately owned allocation covers the complete buffer;
+            // all accesses finish before arena release.
+            let chunk =
+                unsafe { core::slice::from_raw_parts_mut(arena.base() as *mut u8, chunk_bytes) };
             let mut offset = 0u32;
             let mut success = true;
             loop {
-                match fs_read_bulk(fs, path, offset, &mut chunk, &mut response) {
+                match fs_read_bulk(fs, path, offset, chunk, &mut response) {
                     Ok(0) => break,
                     Ok(n) => {
                         counts.feed(&chunk[..n]);
@@ -86,6 +102,7 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
                     }
                 }
             }
+            let _ = arena.release();
             success
         }
     };
@@ -101,4 +118,44 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _a5: u32) -> ! {
     }
     io::close_stdout();
     sys::process_exit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(data: &[u8], expected: (u32, u32, u32)) {
+        for chunk in [1, 2, 95, 96, 1024, 2048, 4096, 65536] {
+            let mut counts = Counts::new();
+            for block in data.chunks(chunk) {
+                counts.feed(block);
+            }
+            assert_eq!((counts.lines, counts.words, counts.bytes), expected);
+        }
+    }
+
+    #[test]
+    fn counts_empty_whitespace_and_unterminated_last_line() {
+        check(b"", (0, 0, 0));
+        check(b" \t\n\x0b\x0c\r", (1, 0, 6));
+        check(b"one two\r\nthree", (1, 3, 14));
+    }
+
+    #[test]
+    fn word_and_crlf_cross_the_64_kib_boundary() {
+        let mut data = vec![b'x'; 65535];
+        data.extend_from_slice(b"yz \tlast\r\n");
+        check(&data, (1, 2, data.len() as u32));
+        let mut data = vec![b' '; 65535];
+        data.extend_from_slice(b"\r\nend");
+        check(&data, (1, 1, data.len() as u32));
+    }
+
+    #[test]
+    fn byte_count_saturates_once_per_chunk() {
+        let mut counts = Counts::new();
+        counts.bytes = u32::MAX - 1;
+        counts.feed(b"abc");
+        assert_eq!(counts.bytes, u32::MAX);
+    }
 }

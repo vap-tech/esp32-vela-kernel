@@ -41,6 +41,7 @@ writing. The monitor uses Ctrl-R to reset and Ctrl-C to detach.
 | `help` | List shell commands and virtual namespaces. |
 | `ls [path]` | List `/`, `/proc`, `/sys`, `/sys/sentinel`, `/dev`, or any `/sd/<dir>` via `/sd/bin/ls.elf`. |
 | `cat <path>` | Read any file in `/proc`, `/sys`, `/dev`, or `/sd` via `/sd/bin/cat.elf`. |
+| `wc [path]` | Count LF lines, ASCII-delimited words and bytes from a file or stdin. |
 | `echo <val> [> <path>]` | Print text, or write control values to writable `/sys/*` and `/dev/*` nodes. |
 | `uptime` | Run `/sd/bin/uptime.elf` (or `cat /proc/uptime`). |
 | `run <elf> [arg]` | Run an RV32 static PIE ELF from `/sd` (up to 1 MiB) and wait for exit. |
@@ -579,3 +580,28 @@ hardware limits are in [the roadmap](docs/roadmap.md).
 Keyboard code and its guarded stack use PSRAM to reserve SRAM for fbcon/DMA.
 The standard check includes host regressions for copy alignment, tails,
 overlapping shared mappings, permissions and destination bounds.
+
+
+### File buffers in cat and wc
+
+File-mode `cat` and `wc` allocate a private 64 KiB PSRAM buffer and release
+it after reading, including error/closed-output paths. Their stdin modes use
+the existing small IPC stream buffers. Allocation failures produce stderr
+diagnostics. `wc` reports input errors and updates its byte count once per
+chunk; counters saturate at `u32::MAX`.
+
+Words are separated by ASCII space and bytes 0x09–0x0d, including vertical
+tab. This matches the reference `POSIXLY_CORRECT=1 LC_ALL=C wc -l -w -c`.
+Host tests cover empty input, whitespace, unterminated last lines, words
+and CRLF crossing 64 KiB, stream-sized fragments and byte-count saturation.
+
+On Tab5 the existing 1 MiB + 123 byte file produced
+`4178 24679 1048699`. One end-to-end run took 12.0 s, versus 18.2 s with
+the old 1 KiB reader and per-byte byte counter. The update also corrects
+vertical-tab word separation, so both buffering and counting code changed.
+
+A 131,084-byte fixture crossing two 64 KiB boundaries produced `1 4 131084`
+both directly and through `cat ... | wc`. Console output and missing-file
+diagnostics passed. Linux `cmp` confirmed redirected file contents byte for
+byte. Redirection took 24.2 s; profiling its stream/write path is separate work.
+Temporary SD test files were removed.

@@ -572,10 +572,15 @@ fn fs_pos_request(
 
 pub fn cat(handle: u32, path: &[u8]) {
     let mut response = Buffer::new();
-    let mut chunk = [0u8; 2048];
+    let Ok(mut arena) = Arena::new_psram(BULK_CHUNK_MAX) else {
+        io::ewrite(b"cat: read buffer allocation failed\n");
+        return;
+    };
+    // SAFETY: private live allocation covers the buffer; no access after release.
+    let chunk = unsafe { core::slice::from_raw_parts_mut(arena.base() as *mut u8, BULK_CHUNK_MAX) };
     let mut offset = 0u32;
     loop {
-        match fs_read_bulk(handle, path, offset, &mut chunk, &mut response) {
+        match fs_read_bulk(handle, path, offset, chunk, &mut response) {
             Ok(0) => break,
             Ok(count) => {
                 if io::write(&chunk[..count]).is_err() {
@@ -591,4 +596,5 @@ pub fn cat(handle: u32, path: &[u8]) {
             }
         }
     }
+    let _ = arena.release();
 }
