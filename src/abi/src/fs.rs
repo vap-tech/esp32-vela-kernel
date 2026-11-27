@@ -39,6 +39,20 @@ pub const OP_READ_BULK_SINGLE: u8 = 10;
 /// Bulk-read control retaining the ext4 staging buffer and sector batching.
 pub const OP_READ_BULK_STAGED: u8 = 11;
 
+/// Opt-in profiling for bulk-read operations. The request layout is unchanged;
+/// ext4 replies append service timings and sysd appends forwarding time.
+pub const BULK_READ_PROFILE: u8 = 0x80;
+
+/// Recognize only read operations with the optional profiling bit.
+/// Mutation and namespace operations cannot acquire this flag implicitly.
+pub const fn bulk_read_operation(operation: u8) -> Option<u8> {
+    let base = operation & !BULK_READ_PROFILE;
+    match base {
+        OP_READ_BULK | OP_READ_BULK_SINGLE | OP_READ_BULK_STAGED => Some(base),
+        _ => None,
+    }
+}
+
 /// Reply status codes.
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_NOENT: u8 = 1;
@@ -89,3 +103,35 @@ pub const MAX_PATH: usize = IPC_BYTES - REQ_HEADER;
 
 /// Maximum path bytes accepted in `OP_READ_BULK` requests.
 pub const MAX_BULK_PATH: usize = IPC_BYTES - BULK_READ_HEADER;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiling_flag_only_normalizes_bulk_reads() {
+        for operation in [OP_READ_BULK, OP_READ_BULK_SINGLE, OP_READ_BULK_STAGED] {
+            assert_eq!(bulk_read_operation(operation), Some(operation));
+            assert_eq!(
+                bulk_read_operation(operation | BULK_READ_PROFILE),
+                Some(operation)
+            );
+        }
+        for operation in [
+            OP_READ,
+            OP_LIST,
+            OP_WRITE,
+            OP_STAT,
+            OP_MOUNT,
+            OP_UNMOUNT,
+            OP_WRITE_BULK,
+            OP_UNLINK,
+            OP_MKDIR,
+            12,
+            127,
+        ] {
+            assert_eq!(bulk_read_operation(operation), None);
+            assert_eq!(bulk_read_operation(operation | BULK_READ_PROFILE), None);
+        }
+    }
+}

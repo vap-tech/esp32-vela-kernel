@@ -5,7 +5,7 @@ use vela_abi::syscall as abi;
 use vela_user::{
     Buffer, TextBuf,
     arena::Arena,
-    file::{fs_read_bulk_mode, fs_read_bulk_staged},
+    file::{fs_read_bulk_mode, fs_read_bulk_profiled, fs_read_bulk_staged},
     io, sys, word_le,
 };
 
@@ -79,11 +79,15 @@ fn report(label: &[u8], value: u64) {
 fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     io::init(stdin, stdout);
     if fs == 0 || arg == 0 || len == 0 || len as usize > abi::SPAWN_ARG_MAX {
-        io::ewrite(b"usage: readbench [verify] [single|staged] [4k|64k] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [profile] [verify] [single|staged] [4k|64k] /sd/<file>\n");
         sys::process_exit();
     }
     // SAFETY: the loader reserves the argument above the initial stack.
     let argument = unsafe { core::slice::from_raw_parts(arg as *const u8, len as usize) };
+    let (detailed, argument) = match argument.strip_prefix(b"profile ") {
+        Some(argument) => (true, argument),
+        None => (false, argument),
+    };
     let (hash_enabled, argument) = match argument.strip_prefix(b"verify ") {
         Some(path) => (true, path),
         None => (false, argument.strip_prefix(b"io ").unwrap_or(argument)),
@@ -101,7 +105,7 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         (4096, argument.strip_prefix(b"4k ").unwrap_or(argument))
     };
     if !path.starts_with(b"/sd/") {
-        io::ewrite(b"usage: readbench [verify] [single|staged] [4k|64k] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [profile] [verify] [single|staged] [4k|64k] /sd/<file>\n");
         sys::process_exit();
     }
     let Ok(mut arena) = Arena::new_psram(chunk_bytes) else {
@@ -112,7 +116,11 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     let chunk = unsafe { core::slice::from_raw_parts_mut(arena.base() as *mut u8, chunk_bytes) };
     let mut response = Buffer::new();
     let before = snapshot();
-    let kernel_before = profile();
+    let kernel_before = if detailed {
+        profile()
+    } else {
+        [0; abi::STATS_READ_PROFILE_BYTES]
+    };
     let mut rpc_ticks = 0u64;
     let mut hash_ticks = 0u64;
     let mut ext4_ticks = 0u64;
@@ -138,14 +146,44 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         } else {
             chunk.len()
         };
-        let rpc_at = sys::monotonic_16m();
-        let result = if staged {
+        let rpc_at = if detailed { sys::monotonic_16m() } else { 0 };
+        let result = if detailed {
+            let operation = if staged {
+                vela_abi::fs::OP_READ_BULK_STAGED
+            } else if batch {
+                vela_abi::fs::OP_READ_BULK
+            } else {
+                vela_abi::fs::OP_READ_BULK_SINGLE
+            };
+            fs_read_bulk_profiled(
+                fs,
+                path,
+                offset,
+                &mut chunk[..want],
+                &mut response,
+                operation,
+            )
+        } else if staged {
             fs_read_bulk_staged(fs, path, offset, &mut chunk[..want], &mut response)
         } else {
             fs_read_bulk_mode(fs, path, offset, &mut chunk[..want], &mut response, batch)
         };
-        rpc_ticks += sys::monotonic_16m() - rpc_at;
-        if response.get(0) == 0 && response.len() == vela_abi::fs::BULK_READ_PROFILE_BYTES {
+        if detailed {
+            rpc_ticks += sys::monotonic_16m() - rpc_at;
+        }
+        let expected_reply = if detailed {
+            vela_abi::fs::BULK_READ_PROFILE_BYTES
+        } else {
+            vela_abi::fs::BULK_READ_REPLY_BYTES
+        };
+        if result.is_ok() && response.len() != expected_reply {
+            io::ewrite(b"readbench: unexpected profiling reply\n");
+            sys::process_exit();
+        }
+        if detailed
+            && response.get(0) == 0
+            && response.len() == vela_abi::fs::BULK_READ_PROFILE_BYTES
+        {
             ext4_ticks += wide(response.as_slice(), 5);
             service_copy_ticks += wide(response.as_slice(), 13);
             forward_ticks += wide(response.as_slice(), 21);
@@ -167,7 +205,7 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
             Ok(0) => break,
             Ok(n) => {
                 if hash_enabled {
-                    let hash_at = sys::monotonic_16m();
+                    let hash_at = if detailed { sys::monotonic_16m() } else { 0 };
                     for block in chunk[..n].chunks(4096) {
                         for &b in block {
                             hash = (hash ^ u32::from(b)).wrapping_mul(16777619);
@@ -179,7 +217,9 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
                         samples += word_le(&observed, 4);
                         max_delay = max_delay.max(word_le(&observed, 8));
                     }
-                    hash_ticks += sys::monotonic_16m() - hash_at;
+                    if detailed {
+                        hash_ticks += sys::monotonic_16m() - hash_at;
+                    }
                 }
                 offset += n as u32;
             }
@@ -191,7 +231,11 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     }
     let elapsed_us = ((end - start) / 16) as u32;
     let after = snapshot();
-    let kernel_after = profile();
+    let kernel_after = if detailed {
+        profile()
+    } else {
+        [0; abi::STATS_READ_PROFILE_BYTES]
+    };
     let mut out = TextBuf::<256>::new();
     out.append(if staged {
         b"staged "
@@ -224,38 +268,45 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     } else {
         out.append(b" hash=off");
     }
+    out.append(if detailed {
+        b" detail=on"
+    } else {
+        b" detail=off"
+    });
     out.push(b'\n');
     let _ = io::write(out.as_slice());
-    for (label, ticks) in [
-        (b"profile rpc_us=" as &[u8], rpc_ticks),
-        (b"profile hash_us=", hash_ticks),
-        (b"profile ext4_read_us=", ext4_ticks),
-        (b"profile service_bulk_us=", service_copy_ticks),
-        (b"profile sysd_forward_us=", forward_ticks),
-        (
-            b"profile sd_driver_us=",
-            wide(&kernel_after, 0) - wide(&kernel_before, 0),
-        ),
-        (
-            b"profile sd_copy_us=",
-            wide(&kernel_after, 8) - wide(&kernel_before, 8),
-        ),
-        (
-            b"profile kernel_bulk_copy_us=",
-            wide(&kernel_after, 16) - wide(&kernel_before, 16),
-        ),
-    ] {
-        report(label, ticks / 16);
+    if detailed {
+        for (label, ticks) in [
+            (b"profile rpc_us=" as &[u8], rpc_ticks),
+            (b"profile hash_us=", hash_ticks),
+            (b"profile ext4_read_us=", ext4_ticks),
+            (b"profile service_bulk_us=", service_copy_ticks),
+            (b"profile sysd_forward_us=", forward_ticks),
+            (
+                b"profile sd_driver_us=",
+                wide(&kernel_after, 0) - wide(&kernel_before, 0),
+            ),
+            (
+                b"profile sd_copy_us=",
+                wide(&kernel_after, 8) - wide(&kernel_before, 8),
+            ),
+            (
+                b"profile kernel_bulk_copy_us=",
+                wide(&kernel_after, 16) - wide(&kernel_before, 16),
+            ),
+        ] {
+            report(label, ticks / 16);
+        }
+        report(b"profile replies=", u64::from(profiled_replies));
+        report(
+            b"profile sd_calls=",
+            wide(&kernel_after, 24) - wide(&kernel_before, 24),
+        );
+        report(
+            b"profile bulk_calls=",
+            wide(&kernel_after, 32) - wide(&kernel_before, 32),
+        );
     }
-    report(b"profile replies=", u64::from(profiled_replies));
-    report(
-        b"profile sd_calls=",
-        wide(&kernel_after, 24) - wide(&kernel_before, 24),
-    );
-    report(
-        b"profile bulk_calls=",
-        wide(&kernel_after, 32) - wide(&kernel_before, 32),
-    );
     let _ = arena.release();
     sys::process_exit();
 }

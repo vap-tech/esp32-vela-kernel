@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use core::cell::Cell;
+
 use vela_abi::{fs as fs_abi, syscall as abi};
 use vela_user::{
     Buffer,
@@ -16,12 +18,23 @@ struct BulkChunk([u8; 4096]);
 
 static mut BULK_CHUNK: BulkChunk = BulkChunk([0; 4096]);
 
-struct Partition {
+struct Partition<'a> {
+    profiled: &'a Cell<bool>,
     handle: u32,
     sectors: u32,
 }
 
-impl BlockRead for Partition {
+impl Partition<'_> {
+    fn profile_flag(&self) -> u32 {
+        if self.profiled.get() {
+            abi::IO_PROFILE
+        } else {
+            0
+        }
+    }
+}
+
+impl BlockRead for Partition<'_> {
     fn sectors(&self) -> u32 {
         self.sectors
     }
@@ -35,7 +48,7 @@ impl BlockRead for Partition {
             self.handle,
             sector,
             out.as_mut_ptr() as u32,
-            abi::SD_PARTITION_READ_BATCH,
+            abi::SD_PARTITION_READ_BATCH | self.profile_flag(),
             (out.len() / SECTOR) as u32,
             0,
         )
@@ -53,7 +66,7 @@ impl BlockRead for Partition {
             self.handle,
             sector,
             out.as_mut_ptr() as u32,
-            0,
+            self.profile_flag(),
         ) == 0
         {
             Ok(())
@@ -63,7 +76,7 @@ impl BlockRead for Partition {
     }
 }
 
-impl BlockWrite for Partition {
+impl BlockWrite for Partition<'_> {
     fn write_sector(&mut self, sector: u32, data: &[u8; SECTOR]) -> Result<(), Error> {
         if sys::call(
             abi::SD_PARTITION,
@@ -81,6 +94,9 @@ impl BlockWrite for Partition {
 }
 
 fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u32) -> ! {
+    // Single-threaded service: the current RPC selects profiling for every
+    // read of its Partition, including metadata. Each request resets the Cell.
+    let profiling = Cell::new(false);
     let mut mount = None;
     let mut mounted_epoch = 0;
     let mut opened: Option<(Buffer, File)> = None;
@@ -107,12 +123,15 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
             continue;
         }
         response.clear();
+        profiling.set(false);
         let result = (|| -> Result<(), (u8, &'static [u8])> {
             let req = request.as_slice();
             let op = *req.first().ok_or((
                 fs_abi::STATUS_ERR,
                 b"read-only or invalid request".as_slice(),
             ))?;
+            let bulk_op = fs_abi::bulk_read_operation(op);
+            let profiled = bulk_op.is_some() && op & fs_abi::BULK_READ_PROFILE != 0;
             if !matches!(
                 op,
                 fs_abi::OP_READ
@@ -125,9 +144,11 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     | fs_abi::OP_WRITE_BULK
                     | fs_abi::OP_UNLINK
                     | fs_abi::OP_MKDIR
-            ) {
+            ) && bulk_op.is_none()
+            {
                 return Err((fs_abi::STATUS_ERR, b"unsupported request"));
             }
+            profiling.set(profiled);
 
             let epoch = sys::call(abi::SD_PARTITION, storage, 0, 0, abi::SD_PARTITION_EPOCH);
             if (epoch as i32) <= 0 {
@@ -146,6 +167,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                 }
                 mount = Some(
                     Ext4::mount(Partition {
+                        profiled: &profiling,
                         handle: storage,
                         sectors,
                     })
@@ -210,21 +232,12 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     response.append(&data[..count]);
                     Ok(())
                 }
-                [
-                    op @ (fs_abi::OP_READ_BULK
-                    | fs_abi::OP_READ_BULK_SINGLE
-                    | fs_abi::OP_READ_BULK_STAGED),
-                    a,
-                    b,
-                    c,
-                    d,
-                    e,
-                    f,
-                    g,
-                    h,
-                    path @ ..,
-                ] if !path.is_empty() => {
-                    let opened_at = sys::monotonic_16m();
+                [_op, a, b, c, d, e, f, g, h, path @ ..]
+                    if bulk_op.is_some() && !path.is_empty() =>
+                {
+                    let mode = bulk_op.unwrap();
+                    let profile_flag = if profiled { abi::IO_PROFILE } else { 0 };
+                    let opened_at = if profiled { sys::monotonic_16m() } else { 0 };
                     let mut offset = u32::from_le_bytes([*a, *b, *c, *d]);
                     let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
                     if offset == 0
@@ -241,16 +254,22 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     // SAFETY: single-threaded service, never re-entered.
                     let buf = unsafe { &mut (*core::ptr::addr_of_mut!(BULK_CHUNK)).0 };
                     let mut written = 0usize;
-                    let mut read_ticks = sys::monotonic_16m() - opened_at;
+                    let mut read_ticks = if profiled {
+                        sys::monotonic_16m() - opened_at
+                    } else {
+                        0
+                    };
                     let mut copy_ticks = 0u64;
                     while written < max_len {
                         let mut want = (max_len - written).min(buf.len());
-                        let read_at = sys::monotonic_16m();
-                        if *op == fs_abi::OP_READ_BULK {
+                        let read_at = if profiled { sys::monotonic_16m() } else { 0 };
+                        if mode == fs_abi::OP_READ_BULK {
                             let Some(range) =
                                 fs.read_chunk(file, offset, want).map_err(err_reply)?
                             else {
-                                read_ticks += sys::monotonic_16m() - read_at;
+                                if profiled {
+                                    read_ticks += sys::monotonic_16m() - read_at;
+                                }
                                 break;
                             };
                             want = range.len;
@@ -263,7 +282,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                                         storage,
                                         sector,
                                         pending,
-                                        abi::SD_PARTITION_READ_BULK,
+                                        abi::SD_PARTITION_READ_BULK | profile_flag,
                                         want as u32,
                                         written as u32,
                                     )
@@ -271,7 +290,9 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                                     {
                                         return Err(err_reply(Error::Io));
                                     }
-                                    read_ticks += sys::monotonic_16m() - read_at;
+                                    if profiled {
+                                        read_ticks += sys::monotonic_16m() - read_at;
+                                    }
                                     written += want;
                                     offset += want as u32;
                                     continue;
@@ -287,26 +308,34 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                                 &file,
                                 offset,
                                 &mut buf[..want],
-                                *op != fs_abi::OP_READ_BULK_SINGLE,
+                                mode != fs_abi::OP_READ_BULK_SINGLE,
                             )
                             .map_err(err_reply)?;
-                        read_ticks += sys::monotonic_16m() - read_at;
+                        if profiled {
+                            read_ticks += sys::monotonic_16m() - read_at;
+                        }
                         if n == 0 {
                             break;
                         }
-                        let copied_at = sys::monotonic_16m();
-                        if sys::ipc_bulk_write(pending, written, &buf[..n]).is_err() {
+                        let copied_at = if profiled { sys::monotonic_16m() } else { 0 };
+                        if sys::ipc_bulk_write_with_profile(pending, written, &buf[..n], profiled)
+                            .is_err()
+                        {
                             return Err((fs_abi::STATUS_ERR, b"bulk write failed"));
                         }
-                        copy_ticks += sys::monotonic_16m() - copied_at;
+                        if profiled {
+                            copy_ticks += sys::monotonic_16m() - copied_at;
+                        }
                         written += n;
                         offset = offset.saturating_add(n as u32);
                     }
                     response.push(fs_abi::STATUS_OK);
                     response.append(&(written as u32).to_le_bytes());
                     // Optional profiling suffix after the stable five-byte reply.
-                    response.append(&read_ticks.to_le_bytes());
-                    response.append(&copy_ticks.to_le_bytes());
+                    if profiled {
+                        response.append(&read_ticks.to_le_bytes());
+                        response.append(&copy_ticks.to_le_bytes());
+                    }
                     Ok(())
                 }
                 [fs_abi::OP_WRITE, a, b, c, d, path_len, rest @ ..]

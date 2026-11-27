@@ -117,7 +117,18 @@ impl Runtime {
     }
 
     pub(super) fn sys_sd_partition(&mut self, current: ProcSlot, args: Args) -> Result<u32, Errno> {
-        let is_write = args.a2 != 0 && args.a3 == syscall::SD_PARTITION_WRITE;
+        let profiled = args.a3 & syscall::IO_PROFILE != 0;
+        let mode = args.a3 & !syscall::IO_PROFILE;
+        if profiled
+            && (args.a2 == 0
+                || !matches!(
+                    mode,
+                    0 | syscall::SD_PARTITION_READ_BATCH | syscall::SD_PARTITION_READ_BULK
+                ))
+        {
+            return Err(Errno::Einval);
+        }
+        let is_write = args.a2 != 0 && mode == syscall::SD_PARTITION_WRITE;
         lifecycle::require_authority(
             &self.processes,
             current,
@@ -128,11 +139,11 @@ impl Runtime {
         if unsafe { soc::sdcard::exported() } {
             return Err(Errno::Ebusy);
         }
-        if args.a2 == 0 && args.a3 == syscall::SD_PARTITION_EPOCH {
+        if args.a2 == 0 && mode == syscall::SD_PARTITION_EPOCH {
             return Ok(self.sd_epoch);
         }
         if args.a2 == 0 {
-            if args.a3 != 0 {
+            if mode != 0 {
                 return Err(Errno::Einval);
             }
             self.sd_partition = None;
@@ -144,7 +155,7 @@ impl Runtime {
             return Ok(partition.1);
         }
         let (start, count) = self.sd_partition.ok_or(Errno::Einval)?;
-        if args.a3 == syscall::SD_PARTITION_READ_BULK {
+        if mode == syscall::SD_PARTITION_READ_BULK {
             let bytes = args.a4 as usize;
             if !(1..=4096).contains(&bytes) {
                 return Err(Errno::Einval);
@@ -170,7 +181,11 @@ impl Runtime {
             ) {
                 return Err(Errno::Efault);
             }
-            let started = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+            let started = if profiled {
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+            } else {
+                0
+            };
             let data = unsafe {
                 soc::sdcard::read_sectors_dma_with(start + args.a1, sectors as usize, &mut || {
                     self.display.tick()
@@ -180,19 +195,27 @@ impl Runtime {
                 self.sd_partition = None;
                 Errno::Eio
             })?;
-            let completed = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
-            self.read_profile.sd_ticks += completed - started;
+            let completed = if profiled {
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+            } else {
+                0
+            };
+            if profiled {
+                self.read_profile.sd_ticks += completed - started;
+            }
             self.read_profile.sd_calls += 1;
             // SAFETY: DMA initialized ceil(bytes/512) sectors. KERNEL_LOCK
             // prevents buffer reuse, call cancellation, teardown and unmapping
             // until this exact-length copy has completed. DMA never targets U-mode.
             let data = unsafe { core::slice::from_raw_parts(data, bytes) };
             copy_to_user_within(&self.processes.slot(owner).memory, destination, bytes, data)?;
-            self.read_profile.sd_copy_ticks +=
-                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+            if profiled {
+                self.read_profile.sd_copy_ticks +=
+                    unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+            }
             return Ok(0);
         }
-        if args.a3 == syscall::SD_PARTITION_READ_BATCH {
+        if mode == syscall::SD_PARTITION_READ_BATCH {
             let sectors = args.a4;
             if !(1..=8).contains(&sectors)
                 || args.a1.checked_add(sectors).is_none_or(|end| end > count)
@@ -202,7 +225,11 @@ impl Runtime {
             }
             // KERNEL_LOCK serializes DMA and excludes changes to the validated
             // address space until the private driver buffer has been copied.
-            let started = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+            let started = if profiled {
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+            } else {
+                0
+            };
             let data = unsafe {
                 soc::sdcard::read_sectors_dma_with(start + args.a1, sectors as usize, &mut || {
                     self.display.tick()
@@ -212,15 +239,23 @@ impl Runtime {
                 self.sd_partition = None;
                 Errno::Eio
             })?;
-            let completed = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
-            self.read_profile.sd_ticks += completed - started;
+            let completed = if profiled {
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+            } else {
+                0
+            };
+            if profiled {
+                self.read_profile.sd_ticks += completed - started;
+            }
             self.read_profile.sd_calls += 1;
             // SAFETY: completed DMA initialized this many bytes; no other SD
             // operation can reuse its buffer while KERNEL_LOCK is held.
             let data = unsafe { core::slice::from_raw_parts(data, sectors as usize * 512) };
             copy_to_user_within(self.memory(), args.a2 as usize, data.len(), data)?;
-            self.read_profile.sd_copy_ticks +=
-                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+            if profiled {
+                self.read_profile.sd_copy_ticks +=
+                    unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+            }
             return Ok(0);
         }
         let mut sector = [0; 512];
@@ -240,12 +275,16 @@ impl Runtime {
             })?;
             return Ok(0);
         }
-        if args.a3 != 0 || !self.writable(args.a2 as usize, sector.len()) {
+        if mode != 0 || !self.writable(args.a2 as usize, sector.len()) {
             return Err(Errno::Einval);
         }
         // Serialized with legacy SD accesses by KERNEL_LOCK. DMA writes only
         // to the driver's buffer. Copy to U-mode after completion.
-        let started = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+        let started = if profiled {
+            unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+        } else {
+            0
+        };
         unsafe {
             soc::sdcard::read_sector_with(start + args.a1, &mut sector, &mut || self.display.tick())
         }
@@ -253,12 +292,20 @@ impl Runtime {
             self.sd_partition = None;
             Errno::Eio
         })?;
-        let completed = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
-        self.read_profile.sd_ticks += completed - started;
+        let completed = if profiled {
+            unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+        } else {
+            0
+        };
+        if profiled {
+            self.read_profile.sd_ticks += completed - started;
+        }
         self.read_profile.sd_calls += 1;
         copy_to_user_within(self.memory(), args.a2 as usize, sector.len(), &sector)?;
-        self.read_profile.sd_copy_ticks +=
-            unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+        if profiled {
+            self.read_profile.sd_copy_ticks +=
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
+        }
         Ok(0)
     }
 

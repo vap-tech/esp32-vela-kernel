@@ -14,10 +14,10 @@ Application development is documented in [the SDK guide](docs/sdk.md).
 
 Sequential ext4 reads use delegated IPC bulk windows, with one data copy
 from private SD DMA SRAM into the client. Client requests of 64 KiB are
-served through SD operations of up to 4 KiB. The instrumented Tab5 test
-reached 1.59 MiB/s. The next experiment measures the ordinary file path
-with detailed profiling enabled only on request. Measurements and their
-limits are recorded in [the roadmap](docs/roadmap.md).
+served through SD operations of up to 4 KiB. The ordinary 64 KiB path
+reached 2.2–2.3 MiB/s on Tab5. Detailed service/kernel timings are enabled
+by an explicit profiling request. Measurements and their limits are
+recorded in [the roadmap](docs/roadmap.md).
 
 ## Build and run
 
@@ -437,7 +437,7 @@ reading the `0x48xx_xxxx` bus alias), and renders the 80×22 ANSI console. Writi
 `echo off > /sys/display` stops scanout, disables backlight, releases the `InFlight`
 DMA hold, and returns the 2 MiB region to the 32 MiB pool.
 
-The local release snapshot of 2026-11-27 has a 253,916-byte SRAM payload
+The local release snapshot of 2026-11-27 has a 254,876-byte SRAM payload
 (including bundled service ELFs), a 1,728-byte SPM `.entry` and 41,328 bytes
 of kernel BSS. Build scripts report the sizes for each new image.
 
@@ -533,10 +533,11 @@ Build utilities with `./scripts/build-tools.sh`, then copy
 USB export and eject cleanly. The benchmark uses this syntax:
 
 ```text
-readbench [verify] [single|staged] [4k|64k] /sd/<file>
+readbench [profile] [verify] [single|staged] [4k|64k] /sd/<file>
 ```
 
-The default is a direct 4 KiB read with `hash=off`.
+The default is a direct 4 KiB read with `hash=off` and `detail=off`.
+`profile` explicitly enables service/kernel timings and extended replies.
 `64k` selects the client RPC size. `single` selects sector-at-a-time
 staging and `staged` selects the batched staging control.
 `verify` enables FNV-1a and guard checks, beginning with a request one byte
@@ -545,29 +546,35 @@ history every 4 KiB of hashing. The previous `io` prefix is an alias for
 a read without hashing.
 
 ```console
-run /sd/bin/readbench.elf 4k /sd/bin/readbench-data.bin
 run /sd/bin/readbench.elf 64k /sd/bin/readbench-data.bin
+run /sd/bin/readbench.elf profile 64k /sd/bin/readbench-data.bin
 run /sd/bin/readbench.elf verify 64k /sd/bin/readbench-data.bin
 ```
 
 The 1 MiB + 123 byte test file was installed separately on the Tab5 card.
-At 180 MHz with the display active, two runs per size gave:
+At 180 MHz with the display active, two runs per mode in the same build gave:
 
-| Client request | Elapsed time | Client RPCs including EOF | SD commands |
-| --- | --- | --- | --- |
-| 4 KiB | 1.366–1.375 s | 258 | 265 |
-| 64 KiB | 0.628–0.629 s | 18 | 265 |
+| 64 KiB read mode | Elapsed time | Maximum observed timer latency |
+| --- | --- | --- |
+| Ordinary | 0.432–0.454 s | 1.28 ms |
+| `profile` | 0.506–0.522 s | 1.27 ms |
 
-The 64 KiB mode reached about 1.59 MiB/s, with a maximum observed timer
-latency of 1.34 ms. Wide verification matched the Linux FNV-1a value
+The ordinary path reached about 2.2–2.3 MiB/s. Both modes issued 265 SD
+commands for 2057 sectors. Wide verification matched the Linux FNV-1a value
 `2740238281` and passed buffer-tail checks.
 
-These measurements include instrumentation. Detailed ext4 and namespace
-timings currently run for ordinary bulk reads too. Reported service times
-are nested; kernel counters are cumulative and the utility reports deltas.
-Making profiling opt-in is the next experiment. Full profiles, historical
-comparisons, hardware observations and limits are in
-[the roadmap](docs/roadmap.md).
+Ordinary bulk replies contain the five-byte status/count header. Profiling
+adds ext4 open/read and bulk-copy timings, then namespace forwarding time,
+for a 29-byte reply. A request flag selects profiling throughout the chain,
+including SD metadata reads and kernel IPC_BULK_IO copies. The single-threaded
+ext4 service derives its Partition profiling flag for each new request.
+
+Kernel timing sums count explicitly flagged operations. Basic call counters
+count all operations. Service intervals are nested; the diagnostic utility
+reports deltas of cumulative kernel counters. The ordinary benchmark samples
+wall time and IRQ history, so its measurements include that
+lightweight observation. The full profiles, historical comparisons and
+hardware limits are in [the roadmap](docs/roadmap.md).
 
 Keyboard code and its guarded stack use PSRAM to reserve SRAM for fbcon/DMA.
 The standard check includes host regressions for copy alignment, tails,

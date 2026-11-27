@@ -272,7 +272,8 @@ impl Runtime {
         let offset = args.a1 as usize;
         let local_ptr = args.a2 as usize;
         let len = args.a3 as usize;
-        let dir = args.a4;
+        let profiled = args.a4 & syscall::IO_PROFILE != 0;
+        let dir = args.a4 & !syscall::IO_PROFILE;
         let server = self.scheduler.current;
         if local_ptr == 0 && len == 0 {
             let bulk = self.calls.lookup_bulk(token, server)?;
@@ -287,7 +288,11 @@ impl Runtime {
         let (client_proc, client_addr) =
             self.calls
                 .prepare_bulk_io(token, server, offset, len, write_to_client)?;
-        let started = unsafe { crate::soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+        let started = if profiled {
+            unsafe { crate::soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?
+        } else {
+            0
+        };
         if write_to_client {
             copy_between_users(
                 &self.processes.slot(current).memory,
@@ -307,8 +312,10 @@ impl Runtime {
                 len,
             )?;
         }
-        self.read_profile.bulk_copy_ticks +=
-            unsafe { crate::soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - started;
+        if profiled {
+            self.read_profile.bulk_copy_ticks +=
+                unsafe { crate::soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - started;
+        }
         self.read_profile.bulk_calls += 1;
         Ok(len as u32)
     }

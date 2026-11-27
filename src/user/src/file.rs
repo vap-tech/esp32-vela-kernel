@@ -222,6 +222,31 @@ pub fn fs_read_bulk_staged(
     fs_read_bulk_request(handle, path, offset, dst, response, fs::OP_READ_BULK_STAGED)
 }
 
+/// Request service and kernel timings for an explicit bulk-read operation.
+pub fn fs_read_bulk_profiled(
+    handle: u32,
+    path: &[u8],
+    offset: u32,
+    dst: &mut [u8],
+    response: &mut Buffer,
+    operation: u8,
+) -> Result<usize, u8> {
+    if fs::bulk_read_operation(operation).is_none() {
+        response.clear();
+        response.push(STATUS_ERR);
+        response.append(b"invalid profiled read operation");
+        return Err(STATUS_ERR);
+    }
+    fs_read_bulk_request(
+        handle,
+        path,
+        offset,
+        dst,
+        response,
+        operation | fs::BULK_READ_PROFILE,
+    )
+}
+
 fn fs_read_bulk_request(
     handle: u32,
     path: &[u8],

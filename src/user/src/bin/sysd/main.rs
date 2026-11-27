@@ -218,7 +218,8 @@ fn handle_read_bulk(
     response: &mut Buffer,
 ) {
     if let Some((ep, rel)) = mounts.resolve(path) {
-        let forwarded_at = usys::monotonic_16m();
+        let profiled = operation & fs_abi::BULK_READ_PROFILE != 0;
+        let forwarded_at = if profiled { usys::monotonic_16m() } else { 0 };
         let alive = mount::forward_read_bulk(
             operation,
             ep,
@@ -228,7 +229,8 @@ fn handle_read_bulk(
             rel,
             response,
         );
-        if response.len() == fs_abi::BULK_READ_SERVICE_PROFILE_BYTES
+        if profiled
+            && response.len() == fs_abi::BULK_READ_SERVICE_PROFILE_BYTES
             && response.get(0) == fs_abi::STATUS_OK
         {
             response.append(&(usys::monotonic_16m() - forwarded_at).to_le_bytes());
@@ -238,7 +240,7 @@ fn handle_read_bulk(
     }
     if operation != fs_abi::OP_READ_BULK {
         response.push(fs_abi::STATUS_ERR);
-        response.append(b"single-sector reads require an ext4 mount");
+        response.append(b"bulk read mode requires a mounted service");
         return;
     }
     let (status, bytes) = cache.render_or_reuse(offset, path, mounts, caps);
@@ -471,18 +473,9 @@ fn handle_request(
             let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
             handle_read(offset, path, mounts, caps, cache, response);
         }
-        [
-            op @ (fs_abi::OP_READ_BULK | fs_abi::OP_READ_BULK_SINGLE | fs_abi::OP_READ_BULK_STAGED),
-            a,
-            b,
-            c,
-            d,
-            e,
-            f,
-            g,
-            h,
-            path @ ..,
-        ] if !path.is_empty() => {
+        [op, a, b, c, d, e, f, g, h, path @ ..]
+            if fs_abi::bulk_read_operation(*op).is_some() && !path.is_empty() =>
+        {
             let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
             let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
             handle_read_bulk(

@@ -296,3 +296,7 @@ pub const STATS_READ_PROFILE_BYTES: usize = 40;
 /// bytes, a5=window byte offset, a1=first partition-relative sector.
 /// Reads ceil(a4/512) sectors but copies exactly a4 bytes. Requires SD READ.
 pub const SD_PARTITION_READ_BULK: u32 = 4;
+
+/// Opt-in timing bit in SD_PARTITION a3 (read modes only) or IPC_BULK_IO a4.
+/// Call counters remain cumulative; timing sums cover flagged operations.
+pub const IO_PROFILE: u32 = 1 << 31;

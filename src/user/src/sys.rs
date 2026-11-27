@@ -133,6 +133,16 @@ pub fn ipc_accept_cap(token: u32) -> Result<(u32, u32), i32> {
 }
 
 pub fn ipc_bulk_write(token: u32, client_offset: usize, src: &[u8]) -> Result<usize, i32> {
+    ipc_bulk_write_with_profile(token, client_offset, src, false)
+}
+
+/// Explicit kernel copy timing for a diagnostic bulk-write operation.
+pub fn ipc_bulk_write_with_profile(
+    token: u32,
+    client_offset: usize,
+    src: &[u8],
+    profiled: bool,
+) -> Result<usize, i32> {
     if src.is_empty() {
         return Ok(0);
     }
@@ -142,7 +152,7 @@ pub fn ipc_bulk_write(token: u32, client_offset: usize, src: &[u8]) -> Result<us
         client_offset as u32,
         src.as_ptr() as u32,
         src.len() as u32,
-        abi::IPC_BULK_DIR_WRITE,
+        abi::IPC_BULK_DIR_WRITE | if profiled { abi::IO_PROFILE } else { 0 },
         0,
     )
     .0 as i32;

@@ -65,7 +65,15 @@ KERNEL_LOCK protects the DMA buffer and mappings through completion.
 Unaligned leading bytes and sparse/unwritten spans use the service staging
 buffer. Large client requests are served by multiple bounded SD operations.
 
-Detailed ext4/sysd timings currently execute for ordinary bulk reads.
-The measured 4/64 KiB comparisons include that overhead. Making profiling
-opt-in and measuring the ordinary path is the next storage experiment.
-Current commands and measured limits are in the README and roadmap.
+Detailed timings require the `BULK_READ_PROFILE` request flag on a recognized
+bulk-read operation. ext4fs selects a stack-owned `Cell<bool>` for each
+request; its Partition reads, including metadata, use the matching
+`IO_PROFILE` syscall flag. Kernel SD and IPC_BULK_IO timing snapshots run
+for flagged operations. Call counters count every operation.
+
+Ordinary successful bulk reads return the five-byte status/count header.
+Profiled ext4 replies include service timings, with sysd adding forwarding
+time for a total of 29 bytes. Timings are nested and kernel timing counters
+are cumulative. `readbench profile` selects the diagnostic path; its default
+selects ordinary reads. Current commands and measurements are in the README
+and roadmap.
