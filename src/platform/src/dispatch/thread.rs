@@ -558,6 +558,26 @@ impl Runtime {
                 }
                 copy_to_user(self.memory(), ptr, &buffer[..len])
             }
+            syscall::STATS_READ_PROFILE => {
+                if len != syscall::STATS_READ_PROFILE_BYTES {
+                    return Err(Errno::Einval);
+                }
+                let p = &self.read_profile;
+                let mut data = [0; syscall::STATS_READ_PROFILE_BYTES];
+                for (i, value) in [
+                    p.sd_ticks,
+                    p.sd_copy_ticks,
+                    p.bulk_copy_ticks,
+                    p.sd_calls,
+                    p.bulk_calls,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    data[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                copy_to_user(self.memory(), ptr, &data)
+            }
             syscall::STATS_IRQ_WINDOW => {
                 if len != syscall::STATS_IRQ_WINDOW_BYTES || args.a4 > 1 {
                     return Err(Errno::Einval);

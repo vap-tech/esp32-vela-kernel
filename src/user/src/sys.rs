@@ -272,3 +272,24 @@ pub fn rdcycle64() -> u64 {
         0
     }
 }
+
+/// Coherent monotonic time for profiling across hart migration and DVFS.
+/// STATS_IRQ_WINDOW start snapshots do not reset or consume timer history.
+pub fn monotonic_16m() -> u64 {
+    let mut data = [0u8; abi::STATS_IRQ_WINDOW_BYTES];
+    assert_eq!(
+        call6(
+            abi::STATS,
+            data.as_mut_ptr() as u32,
+            data.len() as u32,
+            abi::STATS_IRQ_WINDOW,
+            0,
+            1,
+            0
+        )
+        .0,
+        0
+    );
+    u64::from(u32::from_le_bytes(data[12..16].try_into().unwrap()))
+        | (u64::from(u32::from_le_bytes(data[16..20].try_into().unwrap())) << 32)
+}

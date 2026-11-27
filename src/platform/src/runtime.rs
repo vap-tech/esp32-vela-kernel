@@ -57,7 +57,18 @@ pub struct HartState {
     pub pmp_shootdowns: u64,
 }
 
+/// Cumulative read-path timings in SYSTIMER 16 MHz ticks, serialized by KERNEL_LOCK.
+#[derive(Default)]
+pub struct ReadProfile {
+    pub sd_ticks: u64,
+    pub sd_copy_ticks: u64,
+    pub bulk_copy_ticks: u64,
+    pub sd_calls: u64,
+    pub bulk_calls: u64,
+}
+
 pub struct Runtime {
+    pub read_profile: ReadProfile,
     pub scheduler: Scheduler<arch::TrapFrame>,
     /// Per-thread extended hardware context (`RV32F` FPU + `ESP32-P4 v1.3` `PIE`),
     /// indexed by `ThreadSlot` and 16-byte aligned in internal L2MEM SRAM.

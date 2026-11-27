@@ -218,6 +218,7 @@ fn handle_read_bulk(
     response: &mut Buffer,
 ) {
     if let Some((ep, rel)) = mounts.resolve(path) {
+        let forwarded_at = usys::monotonic_16m();
         let alive = mount::forward_read_bulk(
             operation,
             ep,
@@ -227,6 +228,11 @@ fn handle_read_bulk(
             rel,
             response,
         );
+        if response.len() == fs_abi::BULK_READ_SERVICE_PROFILE_BYTES
+            && response.get(0) == fs_abi::STATUS_OK
+        {
+            response.append(&(usys::monotonic_16m() - forwarded_at).to_le_bytes());
+        }
         prune_if_dead(alive, ep, mounts, cache);
         return;
     }

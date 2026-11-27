@@ -285,3 +285,8 @@ pub const SD_PARTITION_READ_BATCH: u32 = 3;
 /// A stale cursor (over 64 samples old) returns EOVERFLOW.
 pub const STATS_IRQ_WINDOW: u32 = 10;
 pub const STATS_IRQ_WINDOW_BYTES: usize = 20;
+
+/// Cumulative u64 read-path counters: SD driver ticks, SD-to-user copy ticks,
+/// bulk-copy ticks (all 16 MHz), SD read calls, bulk-copy calls.
+pub const STATS_READ_PROFILE: u32 = 11;
+pub const STATS_READ_PROFILE_BYTES: usize = 40;

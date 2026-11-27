@@ -287,6 +287,7 @@ impl Runtime {
         let (client_proc, client_addr) =
             self.calls
                 .prepare_bulk_io(token, server, offset, len, write_to_client)?;
+        let started = unsafe { crate::soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
         if write_to_client {
             copy_between_users(
                 &self.processes.slot(current).memory,
@@ -306,6 +307,9 @@ impl Runtime {
                 len,
             )?;
         }
+        self.read_profile.bulk_copy_ticks +=
+            unsafe { crate::soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - started;
+        self.read_profile.bulk_calls += 1;
         Ok(len as u32)
     }
 

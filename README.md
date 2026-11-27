@@ -533,3 +533,15 @@ Keyboard code and its guarded stack use PSRAM to reserve SRAM for fbcon/DMA.
 On Tab5, the existing 10,552-byte shell required 12 commands versus 29 before,
 with identical checksums. Timing and limitations are recorded in
 [the roadmap](docs/roadmap.md).
+
+
+The profiler now separates RPC elapsed time, the checksum interval, ext4 read
+and bulk-write phases, namespace forwarding, SD driver time and checked memory
+copies. Service intervals are nested. Kernel counters are cumulative and the
+utility reports their deltas. Instrumentation overhead is included.
+
+Use `run /sd/bin/readbench.elf io /sd/bin/readbench-data.bin` for a timed read
+with `hash=off`; `io single /sd/bin/readbench-data.bin` selects the sector
+control. On Tab5, FNV consumed 7.42 s of the 9.11 s instrumented batch test.
+Reading without FNV took 1.63 s (629 KiB/s), versus 3.98 s for single sectors.
+The full measurements and their limits are in the roadmap.

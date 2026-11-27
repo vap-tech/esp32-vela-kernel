@@ -90,6 +90,7 @@ extern "C" fn rust_main() -> ! {
         core::ptr::addr_of_mut!((*ptr).ext_contexts)
             .write([arch::ExtendedContext::ZERO; vela_kernel::sched::TASKS]);
         core::ptr::addr_of_mut!((*ptr).processes).write(Processes::new());
+        core::ptr::addr_of_mut!((*ptr).read_profile).write(crate::runtime::ReadProfile::default());
         core::ptr::addr_of_mut!((*ptr).harts).write([
             HartState {
                 active_space: None,

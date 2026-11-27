@@ -218,6 +218,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     h,
                     path @ ..,
                 ] if !path.is_empty() => {
+                    let opened_at = sys::monotonic_16m();
                     let mut offset = u32::from_le_bytes([*a, *b, *c, *d]);
                     let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
                     if offset == 0
@@ -234,8 +235,11 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     // SAFETY: single-threaded service, never re-entered.
                     let buf = unsafe { &mut *core::ptr::addr_of_mut!(BULK_CHUNK) };
                     let mut written = 0usize;
+                    let mut read_ticks = sys::monotonic_16m() - opened_at;
+                    let mut copy_ticks = 0u64;
                     while written < max_len {
                         let want = (max_len - written).min(buf.len());
+                        let read_at = sys::monotonic_16m();
                         let n = fs
                             .read_with_batch(
                                 &file,
@@ -244,17 +248,23 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                                 *op == fs_abi::OP_READ_BULK,
                             )
                             .map_err(err_reply)?;
+                        read_ticks += sys::monotonic_16m() - read_at;
                         if n == 0 {
                             break;
                         }
+                        let copied_at = sys::monotonic_16m();
                         if sys::ipc_bulk_write(pending, written, &buf[..n]).is_err() {
                             return Err((fs_abi::STATUS_ERR, b"bulk write failed"));
                         }
+                        copy_ticks += sys::monotonic_16m() - copied_at;
                         written += n;
                         offset = offset.saturating_add(n as u32);
                     }
                     response.push(fs_abi::STATUS_OK);
                     response.append(&(written as u32).to_le_bytes());
+                    // Optional profiling suffix after the stable five-byte reply.
+                    response.append(&read_ticks.to_le_bytes());
+                    response.append(&copy_ticks.to_le_bytes());
                     Ok(())
                 }
                 [fs_abi::OP_WRITE, a, b, c, d, path_len, rest @ ..]

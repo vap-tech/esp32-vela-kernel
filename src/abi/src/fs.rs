@@ -67,6 +67,12 @@ pub const BULK_READ_HEADER: usize = 9;
 /// Byte length of a successful `OP_READ_BULK` reply: `[status: u8, bytes_read: u32 LE]`.
 pub const BULK_READ_REPLY_BYTES: usize = 5;
 
+/// Optional ext4 profiling suffix adds read/open and bulk-write elapsed u64
+/// SYSTIMER ticks (16 MHz). sysd appends its forwarding elapsed ticks.
+/// These are nested wall times and must not be summed across layers.
+pub const BULK_READ_SERVICE_PROFILE_BYTES: usize = BULK_READ_REPLY_BYTES + 16;
+pub const BULK_READ_PROFILE_BYTES: usize = BULK_READ_SERVICE_PROFILE_BYTES + 8;
+
 /// Header bytes for `OP_WRITE_BULK` requests: `[op: u8, offset: u32 LE, len: u32 LE]`.
 pub const BULK_WRITE_HEADER: usize = 9;
 

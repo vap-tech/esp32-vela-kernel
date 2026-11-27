@@ -44,6 +44,33 @@ fn counter(data: &[u8]) -> u64 {
     u64::from(word_le(data, 12)) | (u64::from(word_le(data, 16)) << 32)
 }
 
+fn profile() -> [u8; abi::STATS_READ_PROFILE_BYTES] {
+    let mut data = [0; abi::STATS_READ_PROFILE_BYTES];
+    assert_eq!(
+        sys::call(
+            abi::STATS,
+            data.as_mut_ptr() as u32,
+            data.len() as u32,
+            abi::STATS_READ_PROFILE,
+            0
+        ),
+        0
+    );
+    data
+}
+
+fn wide(data: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(data[at..at + 8].try_into().unwrap())
+}
+
+fn report(label: &[u8], value: u64) {
+    let mut out = TextBuf::<96>::new();
+    out.append(label);
+    out.decimal64(value as u32, (value >> 32) as u32);
+    out.push(b'\n');
+    let _ = io::write(out.as_slice());
+}
+
 fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     io::init(stdin, stdout);
     if fs == 0 || arg == 0 || len == 0 || len as usize > abi::SPAWN_ARG_MAX {
@@ -52,12 +79,16 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     }
     // SAFETY: the loader reserves the argument above the initial stack.
     let argument = unsafe { core::slice::from_raw_parts(arg as *const u8, len as usize) };
+    let (hash_enabled, argument) = match argument.strip_prefix(b"io ") {
+        Some(path) => (false, path),
+        None => (true, argument),
+    };
     let (batch, path) = match argument.strip_prefix(b"single ") {
         Some(path) => (false, path),
         None => (true, argument),
     };
     if !path.starts_with(b"/sd/") {
-        io::ewrite(b"usage: readbench [single] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [io] [single] /sd/<file>\n");
         sys::process_exit();
     }
     let Ok(mut arena) = Arena::new_psram(4096) else {
@@ -68,6 +99,13 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     let chunk = unsafe { core::slice::from_raw_parts_mut(arena.base() as *mut u8, 4096) };
     let mut response = Buffer::new();
     let before = snapshot();
+    let kernel_before = profile();
+    let mut rpc_ticks = 0u64;
+    let mut hash_ticks = 0u64;
+    let mut ext4_ticks = 0u64;
+    let mut service_copy_ticks = 0u64;
+    let mut forward_ticks = 0u64;
+    let mut profiled_replies = 0u32;
     let first = window(0, true);
     let start = counter(&first);
     let mut cursor = word_le(&first, 0);
@@ -77,7 +115,15 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     let mut offset = 0u32;
     let mut hash = 2166136261u32;
     loop {
+        let rpc_at = sys::monotonic_16m();
         let result = fs_read_bulk_mode(fs, path, offset, chunk, &mut response, batch);
+        rpc_ticks += sys::monotonic_16m() - rpc_at;
+        if response.get(0) == 0 && response.len() == vela_abi::fs::BULK_READ_PROFILE_BYTES {
+            ext4_ticks += wide(response.as_slice(), 5);
+            service_copy_ticks += wide(response.as_slice(), 13);
+            forward_ticks += wide(response.as_slice(), 21);
+            profiled_replies += 1;
+        }
         let observed = window(cursor, false);
         cursor = word_le(&observed, 0);
         samples += word_le(&observed, 4);
@@ -86,8 +132,12 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         match result {
             Ok(0) => break,
             Ok(n) => {
-                for &b in &chunk[..n] {
-                    hash = (hash ^ u32::from(b)).wrapping_mul(16777619);
+                if hash_enabled {
+                    let hash_at = sys::monotonic_16m();
+                    for &b in &chunk[..n] {
+                        hash = (hash ^ u32::from(b)).wrapping_mul(16777619);
+                    }
+                    hash_ticks += sys::monotonic_16m() - hash_at;
                 }
                 offset += n as u32;
             }
@@ -99,6 +149,7 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     }
     let elapsed_us = ((end - start) / 16) as u32;
     let after = snapshot();
+    let kernel_after = profile();
     let mut out = TextBuf::<256>::new();
     out.append(if batch { b"batch " } else { b"single " });
     for (label, value) in [
@@ -114,13 +165,48 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
             b" commands=",
             word_le(&after, 44).wrapping_sub(word_le(&before, 44)),
         ),
-        (b" fnv1a=", hash),
     ] {
         out.append(label);
         out.decimal(value);
     }
+    if hash_enabled {
+        out.append(b" fnv1a=");
+        out.decimal(hash);
+    } else {
+        out.append(b" hash=off");
+    }
     out.push(b'\n');
     let _ = io::write(out.as_slice());
+    for (label, ticks) in [
+        (b"profile rpc_us=" as &[u8], rpc_ticks),
+        (b"profile hash_us=", hash_ticks),
+        (b"profile ext4_read_us=", ext4_ticks),
+        (b"profile service_bulk_us=", service_copy_ticks),
+        (b"profile sysd_forward_us=", forward_ticks),
+        (
+            b"profile sd_driver_us=",
+            wide(&kernel_after, 0) - wide(&kernel_before, 0),
+        ),
+        (
+            b"profile sd_copy_us=",
+            wide(&kernel_after, 8) - wide(&kernel_before, 8),
+        ),
+        (
+            b"profile kernel_bulk_copy_us=",
+            wide(&kernel_after, 16) - wide(&kernel_before, 16),
+        ),
+    ] {
+        report(label, ticks / 16);
+    }
+    report(b"profile replies=", u64::from(profiled_replies));
+    report(
+        b"profile sd_calls=",
+        wide(&kernel_after, 24) - wide(&kernel_before, 24),
+    );
+    report(
+        b"profile bulk_calls=",
+        wide(&kernel_after, 32) - wide(&kernel_before, 32),
+    );
     let _ = arena.release();
     sys::process_exit();
 }

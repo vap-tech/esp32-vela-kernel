@@ -154,6 +154,7 @@ impl Runtime {
             }
             // KERNEL_LOCK serializes DMA and excludes changes to the validated
             // address space until the private driver buffer has been copied.
+            let started = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
             let data = unsafe {
                 soc::sdcard::read_sectors_dma_with(start + args.a1, sectors as usize, &mut || {
                     self.display.tick()
@@ -163,10 +164,15 @@ impl Runtime {
                 self.sd_partition = None;
                 Errno::Eio
             })?;
+            let completed = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+            self.read_profile.sd_ticks += completed - started;
+            self.read_profile.sd_calls += 1;
             // SAFETY: completed DMA initialized this many bytes; no other SD
             // operation can reuse its buffer while KERNEL_LOCK is held.
             let data = unsafe { core::slice::from_raw_parts(data, sectors as usize * 512) };
             copy_to_user_within(self.memory(), args.a2 as usize, data.len(), data)?;
+            self.read_profile.sd_copy_ticks +=
+                unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
             return Ok(0);
         }
         let mut sector = [0; 512];
@@ -191,6 +197,7 @@ impl Runtime {
         }
         // Serialized with legacy SD accesses by KERNEL_LOCK. DMA writes only
         // to the driver's buffer. Copy to U-mode after completion.
+        let started = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
         unsafe {
             soc::sdcard::read_sector_with(start + args.a1, &mut sector, &mut || self.display.tick())
         }
@@ -198,7 +205,12 @@ impl Runtime {
             self.sd_partition = None;
             Errno::Eio
         })?;
+        let completed = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+        self.read_profile.sd_ticks += completed - started;
+        self.read_profile.sd_calls += 1;
         copy_to_user_within(self.memory(), args.a2 as usize, sector.len(), &sector)?;
+        self.read_profile.sd_copy_ticks +=
+            unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)? - completed;
         Ok(0)
     }
 
