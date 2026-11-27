@@ -571,3 +571,19 @@ On Tab5 the 1 MiB + 123 byte file took 1.16–1.18 s (871–882 KiB/s), versus
 1.65 s staged. Both used 265 SD commands; the aligned direct path eliminated
 257 separate IPC_BULK_IO copies. DMA still targets private kernel SRAM.
 Full results and checks are recorded in the roadmap.
+
+
+Select the client RPC size with `readbench [verify] [single|staged] [4k|64k] /sd/<file>`.
+The default is 4 KiB. For example:
+
+```console
+run /sd/bin/readbench.elf 64k /sd/bin/readbench-data.bin
+run /sd/bin/readbench.elf verify 64k /sd/bin/readbench-data.bin
+```
+
+On Tab5 the 1 MiB + 123 byte file took 0.628–0.629 s with 64 KiB requests,
+versus 1.366–1.375 s with 4 KiB requests in the same instrumented utility.
+Client RPCs including EOF fell from 258 to 18. Both modes issued 265 SD
+commands, each limited to 4 KiB. Maximum timer latency in the timed runs
+was 1.17–1.34 ms. Wide verification passed checksum and buffer-tail checks.
+During verification the utility samples IRQ history every 4 KiB of hashing.

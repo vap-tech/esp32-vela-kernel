@@ -79,7 +79,7 @@ fn report(label: &[u8], value: u64) {
 fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     io::init(stdin, stdout);
     if fs == 0 || arg == 0 || len == 0 || len as usize > abi::SPAWN_ARG_MAX {
-        io::ewrite(b"usage: readbench [verify] [single|staged] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [verify] [single|staged] [4k|64k] /sd/<file>\n");
         sys::process_exit();
     }
     // SAFETY: the loader reserves the argument above the initial stack.
@@ -88,23 +88,28 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         Some(path) => (true, path),
         None => (false, argument.strip_prefix(b"io ").unwrap_or(argument)),
     };
-    let (batch, staged, path) = if let Some(path) = argument.strip_prefix(b"single ") {
+    let (batch, staged, argument) = if let Some(path) = argument.strip_prefix(b"single ") {
         (false, false, path)
     } else if let Some(path) = argument.strip_prefix(b"staged ") {
         (true, true, path)
     } else {
         (true, false, argument)
     };
+    let (chunk_bytes, path) = if let Some(path) = argument.strip_prefix(b"64k ") {
+        (64 * 1024, path)
+    } else {
+        (4096, argument.strip_prefix(b"4k ").unwrap_or(argument))
+    };
     if !path.starts_with(b"/sd/") {
-        io::ewrite(b"usage: readbench [verify] [single|staged] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [verify] [single|staged] [4k|64k] /sd/<file>\n");
         sys::process_exit();
     }
-    let Ok(mut arena) = Arena::new_psram(4096) else {
+    let Ok(mut arena) = Arena::new_psram(chunk_bytes) else {
         io::ewrite(b"readbench: allocation failed\n");
         sys::process_exit();
     };
     // SAFETY: privately owned live allocation, released after the last access.
-    let chunk = unsafe { core::slice::from_raw_parts_mut(arena.base() as *mut u8, 4096) };
+    let chunk = unsafe { core::slice::from_raw_parts_mut(arena.base() as *mut u8, chunk_bytes) };
     let mut response = Buffer::new();
     let before = snapshot();
     let kernel_before = profile();
@@ -127,7 +132,7 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
             chunk.fill(0xa5);
         }
         // Verification also exercises a grant ending inside a sector, then
-        // unaligned file offsets. The timed default retains 4 KiB requests.
+        // unaligned file offsets. Timed reads use the selected RPC size.
         let want = if hash_enabled && offset == 0 {
             chunk.len() - 1
         } else {
@@ -163,8 +168,16 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
             Ok(n) => {
                 if hash_enabled {
                     let hash_at = sys::monotonic_16m();
-                    for &b in &chunk[..n] {
-                        hash = (hash ^ u32::from(b)).wrapping_mul(16777619);
+                    for block in chunk[..n].chunks(4096) {
+                        for &b in block {
+                            hash = (hash ^ u32::from(b)).wrapping_mul(16777619);
+                        }
+                        // A slow checksum over 64 KiB must not overwrite the
+                        // bounded IRQ history before the next file RPC.
+                        let observed = window(cursor, false);
+                        cursor = word_le(&observed, 0);
+                        samples += word_le(&observed, 4);
+                        max_delay = max_delay.max(word_le(&observed, 8));
                     }
                     hash_ticks += sys::monotonic_16m() - hash_at;
                 }
@@ -188,7 +201,8 @@ fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
         b"single "
     });
     for (label, value) in [
-        (b"bytes=" as &[u8], offset),
+        (b"rpc_kib=" as &[u8], (chunk_bytes / 1024) as u32),
+        (b" bytes=", offset),
         (b" us=", elapsed_us),
         (b" irq_samples=", samples),
         (b" irq_max_us=", max_delay.div_ceil(16)),
