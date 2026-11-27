@@ -545,3 +545,14 @@ with `hash=off`; `io single /sd/bin/readbench-data.bin` selects the sector
 control. On Tab5, FNV consumed 7.42 s of the 9.11 s instrumented batch test.
 Reading without FNV took 1.63 s (629 KiB/s), versus 3.98 s for single sectors.
 The full measurements and their limits are in the roadmap.
+
+
+`readbench /sd/<file>` now defaults to a timed read with `hash=off`.
+Use `readbench verify /sd/<file>` for FNV validation; both accept `single`
+before the path. The previous `io` prefix remains an alias.
+For example, `run /sd/bin/readbench.elf verify /sd/bin/readbench-data.bin`.
+The ext4 staging buffer has explicit 64-byte alignment.
+A four-word copy experiment gave no measurable speedup and was removed.
+Checked interprocess copies retain memmove overlap semantics. The standard
+check includes host regressions for alignment, tails, overlapping shared
+mappings, permissions and full destination bounds.

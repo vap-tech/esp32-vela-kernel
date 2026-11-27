@@ -1,5 +1,46 @@
 # Roadmap
 
+## Проверка выравнивания и копирования, 27 ноября 2026
+
+В исходном ELF `ext4fs::BULK_CHUNK` находится по смещению `0x81d0`,
+кратному 16 байтам. Дизассемблирование target `compiler_builtins::mem::memmove`
+подтвердило 32-битные `lw/sw` для выровненного пути. Гипотеза о случайно
+невыровненном staging-буфере в этой сборке не подтвердилась.
+
+Проверен вариант явного 64-байтового выравнивания staging-буфера и
+копирования четырёх 32-битных слов за итерацию. На том же файле 1 048 699 байт,
+CPU 180 МГц, активном дисплее и включённом профилировании:
+
+| Вариант | Полное время, с | Kernel bulk-copy, с | SD-to-user copy, с |
+| --- | --- | --- | --- |
+| Предыдущая реализация | 1,628193 | 0,401892 | 0,153193 |
+| Эксперимент, прогон 1 | 1,632537 | 0,400089 | 0,152979 |
+| Эксперимент, прогон 2 | 1,667927 | 0,410218 | 0,157482 |
+
+Измеримого ускорения нет. Экспериментальное разворачивание цикла удалено.
+Итоговая реализация использует `memmove` между процессами, сохраняя
+семантику перекрывающихся shared mappings. Буфер оформлен типом с
+`repr(C, align(64))`; новый ELF размещает его по смещению `0x8200`.
+
+В штатный check добавлен `scripts/check_usermem.sh`: четыре host-теста
+для смещений адресов, коротких хвостов, обоих направлений перекрытия,
+полной writable-capacity, недоступных диапазонов и запрета записи.
+Уточнены unsafe-инварианты SRAM/PSRAM и сериализации через KERNEL_LOCK.
+
+`readbench /sd/<file>` теперь по умолчанию печатает `hash=off`.
+`readbench verify /sd/<file>` явно включает FNV; `single` выбирает
+секторный контроль. Прежний префикс `io` поддерживается как псевдоним.
+В аппаратной проверке итогового образа обычное чтение заняло 1,633263 с,
+kernel bulk-copy — 0,401054 с; `verify` подтвердил `fnv1a=2740238281`.
+Scanout frames=3015→3020, FIFO=1021→841, underruns=0, dma_errors=0.
+Штатный check/release и host-проверки прошли.
+
+Следующий шаг — уменьшить промежуточные копирования в bulk-пути с
+сохранением проверки диапазонов и прав IPC. Отдельный эксперимент нужен,
+чтобы измерить стоимость чтения/исполнения PSRAM относительно SRAM.
+
+
+
 ## Профиль bulk-чтения, 27 ноября 2026
 
 На том же файле `/sd/bin/readbench-data.bin` (1 048 699 байт), CPU 180 МГц,
@@ -232,7 +273,7 @@ FNV-1a в обоих случаях `1404242625`. Метаданные вход�
 
 ## Next
 
-По профилю в начале документа проверить выравнивание bulk-буфера и копирование PSRAM, затем отдельно стоимость исполнения контрольной суммы. Ниже — последующие направления.
+Уменьшить промежуточные копирования bulk-пути с сохранением проверки прав и диапазонов. Проверка выравнивания и word-copy приведена в начале документа. Ниже — последующие направления.
 
 1. **Display wallpapers & graphics**: keep the small `fbcon` image in SRAM and its framebuffer in PSRAM (618-cell startup render measured at 80 ms versus 2.54 s with the image in PSRAM). Supervisor stacks use guarded PSRAM allocations to preserve internal SRAM. Reuse the retained `vela_boot_and_display_assets/` pipeline for boot/background wallpapers alongside `fbcon`.
 2. **Cache, storage performance & connectivity**: evaluate cached `L1-DCache` mappings with explicit DMA cache maintenance, Flash XIP for larger images, and networking (ESP32-C6 co-processor or USB).

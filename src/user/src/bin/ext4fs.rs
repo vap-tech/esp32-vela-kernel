@@ -11,7 +11,10 @@ use vela_user::{
 vela_user::entry!(main);
 
 /// NOLOAD `.bss` staging buffer for `OP_READ_BULK` (keeps the 4 KiB service stack clear).
-static mut BULK_CHUNK: [u8; 4096] = [0; 4096];
+#[repr(C, align(64))]
+struct BulkChunk([u8; 4096]);
+
+static mut BULK_CHUNK: BulkChunk = BulkChunk([0; 4096]);
 
 struct Partition {
     handle: u32,
@@ -233,7 +236,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     }
                     let file = &opened.as_ref().unwrap().1;
                     // SAFETY: single-threaded service, never re-entered.
-                    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BULK_CHUNK) };
+                    let buf = unsafe { &mut (*core::ptr::addr_of_mut!(BULK_CHUNK)).0 };
                     let mut written = 0usize;
                     let mut read_ticks = sys::monotonic_16m() - opened_at;
                     let mut copy_ticks = 0u64;
@@ -292,7 +295,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                         return Ok(());
                     }
                     // SAFETY: single-threaded service, never re-entered.
-                    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BULK_CHUNK) };
+                    let buf = unsafe { &mut (*core::ptr::addr_of_mut!(BULK_CHUNK)).0 };
                     let mut done = 0usize;
                     while done < total_len {
                         let step = (total_len - done).min(buf.len());

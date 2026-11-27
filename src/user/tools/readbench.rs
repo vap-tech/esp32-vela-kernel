@@ -74,21 +74,21 @@ fn report(label: &[u8], value: u64) {
 fn main(fs: u32, arg: u32, len: u32, stdin: u32, stdout: u32, _: u32) -> ! {
     io::init(stdin, stdout);
     if fs == 0 || arg == 0 || len == 0 || len as usize > abi::SPAWN_ARG_MAX {
-        io::ewrite(b"usage: readbench /sd/<file>\n");
+        io::ewrite(b"usage: readbench [verify] [single] /sd/<file>\n");
         sys::process_exit();
     }
     // SAFETY: the loader reserves the argument above the initial stack.
     let argument = unsafe { core::slice::from_raw_parts(arg as *const u8, len as usize) };
-    let (hash_enabled, argument) = match argument.strip_prefix(b"io ") {
-        Some(path) => (false, path),
-        None => (true, argument),
+    let (hash_enabled, argument) = match argument.strip_prefix(b"verify ") {
+        Some(path) => (true, path),
+        None => (false, argument.strip_prefix(b"io ").unwrap_or(argument)),
     };
     let (batch, path) = match argument.strip_prefix(b"single ") {
         Some(path) => (false, path),
         None => (true, argument),
     };
     if !path.starts_with(b"/sd/") {
-        io::ewrite(b"usage: readbench [io] [single] /sd/<file>\n");
+        io::ewrite(b"usage: readbench [verify] [single] /sd/<file>\n");
         sys::process_exit();
     }
     let Ok(mut arena) = Arena::new_psram(4096) else {
