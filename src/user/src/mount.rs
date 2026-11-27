@@ -328,6 +328,7 @@ pub fn forward_stat(endpoint: u32, rel_path: &[u8], response: &mut Buffer) -> bo
 /// the caller's bulk memory window bound to `forward_token` with zero intermediate copy.
 /// Returns `false` if the backing endpoint is permanently dead (`-EBADF`/`-EPIPE`).
 pub fn forward_read_bulk(
+    operation: u8,
     endpoint: u32,
     forward_token: u32,
     offset: u32,
@@ -336,7 +337,7 @@ pub fn forward_read_bulk(
     response: &mut Buffer,
 ) -> bool {
     let mut fwd = Buffer::new();
-    fwd.push(fs_abi::OP_READ_BULK);
+    fwd.push(operation);
     fwd.append(&offset.to_le_bytes());
     fwd.append(&max_len.to_le_bytes());
     fwd.append(rel_path);

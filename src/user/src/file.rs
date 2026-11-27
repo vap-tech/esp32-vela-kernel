@@ -185,6 +185,18 @@ pub fn fs_read_bulk(
     dst: &mut [u8],
     response: &mut Buffer,
 ) -> Result<usize, u8> {
+    fs_read_bulk_mode(handle, path, offset, dst, response, true)
+}
+
+/// Explicit single-sector ext4 comparison, preserving the bulk RPC chunk size.
+pub fn fs_read_bulk_mode(
+    handle: u32,
+    path: &[u8],
+    offset: u32,
+    dst: &mut [u8],
+    response: &mut Buffer,
+    batch: bool,
+) -> Result<usize, u8> {
     response.clear();
     if dst.is_empty() {
         return Ok(0);
@@ -196,7 +208,11 @@ pub fn fs_read_bulk(
     }
     let want = dst.len().min(abi::IPC_BULK_MAX) as u32;
     let mut request = Buffer::new();
-    request.push(OP_READ_BULK);
+    request.push(if batch {
+        OP_READ_BULK
+    } else {
+        fs::OP_READ_BULK_SINGLE
+    });
     request.append(&offset.to_le_bytes());
     request.append(&want.to_le_bytes());
     request.append(path);

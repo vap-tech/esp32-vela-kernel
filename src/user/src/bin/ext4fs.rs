@@ -117,6 +117,7 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     | fs_abi::OP_WRITE
                     | fs_abi::OP_STAT
                     | fs_abi::OP_READ_BULK
+                    | fs_abi::OP_READ_BULK_SINGLE
                     | fs_abi::OP_WRITE_BULK
                     | fs_abi::OP_UNLINK
                     | fs_abi::OP_MKDIR
@@ -205,7 +206,18 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     response.append(&data[..count]);
                     Ok(())
                 }
-                [fs_abi::OP_READ_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+                [
+                    op @ (fs_abi::OP_READ_BULK | fs_abi::OP_READ_BULK_SINGLE),
+                    a,
+                    b,
+                    c,
+                    d,
+                    e,
+                    f,
+                    g,
+                    h,
+                    path @ ..,
+                ] if !path.is_empty() => {
                     let mut offset = u32::from_le_bytes([*a, *b, *c, *d]);
                     let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
                     if offset == 0
@@ -225,7 +237,12 @@ fn main(endpoint: u32, storage: u32, mount_vfs: u32, _a3: u32, _a4: u32, _a5: u3
                     while written < max_len {
                         let want = (max_len - written).min(buf.len());
                         let n = fs
-                            .read(&file, offset, &mut buf[..want])
+                            .read_with_batch(
+                                &file,
+                                offset,
+                                &mut buf[..want],
+                                *op == fs_abi::OP_READ_BULK,
+                            )
                             .map_err(err_reply)?;
                         if n == 0 {
                             break;

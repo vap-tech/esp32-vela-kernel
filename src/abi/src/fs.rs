@@ -33,6 +33,9 @@ pub const OP_UNMOUNT: u8 = 6;
 pub const OP_WRITE_BULK: u8 = 7;
 pub const OP_UNLINK: u8 = 8;
 pub const OP_MKDIR: u8 = 9;
+/// Read-only experiment: same bulk transport as OP_READ_BULK, ext4 data reads
+/// limited to single sectors. Explicit operation so older services reject it.
+pub const OP_READ_BULK_SINGLE: u8 = 10;
 
 /// Reply status codes.
 pub const STATUS_OK: u8 = 0;

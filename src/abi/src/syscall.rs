@@ -279,3 +279,9 @@ pub const STATS_KERNEL_STACKS_BYTES: usize = 32;
 
 /// SD_PARTITION a3: read a4 sectors (1..=8) into a2, partition-relative a1.
 pub const SD_PARTITION_READ_BATCH: u32 = 3;
+
+/// HP0 timer window: a3=sequence, a4=1 starts a window, 0 reads it.
+/// Returns sequence, sample count, max full delay (16 MHz ticks), SYSTIMER u64.
+/// A stale cursor (over 64 samples old) returns EOVERFLOW.
+pub const STATS_IRQ_WINDOW: u32 = 10;
+pub const STATS_IRQ_WINDOW_BYTES: usize = 20;

@@ -523,8 +523,13 @@ The partition syscall validates the complete destination and sector range.
 Devices without batch support use the `BlockRead` single-sector fallback.
 
 Build and install `target/sd/bin/readbench.elf`, then run
-`run /sd/bin/readbench.elf /sd/bin/shell.elf` to report bytes, elapsed 10 ms
-ticks, sector/command deltas and FNV-1a without printing file contents.
+`run /sd/bin/readbench.elf /sd/bin/readbench-data.bin` to report bytes,
+elapsed SYSTIMER microseconds, sector/command deltas, FNV-1a and the maximum
+HP0 timer latency observed during that read. Prefix the argument with
+`single ` to compare sector-at-a-time data reads using the same bulk RPC size.
+The benchmark polls a bounded IRQ history and rejects overwritten intervals.
+The 1 MiB + 123 byte test file was installed separately on the Tab5 card.
+Keyboard code and its guarded stack use PSRAM to reserve SRAM for fbcon/DMA.
 On Tab5, the existing 10,552-byte shell required 12 commands versus 29 before,
 with identical checksums. Timing and limitations are recorded in
 [the roadmap](docs/roadmap.md).

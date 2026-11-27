@@ -157,6 +157,8 @@ pub struct CycleAccounting {
     capacity_cycles: u64,
     irq_latency_last_16m: u32,
     irq_latency_max_16m: u32,
+    irq_delays: [u32; 64],
+    irq_sequence: u32,
     freq_switches: u32,
     tickless_entries: u32,
     tickless_ticks: u64,
@@ -176,10 +178,27 @@ impl CycleAccounting {
             capacity_cycles: 0,
             irq_latency_last_16m: 0,
             irq_latency_max_16m: 0,
+            irq_delays: [0; 64],
+            irq_sequence: 0,
             freq_switches: 0,
             tickless_entries: 0,
             tickless_ticks: 0,
         }
+    }
+
+    /// Read a bounded interval without resetting global counters. Delays retain
+    /// full comparator lateness, including missed timer periods.
+    pub fn irq_window(&self, cursor: Option<u32>) -> Option<(u32, u32, u32)> {
+        let count = cursor.map_or(0, |seq| self.irq_sequence.wrapping_sub(seq));
+        if count > 64 {
+            return None;
+        }
+        let mut max = 0;
+        for i in 0..count {
+            let seq = self.irq_sequence.wrapping_sub(i + 1);
+            max = max.max(self.irq_delays[seq as usize % 64]);
+        }
+        Some((self.irq_sequence, count, max))
     }
 
     pub const fn cpu_mhz(&self) -> u32 {
@@ -256,7 +275,7 @@ impl CycleAccounting {
                         let delta = counter_16m - expected;
                         let steps = (delta / period_16m) + 1;
                         self.expected_irq_16m = Some(expected.saturating_add(steps * period_16m));
-                        delta % quantum_16m
+                        delta
                     } else {
                         counter_16m % quantum_16m
                     }
@@ -264,6 +283,9 @@ impl CycleAccounting {
                 None => counter_16m % quantum_16m,
             };
             let lat = lat64.min(u64::from(u32::MAX)) as u32;
+            self.irq_delays[self.irq_sequence as usize % 64] = lat;
+            self.irq_sequence = self.irq_sequence.wrapping_add(1);
+            let lat = lat % quantum_16m as u32;
             self.irq_latency_last_16m = lat;
             if lat > self.irq_latency_max_16m {
                 self.irq_latency_max_16m = lat;
@@ -313,6 +335,28 @@ impl CycleAccounting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn irq_windows_retain_missed_periods_and_reject_overwritten_samples() {
+        let mut acc = CycleAccounting::new();
+        let (cursor, _, _) = acc.irq_window(None).unwrap();
+        acc.set_expected_irq_16m(Some(100));
+        acc.on_timer_irq(100 + 3 * BASE_PERIOD_16M + 17, BASE_PERIOD_16M, true);
+        assert_eq!(
+            acc.irq_window(Some(cursor)),
+            Some((1, 1, (3 * BASE_PERIOD_16M + 17) as u32))
+        );
+        assert_eq!(acc.irq_latency_last_16m, 17);
+        assert_eq!(acc.irq_window(Some(1)), Some((1, 0, 0)));
+        for i in 0..64 {
+            acc.on_timer_irq(100 + (i + 4) * BASE_PERIOD_16M, BASE_PERIOD_16M, true);
+        }
+        assert!(acc.irq_window(Some(cursor)).is_none());
+        assert!(acc.irq_window(Some(1)).is_some());
+        acc.irq_sequence = u32::MAX;
+        acc.on_timer_irq(100 + 69 * BASE_PERIOD_16M, BASE_PERIOD_16M, true);
+        assert_eq!(acc.irq_window(Some(u32::MAX)).unwrap().1, 1);
+    }
 
     #[test]
     fn utilization_remains_accurate_after_long_uptime() {

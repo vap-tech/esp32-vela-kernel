@@ -48,14 +48,10 @@ impl Runtime {
         let pid = if let Some(pid) = self.kbd_pid {
             pid
         } else {
-            // Preserve scarce SRAM for scanout and DMA. A larger kernel may
-            // leave too little aligned space for the keyboard image.
-            let (child, _, _) = match self.load_elf(crate::boot::KBD_ELF, false) {
-                Err(Errno::Enomem) => {
-                    self.load_elf_in(crate::boot::KBD_ELF, MemoryClass::Psram, false)?
-                }
-                result => result?,
-            };
+            // Reserve internal SRAM for fbcon and DMA regardless of supervisor
+            // scheduling order. Keyboard code and its guarded stack use PSRAM.
+            let (child, _, _) =
+                self.load_elf_in(crate::boot::KBD_ELF, MemoryClass::Psram, false)?;
             let result = (|| {
                 let sender =
                     lifecycle::grant(&mut self.processes, current, input, child.slot, cap::SEND)?;
@@ -561,6 +557,26 @@ impl Runtime {
                     buffer[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }
                 copy_to_user(self.memory(), ptr, &buffer[..len])
+            }
+            syscall::STATS_IRQ_WINDOW => {
+                if len != syscall::STATS_IRQ_WINDOW_BYTES || args.a4 > 1 {
+                    return Err(Errno::Einval);
+                }
+                let cursor = if args.a4 == 1 { None } else { Some(args.a3) };
+                let (seq, samples, max) = self.harts[0]
+                    .cycles
+                    .irq_window(cursor)
+                    .ok_or(Errno::Eoverflow)?;
+                // KERNEL_LOCK makes the history and counter one coherent snapshot.
+                let now = unsafe { soc::timer::counter_16mhz() }.ok_or(Errno::Eio)?;
+                let mut data = [0; syscall::STATS_IRQ_WINDOW_BYTES];
+                for (i, word) in [seq, samples, max, now as u32, (now >> 32) as u32]
+                    .into_iter()
+                    .enumerate()
+                {
+                    data[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                copy_to_user(self.memory(), ptr, &data)
             }
             syscall::STATS_CPU => {
                 if !matches!(len, syscall::STATS_CPU_BYTES | syscall::STATS_CPU_SMP_BYTES) {

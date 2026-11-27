@@ -192,7 +192,16 @@ impl<B: BlockRead> Ext4<B> {
         u64::from(self.device.sectors()) * SECTOR as u64
     }
 
-    fn read_bytes(&mut self, mut offset: u64, mut out: &mut [u8]) -> Result<(), Error> {
+    fn read_bytes(&mut self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
+        self.read_bytes_limited(offset, out, true)
+    }
+
+    fn read_bytes_limited(
+        &mut self,
+        mut offset: u64,
+        mut out: &mut [u8],
+        batch: bool,
+    ) -> Result<(), Error> {
         let limit = if self.blocks == 0 {
             self.capacity()
         } else {
@@ -204,7 +213,7 @@ impl<B: BlockRead> Ext4<B> {
         while !out.is_empty() {
             let sector = (offset / SECTOR as u64) as u32;
             let start = offset as usize % SECTOR;
-            if start == 0 && out.len() >= 2 * SECTOR {
+            if batch && start == 0 && out.len() >= 2 * SECTOR {
                 let count = (out.len() / SECTOR).min(8) * SECTOR;
                 self.device.read_sectors(sector, &mut out[..count])?;
                 out = &mut out[count..];
@@ -496,6 +505,17 @@ impl<B: BlockRead> Ext4<B> {
     }
 
     pub fn read(&mut self, file: &File, offset: u32, out: &mut [u8]) -> Result<usize, Error> {
+        self.read_with_batch(file, offset, out, true)
+    }
+
+    /// Read through identical extent/cache logic with optional sector batching.
+    pub fn read_with_batch(
+        &mut self,
+        file: &File,
+        offset: u32,
+        out: &mut [u8],
+        batch: bool,
+    ) -> Result<usize, Error> {
         let len = out.len().min(file.0.size.saturating_sub(offset) as usize);
         let mut done = 0;
         while done < len {
@@ -504,7 +524,7 @@ impl<B: BlockRead> Ext4<B> {
             let count = (len - done).min((self.block_size - within) as usize);
             let chunk = &mut out[done..done + count];
             if let Some(base) = self.data_block(&file.0, pos / self.block_size)? {
-                self.read_bytes(base + u64::from(within), chunk)?;
+                self.read_bytes_limited(base + u64::from(within), chunk, batch)?;
             } else {
                 chunk.fill(0);
             }
@@ -1703,6 +1723,11 @@ mod tests {
                 );
                 let split_count = image.read(&split, offset, &mut bulk).unwrap();
                 assert_eq!(split_count, count);
+                assert_eq!(&bulk[..count], &content[start..start + count]);
+                let single_count = image
+                    .read_with_batch(&split, offset, &mut bulk, false)
+                    .unwrap();
+                assert_eq!(single_count, count);
                 assert_eq!(&bulk[..count], &content[start..start + count]);
             }
             assert_eq!(image.open(b"/bin/missing").err(), Some(Error::NotFound));

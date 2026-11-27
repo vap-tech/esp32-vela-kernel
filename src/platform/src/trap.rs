@@ -97,6 +97,8 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
     let user_delta = runtime.harts[hart]
         .cycles
         .on_trap_entry(entry_cycles, from_idle);
+    let tickless_timer =
+        from_idle && hart == 0 && runtime.tickless_armed && interrupt && cause == 17;
     if !from_idle {
         if let Some(cur) = runtime.scheduler.hart_current[hart] {
             let updated = runtime
@@ -127,7 +129,7 @@ extern "C" fn rust_trap(frame: &mut arch::TrapFrame) -> *const arch::TrapFrame {
             soc::timer::acknowledge();
             soc::timer::counter_16mhz().expect("SYSTIMER snapshot timeout")
         };
-        if !from_idle {
+        if !tickless_timer {
             let live_tick = runtime.scheduler.snapshot().scheduler_ticks > 0;
             runtime.harts[0]
                 .cycles

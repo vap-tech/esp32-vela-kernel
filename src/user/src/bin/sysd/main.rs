@@ -207,6 +207,7 @@ fn handle_read(
 }
 
 fn handle_read_bulk(
+    operation: u8,
     pending_token: u32,
     offset: usize,
     max_len: usize,
@@ -218,6 +219,7 @@ fn handle_read_bulk(
 ) {
     if let Some((ep, rel)) = mounts.resolve(path) {
         let alive = mount::forward_read_bulk(
+            operation,
             ep,
             pending_token,
             offset as u32,
@@ -226,6 +228,11 @@ fn handle_read_bulk(
             response,
         );
         prune_if_dead(alive, ep, mounts, cache);
+        return;
+    }
+    if operation != fs_abi::OP_READ_BULK {
+        response.push(fs_abi::STATUS_ERR);
+        response.append(b"single-sector reads require an ext4 mount");
         return;
     }
     let (status, bytes) = cache.render_or_reuse(offset, path, mounts, caps);
@@ -458,10 +465,22 @@ fn handle_request(
             let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
             handle_read(offset, path, mounts, caps, cache, response);
         }
-        [fs_abi::OP_READ_BULK, a, b, c, d, e, f, g, h, path @ ..] if !path.is_empty() => {
+        [
+            op @ (fs_abi::OP_READ_BULK | fs_abi::OP_READ_BULK_SINGLE),
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+            g,
+            h,
+            path @ ..,
+        ] if !path.is_empty() => {
             let offset = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
             let max_len = u32::from_le_bytes([*e, *f, *g, *h]) as usize;
             handle_read_bulk(
+                *op,
                 pending_token,
                 offset,
                 max_len,
