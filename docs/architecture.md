@@ -4,12 +4,13 @@ Vela is a `no_std` bare-metal Rust microkernel targeting ESP32-P4 v1.3 on M5Stac
 
 ## Workspace Layout (`src/`)
 
-The Cargo workspace contains five crates with a strict acyclic dependency graph and zero cross-crate `#[path]` inclusions:
+The Cargo workspace contains six crates with a strict acyclic dependency graph and zero cross-crate `#[path]` inclusions:
 
 - `src/abi` (`vela-abi`) — Syscall numbers/constants, unified File IPC protocol (`fs`), and HP↔LP Sentinel wire protocol v2 definitions. Depends only on `core`.
 - `src/kernel` (`vela-kernel`) — Architecture- and SoC-independent microkernel core: typed IDs (`Pid`, `Tid`, `ProcSlot`, `ThreadSlot`, `Handle`, `Ticks`), `Errno`, `capability`, `event` (`EventTable`), `ipc`, `call` (`CallTable`), `memory` (`MemoryClass`, `RegionPool`, `RegionAllocator`), `process` (`AddressSpace`, `Processes`), `sched` (`Scheduler`), `elf` (`ET_EXEC` and static PIE validator/relocator), `dma` (`DmaController`, `DmaDirection`, `DmaTable`, `Lease`), `sentinel` (`RequestLink`, `WakeTicket`), `stats`, and cross-subsystem `lifecycle` orchestration. Pure `no_std` Rust; unit-tested on the host (`cargo test -p vela-kernel`).
 - `src/lp` (`vela-lp`) — LP Sentinel core logic (`watch`, `journal`, `wakeup`, host-tested via `cargo test -p vela-lp`), shared MMIO helpers (`hw::{lp_counter, mailbox}`), and the standalone `vela-sentinel` RV32IMAC binary linked at LP SRAM `0x50108000`.
-- `src/user` (`vela-user`) — Standalone U-mode runtime library (`sys`, `Buffer`, bump `Arena`, `mount`, `boot_cfg`, userspace `ina226` power driver, `kbd`, `ext4`, `fbcon`, and `sdcard` helpers, host-tested via `cargo test -p vela-user`), bundled flash static PIE services (`vela-sysd`, `vela-init`, `vela-console`, `vela-fbcon`, `vela-kbd`, `vela-ext4fs`), and standalone `/sd/bin/` utilities (`vela-shell`, `vela-cat`, `vela-ls`, `vela-uptime`, `vela-sdexport`).
+- `src/user` (`vela-user`) — Standalone U-mode runtime library (`sys`, `Buffer`, bump `Arena`, `mount`, `boot_cfg`, userspace `ina226` power driver, `kbd`, `ext4`, `fbcon`, and `sdcard` helpers, host-tested via `cargo test -p vela-user`), bundled flash static PIE services (`vela-sysd`, `vela-init`, `vela-console`, `vela-fbcon`, `vela-kbd`, `vela-ext4fs`), and standalone `/sd/bin/` utilities (`vela-shell`, `vela-cat`, `vela-ls`, `vela-uptime`, `vela-sdexport`, `vela-wc`, `vela-ramdev`, `vela-readbench`).
+- `src/sdk` (`vela-sdk`) — Application-facing file cursors, stdin/stdout, owned PSRAM buffers and explicit-authority process launching. Depends on `vela-abi` and `vela-user`; independent examples live in `examples/`.
 - `src/platform` (`vela-boot-esp32p4`) — Two-stage SPM/SRAM bootstrap (`entry.S`), minimal ESP32-P4 PAC, SPM-resident CLIC trap entry/exit (`arch/trap.S`), cached 16-entry NAPOT PMP compiler (`arch/pmp.rs`), SoC drivers (USB Serial/JTAG console, Full-Speed USB OTG MSC export, SYSTIMER, HP0/HP1 SMP + IPI, GDMA-AHB, DW-GDMA/DSI/ST7121/PSRAM display, 4-bit SDMMC IDMAC host + SPI fallback over `LDO_VO4` + `GPIO39..44`, TRNG/ChaCha20 CSPRNG, GPIO level IRQ, system & Ext.Port1 I²C, LP loader), boot policy (`boot.rs`), and thin syscall dispatchers (`dispatch/`).
 
 Dependency direction:
@@ -51,3 +52,20 @@ Dependency direction:
 - `Runtime` is the sole runtime owner of `Console` (except non-returning `fatal`/`panic` takeover) and `DisplayControl` (`psram::Controller` + `scanout::Scanout`); all raw SoC MMIO/ROM operations are `unsafe fn`, and BSP/SoC diagnostics are returned by value rather than instantiating second `Console` handles.
 - HP↔LP Sentinel communication uses a single hardware mailbox request slot managed by `RequestLink`: at most one request owns `(ARG0, ARG1, REQUEST_SEQ, COMMAND)` until LP answers that exact `sequence`; deadline expiration transitions the link to `offline` (`-ETIMEDOUT`) with idempotent doorbell reassertion until recovery.
 - Hardware cycle accounting (`CycleAccounting`) tracks per-thread and per-hart `user_cycles`, `kernel_cycles`, and `idle_cycles` via 64-bit `mcycle`, integrates wall-clock CPU capacity across `40 MHz` XTAL ↔ `180 MHz` CPLL transitions against the 16 MHz SYSTIMER, and measures comparator-to-ISR latency on runtime timer ticks.
+
+
+## SD bulk-read boundary
+
+`ext4fs` resolves file offsets and extents in U-mode. For aligned data,
+`SD_PARTITION_READ_BULK` checks SD READ authority and a live server-bound
+RPC token, then validates the complete partition range, writable bulk grant
+and current client mappings. Each operation reads at most 4 KiB into private
+kernel DMA SRAM and copies exactly the permitted bytes into the client.
+KERNEL_LOCK protects the DMA buffer and mappings through completion.
+Unaligned leading bytes and sparse/unwritten spans use the service staging
+buffer. Large client requests are served by multiple bounded SD operations.
+
+Detailed ext4/sysd timings currently execute for ordinary bulk reads.
+The measured 4/64 KiB comparisons include that overhead. Making profiling
+opt-in and measuring the ordinary path is the next storage experiment.
+Current commands and measured limits are in the README and roadmap.

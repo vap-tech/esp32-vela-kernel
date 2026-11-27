@@ -12,10 +12,12 @@ Application development is documented in [the SDK guide](docs/sdk.md).
 `./scripts/build-app.sh` builds an independent `no_std` Rust example using only
 `vela-sdk`, ready to copy to microSD and run through shell, pipes or redirection.
 
-The next performance experiment is sequential ext4 reading on Tab5. File IPC
-already supports bulk transfers, while the partition interface used by `ext4fs`
-reads one 512-byte sector per call. The [roadmap](docs/roadmap.md) starts with
-the baseline, proposed eight-sector read, and on-board acceptance checks.
+Sequential ext4 reads use delegated IPC bulk windows, with one data copy
+from private SD DMA SRAM into the client. Client requests of 64 KiB are
+served through SD operations of up to 4 KiB. The instrumented Tab5 test
+reached 1.59 MiB/s. The next experiment measures the ordinary file path
+with detailed profiling enabled only on request. Measurements and their
+limits are recorded in [the roadmap](docs/roadmap.md).
 
 ## Build and run
 
@@ -94,7 +96,7 @@ Journal timestamps use calibrated LP ticks; `elapsed_ticks` uses HP 10ms ticks.
 | Userspace Tab5 Keyboard driver (`vela-kbd`, `I2C_TRANSFER` on Ext.Port1 bus 1) | Sleeps on the keyboard `INT` line (`GPIO50`, level interrupt, `IRQ_SLOT_KBD = 1`, CLIC line 22), drains the `0x6d` Character-mode FIFO when it fires, then writes `INT_STA = 0` so the keyboard releases the line, and feeds the shell input endpoint next to the USB console; named keys (`enter`, `del`, arrows...) become terminal bytes and the shell drops ANSI escape sequences. `echo <auto|off|bright N|R G B [R G B]> > /dev/kbdled` drives the two RGB LEDs (registers `0x03`, `0x11`, `0x60`, `0x64`). No polling; `kbd_arm_low` / `kbd_arm_wait` in `/proc/interrupts` show how often the line was re-armed. After 5 minutes without a key the service dims the LEDs (brightness register `0x03` to 0) and restores them on the next key; while the screen is blanked (`STATS_DISPLAY`) the first key is swallowed and only wakes the display, via a no-op `ESC [ m` written to the console. |
 | Userspace framebuffer console (`vela-fbcon`, `CONSOLE_LOG`, `DISPLAY_MODE_CONSOLE`) | Owns a PSRAM framebuffer and mirrors everything written to the system console (shell echo, kernel log) on the Tab5 screen, 80x22 cells with a 16x32 Terminus font (SIL OFL). After 5 minutes without console output the backlight is switched off (`DISPLAY_MODE_BACKLIGHT`); any new output, such as a key echo, wakes it. The renderer understands ANSI SGR colours (16-colour palette, bold, reset); the shell prompt is green and errors are red. While blanked it polls the log every 100 ms instead of 20 ms. While the display is attached `/sys/sentinel/sleep` and `echo 40 > /sys/freq` return `-EBUSY`. |
 | Per-bus I²C capabilities (`Authority::I2c(bus)`) and probe scan (`/dev/i2c-N`) | Address-only probes work on every address of both buses; data transfers are limited to `0x41` on the system bus and open on Ext.Port1 (no board devices). |
-| Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Legacy raw assets at LBA 2048 and partition-bounded read access for the U-mode ext4 service. |
+| Tab5 microSD driver (`LDO_VO4` 3.3 V, `GPIO39..44`, `CMD59` CRC7 + `CRC16-CCITT`, `/proc/sdcard`) | Legacy raw assets at LBA 2048 and partition-bounded reads and writes for the U-mode ext4 service, including delegated bulk-read destinations. |
 | Coordinated LP Sentinel sleep (`sentinel sleep`), DVFS (`40 MHz <-> 180 MHz`) and Tickless idle (`SYSTIMER`) | WFI + XTAL downshift with pre-sleep IRQ/generation re-check; full PMU HP power-domain power-down/reset resume is not used. |
 | Userspace `sysd` (`/proc`, `/sys`, `/dev`), `ext4fs` (`/sd`), flash `init` (`boards/tab5/init.conf`), and `/sd/bin/shell.elf` | No kernel VFS or POSIX compatibility. |
 
@@ -435,9 +437,9 @@ reading the `0x48xx_xxxx` bus alias), and renders the 80×22 ANSI console. Writi
 `echo off > /sys/display` stops scanout, disables backlight, releases the `InFlight`
 DMA hold, and returns the 2 MiB region to the 32 MiB pool.
 
-Current SRAM payload is ~201 KiB (including bundled `sysd`, `init`, `console`, `kbd`,
-`fbcon`, and `ext4fs` ELFs), SPM `.entry` (bootstrap + trap entry/exit) is 1372 bytes,
-and kernel BSS is ~25 KiB (including per-thread 384-byte `ExtendedContext` frames).
+The local release snapshot of 2026-11-27 has a 253,916-byte SRAM payload
+(including bundled service ELFs), a 1,728-byte SPM `.entry` and 41,328 bytes
+of kernel BSS. Build scripts report the sizes for each new image.
 
 Display error codes 10–12 indicate PSRAM vendor/density/probe failure,
 13 an invalid image stream/range, 14 a framebuffer readback mismatch,
@@ -515,75 +517,58 @@ Tab5's symlink under `/dev/serial/by-id`.
 ELF initial stacks reserve a double-size aligned allocation. PMP exposes the upper half and leaves the lower half inaccessible as a guard. PSRAM programs normally use a 64 KiB PSRAM allocation with a 32 KiB usable stack. SRAM programs retain 4 KiB usable stacks with a 4 KiB guard. THREAD_CREATE accepts THREAD_STACK_GUARD in a5 along with affinity. Pass the full private MEM_ALLOC allocation, twice the desired usable stack size. The kernel closes its lower half, restricts the memory capability to CONTROL, and retains the original allocation for MEM_FREE after thread exit. The four init supervisor threads use this mode with 64 KiB PSRAM allocations (32 KiB usable and 32 KiB guard each), preserving SRAM for the framebuffer console and IRQ services. Each HP kernel stack has a 256-byte boundary marker checked at trap entry and return, with SP validation before a kernel-origin trap frame is stored. Failed checks switch to an independent emergency stack for a fatal hart/SP/PC report. Detection occurs at trap boundaries, so a kernel write beyond the stack can damage memory before detection.
 
 
-### Batched ext4 reads
+### Bulk ext4 reads and profiling
 
-Aligned file reads now submit up to eight sectors per SD command within the
-current ext4 block. Unaligned bytes and tails retain the sector-cache path.
-The partition syscall validates the complete destination and sector range.
-Devices without batch support use the `BlockRead` single-sector fallback.
+ext4fs resolves file offsets and extents in userspace. For aligned data,
+the kernel checks SD READ authority, the live server-bound RPC token,
+partition bounds, the writable bulk grant and the client's current mappings.
+SD reads into private DMA SRAM; the kernel copies exactly the permitted
+file bytes into the client. Each SD operation is limited to 4 KiB.
+Unaligned leading bytes and sparse/unwritten regions use the 64-byte-aligned
+staging buffer. The final sector may be read in full, with only the file
+tail copied to the client. Interprocess copies preserve memmove semantics.
 
-Build and install `target/sd/bin/readbench.elf`, then run
-`run /sd/bin/readbench.elf /sd/bin/readbench-data.bin` to report bytes,
-elapsed SYSTIMER microseconds, sector/command deltas, FNV-1a and the maximum
-HP0 timer latency observed during that read. Prefix the argument with
-`single ` to compare sector-at-a-time data reads using the same bulk RPC size.
-The benchmark polls a bounded IRQ history and rejects overwritten intervals.
-The 1 MiB + 123 byte test file was installed separately on the Tab5 card.
-Keyboard code and its guarded stack use PSRAM to reserve SRAM for fbcon/DMA.
-On Tab5, the existing 10,552-byte shell required 12 commands versus 29 before,
-with identical checksums. Timing and limitations are recorded in
-[the roadmap](docs/roadmap.md).
+Build utilities with `./scripts/build-tools.sh`, then copy
+`target/sd/bin/readbench.elf` into the SD card's `bin/` directory through
+USB export and eject cleanly. The benchmark uses this syntax:
 
+```text
+readbench [verify] [single|staged] [4k|64k] /sd/<file>
+```
 
-The profiler now separates RPC elapsed time, the checksum interval, ext4 read
-and bulk-write phases, namespace forwarding, SD driver time and checked memory
-copies. Service intervals are nested. Kernel counters are cumulative and the
-utility reports their deltas. Instrumentation overhead is included.
-
-Use `run /sd/bin/readbench.elf io /sd/bin/readbench-data.bin` for a timed read
-with `hash=off`; `io single /sd/bin/readbench-data.bin` selects the sector
-control. On Tab5, FNV consumed 7.42 s of the 9.11 s instrumented batch test.
-Reading without FNV took 1.63 s (629 KiB/s), versus 3.98 s for single sectors.
-The full measurements and their limits are in the roadmap.
-
-
-`readbench /sd/<file>` now defaults to a timed read with `hash=off`.
-Use `readbench verify /sd/<file>` for FNV validation; both accept `single`
-before the path. The previous `io` prefix remains an alias.
-For example, `run /sd/bin/readbench.elf verify /sd/bin/readbench-data.bin`.
-The ext4 staging buffer has explicit 64-byte alignment.
-A four-word copy experiment gave no measurable speedup and was removed.
-Checked interprocess copies retain memmove overlap semantics. The standard
-check includes host regressions for alignment, tails, overlapping shared
-mappings, permissions and full destination bounds.
-
-
-Aligned ext4 bulk reads now copy file data from the kernel's private SD DMA
-buffer into the active RPC client's writable bulk window. The kernel checks
-the storage capability, server-bound live token, complete partition range,
-bulk grant and client mapping before accessing the card. Extent resolution
-stays in userspace. Unaligned leading bytes and holes use the staging buffer.
-The final sector is copied only up to the returned file length.
-
-`readbench staged /sd/<file>` compares the previous staged batch path.
-`verify` also exercises unaligned offsets and guards bytes beyond each reply.
-On Tab5 the 1 MiB + 123 byte file took 1.16–1.18 s (871–882 KiB/s), versus
-1.65 s staged. Both used 265 SD commands; the aligned direct path eliminated
-257 separate IPC_BULK_IO copies. DMA still targets private kernel SRAM.
-Full results and checks are recorded in the roadmap.
-
-
-Select the client RPC size with `readbench [verify] [single|staged] [4k|64k] /sd/<file>`.
-The default is 4 KiB. For example:
+The default is a direct 4 KiB read with `hash=off`.
+`64k` selects the client RPC size. `single` selects sector-at-a-time
+staging and `staged` selects the batched staging control.
+`verify` enables FNV-1a and guard checks, beginning with a request one byte
+short of the chosen size to exercise unaligned offsets. It samples IRQ
+history every 4 KiB of hashing. The previous `io` prefix is an alias for
+a read without hashing.
 
 ```console
+run /sd/bin/readbench.elf 4k /sd/bin/readbench-data.bin
 run /sd/bin/readbench.elf 64k /sd/bin/readbench-data.bin
 run /sd/bin/readbench.elf verify 64k /sd/bin/readbench-data.bin
 ```
 
-On Tab5 the 1 MiB + 123 byte file took 0.628–0.629 s with 64 KiB requests,
-versus 1.366–1.375 s with 4 KiB requests in the same instrumented utility.
-Client RPCs including EOF fell from 258 to 18. Both modes issued 265 SD
-commands, each limited to 4 KiB. Maximum timer latency in the timed runs
-was 1.17–1.34 ms. Wide verification passed checksum and buffer-tail checks.
-During verification the utility samples IRQ history every 4 KiB of hashing.
+The 1 MiB + 123 byte test file was installed separately on the Tab5 card.
+At 180 MHz with the display active, two runs per size gave:
+
+| Client request | Elapsed time | Client RPCs including EOF | SD commands |
+| --- | --- | --- | --- |
+| 4 KiB | 1.366–1.375 s | 258 | 265 |
+| 64 KiB | 0.628–0.629 s | 18 | 265 |
+
+The 64 KiB mode reached about 1.59 MiB/s, with a maximum observed timer
+latency of 1.34 ms. Wide verification matched the Linux FNV-1a value
+`2740238281` and passed buffer-tail checks.
+
+These measurements include instrumentation. Detailed ext4 and namespace
+timings currently run for ordinary bulk reads too. Reported service times
+are nested; kernel counters are cumulative and the utility reports deltas.
+Making profiling opt-in is the next experiment. Full profiles, historical
+comparisons, hardware observations and limits are in
+[the roadmap](docs/roadmap.md).
+
+Keyboard code and its guarded stack use PSRAM to reserve SRAM for fbcon/DMA.
+The standard check includes host regressions for copy alignment, tails,
+overlapping shared mappings, permissions and destination bounds.
